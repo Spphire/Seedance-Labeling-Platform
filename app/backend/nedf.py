@@ -129,14 +129,19 @@ def extract_head_video(preprocessed_dir: Path, output_mp4: Path) -> dict:
     }
 
 
-def fetch_episode(host: str, remote_root: str, uuid: str, local_dir: Path) -> None:
+def fetch_episode(host: str, remote_root: str, uuid: str, local_dir: Path) -> Path:
     if local_dir.exists() and (local_dir / "preprocessed" / "metadata.json").exists():
-        return
+        return local_dir
     local_dir.parent.mkdir(parents=True, exist_ok=True)
-    remote = f"{host}:{remote_root.rstrip('/')}/{uuid}"
+    source = Path(remote_root) / uuid
+    if source.exists():
+        return source
+
     tmp = local_dir.with_suffix(".partial")
     if tmp.exists():
         shutil.rmtree(tmp)
+
+    remote = f"{host}:{remote_root.rstrip('/')}/{uuid}"
     cmd = ["scp", "-O", "-r", remote, str(tmp)]
     proc = subprocess.run(
         cmd,
@@ -151,3 +156,4 @@ def fetch_episode(host: str, remote_root: str, uuid: str, local_dir: Path) -> No
     if local_dir.exists():
         shutil.rmtree(local_dir)
     tmp.rename(local_dir)
+    return local_dir

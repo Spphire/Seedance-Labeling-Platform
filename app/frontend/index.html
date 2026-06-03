@@ -139,6 +139,62 @@
       width: 160px;
     }
 
+    .icon-button {
+      width: 36px;
+      min-width: 36px;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+    }
+
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: flex;
+      justify-content: flex-end;
+      background: rgba(17, 24, 32, 0.38);
+    }
+
+    .modal-overlay.hidden {
+      display: none;
+    }
+
+    .admin-panel {
+      width: min(440px, 100vw);
+      height: 100%;
+      overflow: auto;
+      padding: 18px;
+      background: var(--panel);
+      color: var(--ink);
+      border-left: 1px solid var(--line);
+      box-shadow: -18px 0 34px rgba(0, 0, 0, 0.16);
+    }
+
+    .admin-panel h2 {
+      margin: 0 0 16px;
+      font-size: 16px;
+    }
+
+    .field {
+      margin-bottom: 14px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .admin-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 18px;
+    }
+
     aside {
       overflow: auto;
       border-right: 1px solid var(--line);
@@ -560,11 +616,32 @@
       <h1>Seedance 数据标注平台</h1>
       <div class="header-actions">
         <input id="reviewerName" class="reviewer" placeholder="审核人">
-        <input id="publicBaseUrl" placeholder="public base url">
-        <button id="saveSettings">保存配置</button>
+        <button id="openSettings" class="icon-button" title="后台管理员设置" aria-label="后台管理员设置">&#9881;</button>
         <button id="refresh" class="primary">刷新</button>
       </div>
     </header>
+
+    <div id="settingsOverlay" class="modal-overlay hidden">
+      <section class="admin-panel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <h2 id="settingsTitle">后台管理员设置</h2>
+        <div class="field">
+          <label for="dm3Host">数据服务器</label>
+          <input id="dm3Host" placeholder="DM3data">
+        </div>
+        <div class="field">
+          <label for="dm3NedfRoot">原数据路径</label>
+          <input id="dm3NedfRoot" placeholder="/mnt/nm_data/data/nedf">
+        </div>
+        <div class="field">
+          <label for="publicBaseUrl">Clip 访问地址</label>
+          <input id="publicBaseUrl" placeholder="http://106.14.2.243:18080">
+        </div>
+        <div class="admin-actions">
+          <button id="closeSettings">关闭</button>
+          <button id="saveSettings" class="primary">保存配置</button>
+        </div>
+      </section>
+    </div>
 
     <aside>
       <section class="block">
@@ -693,6 +770,8 @@
       state.jobs = data.jobs || [];
       state.locks = data.locks || [];
       state.settings = data.settings || {};
+      $("dm3Host").value = state.settings.dm3_host || "DM3data";
+      $("dm3NedfRoot").value = state.settings.dm3_nedf_root || "/mnt/nm_data/data/nedf";
       $("publicBaseUrl").value = state.settings.public_base_url || "";
       $("generationMode").value = state.settings.generation_mode || "mock";
       reconcileLocks();
@@ -1183,14 +1262,29 @@
     });
 
     $("refresh").addEventListener("click", () => refresh().catch((err) => log(formatApiError(err))));
+    $("openSettings").addEventListener("click", () => {
+      $("settingsOverlay").classList.remove("hidden");
+      $("dm3NedfRoot").focus();
+    });
+    $("closeSettings").addEventListener("click", () => {
+      $("settingsOverlay").classList.add("hidden");
+    });
+    $("settingsOverlay").addEventListener("click", (event) => {
+      if (event.target === $("settingsOverlay")) {
+        $("settingsOverlay").classList.add("hidden");
+      }
+    });
     $("saveSettings").addEventListener("click", async () => {
       try {
         const values = {
+          dm3_host: $("dm3Host").value.trim() || "DM3data",
+          dm3_nedf_root: $("dm3NedfRoot").value.trim() || "/mnt/nm_data/data/nedf",
           public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
           generation_mode: $("generationMode").value,
         };
         const result = await api("/api/settings", { method: "POST", body: { values } });
         log("settings saved", result);
+        $("settingsOverlay").classList.add("hidden");
         await refresh();
       } catch (err) {
         log(err.message);

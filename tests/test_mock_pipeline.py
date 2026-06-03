@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 
 from app.backend import db
 from app.backend.main import app
-from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DB_PATH, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
+from app.backend.nedf import fetch_episode
+from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
 from app.backend.services import create_clips, refresh_clip_public_urls, review_clip, run_generation
 from app.backend.settings import DEFAULT_SETTINGS, save_settings
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
@@ -159,6 +160,19 @@ class MockPipelineTest(unittest.TestCase):
         data = res.json()
         self.assertNotIn("seedance_api_key", data)
         self.assertTrue(data["seedance_api_key_set"])
+
+    def test_fetch_episode_uses_local_mount_without_copying(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000010"
+        source_root = DATA_DIR / "local_remote_source"
+        source_preprocessed = source_root / uuid / "preprocessed"
+        source_preprocessed.mkdir(parents=True, exist_ok=True)
+        (source_preprocessed / "metadata.json").write_text("{}", encoding="utf-8")
+
+        local_dir = EPISODES_DIR / uuid
+        resolved = fetch_episode("unresolvable-host", str(source_root), uuid, local_dir)
+
+        self.assertEqual(resolved, source_root / uuid)
+        self.assertFalse(local_dir.exists())
 
     def test_public_base_url_refreshes_existing_clip_records(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000009"

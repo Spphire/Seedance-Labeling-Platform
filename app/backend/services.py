@@ -250,9 +250,10 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
     with db.connect() as conn:
         conn.execute("UPDATE episodes SET status='preprocessing', error=NULL, updated_at=? WHERE uuid=?", (now, uuid))
     try:
+        episode_dir = local_dir
         if fetch_remote:
-            fetch_episode(settings["dm3_host"], settings["dm3_nedf_root"], uuid, local_dir)
-        preprocessed_dir = local_dir / "preprocessed"
+            episode_dir = fetch_episode(settings["dm3_host"], settings["dm3_nedf_root"], uuid, local_dir)
+        preprocessed_dir = episode_dir / "preprocessed"
         if not (preprocessed_dir / "metadata.json").exists():
             raise RuntimeError(f"Missing preprocessed metadata for {uuid}")
         head_path = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
@@ -263,9 +264,9 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
             conn.execute(
                 """
                 UPDATE episodes SET status='preprocessed', head_video_path=?, final_status='missing',
-                error=NULL, updated_at=? WHERE uuid=?
+                local_path=?, error=NULL, updated_at=? WHERE uuid=?
                 """,
-                (str(head_path.resolve()), db.now(), uuid),
+                (str(head_path.resolve()), str(episode_dir.resolve()), db.now(), uuid),
             )
         return {"uuid": uuid, "head": meta, "clips": clips}
     except Exception as exc:
