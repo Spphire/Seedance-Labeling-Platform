@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from app.backend import db
 from app.backend.main import app
 from app.backend.nedf import fetch_episode
-from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
+from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import create_clips, list_clips, queue_generation, refresh_clip_public_urls, review_clip, run_generation
 from app.backend.settings import DEFAULT_SETTINGS, save_settings
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
@@ -80,6 +80,15 @@ class MockPipelineTest(unittest.TestCase):
                 str(path),
             ]
         )
+
+    def make_reference_images(self) -> list[str]:
+        REFERENCE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        result = []
+        for index in range(4):
+            path = REFERENCE_IMAGES_DIR / f"ref-{index + 1}.png"
+            path.write_bytes(b"fake-png")
+            result.append(path)
+        return [str(path) for path in result]
 
     def make_episode_with_generated_clip(self, uuid: str, duration: float = 5.0) -> tuple[list[dict], list[dict]]:
         now = db.now()
@@ -147,12 +156,37 @@ class MockPipelineTest(unittest.TestCase):
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
         self.make_video(head, 5.2)
         create_clips(uuid, head, 5.2)
+        save_settings({"reference_images": ["data:image/png;base64,AA=="]})
         result = run_generation(mode="seedance", dry_run=True)
         payload_path = Path(result[0]["output_path"])
         self.assertEqual(payload_path.suffix, ".json")
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["duration"], 6)
         self.assertIn("video_url", json.dumps(payload))
+
+    def test_seedance_dry_run_includes_reference_images_in_order(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000012"
+        now = db.now()
+        refs = self.make_reference_images()
+        save_settings({"reference_images": [refs[2], refs[0], refs[3], refs[1]]})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.2)
+        create_clips(uuid, head, 5.2)
+        result = run_generation(mode="seedance", dry_run=True)
+        payload = json.loads(Path(result[0]["output_path"]).read_text(encoding="utf-8"))
+
+        image_items = [item for item in payload["content"] if item["type"] == "image_url"]
+        self.assertEqual(len(image_items), 4)
+        self.assertTrue(payload["content"][0]["text"].startswith("把@视频1"))
+        self.assertEqual(payload["content"][-1]["type"], "video_url")
 
     def test_seedance_queue_marks_running_and_blocks_duplicate(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000011"

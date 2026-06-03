@@ -12,10 +12,23 @@ from typing import Any
 
 from volcenginesdkarkruntime import Ark
 
+from app.backend.paths import ROOT
+
 
 def image_uri(path: Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('utf-8')}"
+
+
+def resolve_image_value(value: str) -> str:
+    if value.startswith(("http://", "https://", "data:")):
+        return value
+    path = Path(value)
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.is_file():
+        raise FileNotFoundError(f"reference image not found: {value}")
+    return image_uri(path)
 
 
 class SeedanceClient:
@@ -31,8 +44,7 @@ class SeedanceClient:
         duration = int(math.ceil(duration_sec))
         content = [{"type": "text", "text": prompt}]
         for item in self.settings.get("reference_images", []):
-            path = Path(item)
-            uri = item if str(item).startswith(("http://", "https://", "data:")) else image_uri(path)
+            uri = resolve_image_value(str(item))
             content.append({"type": "image_url", "image_url": {"url": uri}, "role": "reference_image"})
         content.append({"type": "video_url", "video_url": {"url": public_url}, "role": "reference_video"})
         return {

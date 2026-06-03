@@ -195,6 +195,34 @@
       line-height: 1.35;
     }
 
+    .ref-image-order {
+      display: grid;
+      gap: 8px;
+    }
+
+    .ref-image-row {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr) 56px;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .ref-image-row span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .ref-preview {
+      width: 56px;
+      aspect-ratio: 1 / 1;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f1f3f5;
+      object-fit: cover;
+    }
+
     .admin-actions {
       display: flex;
       gap: 8px;
@@ -657,8 +685,9 @@
           <textarea id="defaultPrompt" spellcheck="false"></textarea>
         </div>
         <div class="field">
-          <label for="referenceImages">参考图路径或 URL</label>
-          <textarea id="referenceImages" spellcheck="false" placeholder="每行一个；需要 4 张时填 4 行"></textarea>
+          <label>参考图顺序</label>
+          <div id="referenceImageOrder" class="ref-image-order"></div>
+          <div class="hint">按顺序对应 prompt 中的 @图片1、@图片2、@图片3、@图片4。</div>
         </div>
         <div class="field">
           <label for="seedanceModel">Seedance 模型</label>
@@ -825,6 +854,7 @@
       state.jobs = data.jobs || [];
       state.locks = data.locks || [];
       state.settings = data.settings || {};
+      state.availableReferenceImages = state.settings.available_reference_images || [];
       $("dm3Host").value = state.settings.dm3_host || "DM3data";
       $("dm3NedfRoot").value = state.settings.dm3_nedf_root || "/mnt/nm_data/data/nedf";
       $("publicBaseUrl").value = state.settings.public_base_url || "";
@@ -832,7 +862,7 @@
       $("seedanceApiKey").value = "";
       $("seedanceApiKeyHint").textContent = state.settings.seedance_api_key_set ? "服务器已保存 API Key；留空不会覆盖。" : "尚未保存 API Key。";
       $("defaultPrompt").value = state.settings.default_prompt || "";
-      $("referenceImages").value = (state.settings.reference_images || []).join("\n");
+      renderReferenceImageSelectors(state.settings.reference_images || []);
       $("seedanceModel").value = state.settings.seedance_model || "doubao-seedance-2-0-fast-260128";
       $("seedanceBaseUrl").value = state.settings.seedance_base_url || "https://ark.cn-beijing.volces.com/api/v3";
       $("seedanceResolution").value = state.settings.seedance_resolution || "480p";
@@ -852,6 +882,70 @@
 
     function badge(status) {
       return `<span class="badge ${status || ""}">${status || "unknown"}</span>`;
+    }
+
+    function renderReferenceImageSelectors(selected) {
+      const target = $("referenceImageOrder");
+      const available = state.availableReferenceImages || [];
+      target.innerHTML = "";
+      for (let index = 0; index < 4; index += 1) {
+        const value = selected[index] || available[index]?.id || "";
+        const row = document.createElement("div");
+        row.className = "ref-image-row";
+        const options = [
+          `<option value="">不使用</option>`,
+          ...available.map((item) => `<option value="${escapeAttr(item.id)}" ${item.id === value ? "selected" : ""}>${escapeHtml(item.name)}</option>`),
+        ].join("");
+        row.innerHTML = `
+          <span>图片${index + 1}</span>
+          <select data-ref-image-index="${index}">${options}</select>
+          <img class="ref-preview" alt="" data-ref-preview="${index}">
+        `;
+        target.appendChild(row);
+      }
+      target.querySelectorAll("[data-ref-image-index]").forEach((select) => {
+        select.addEventListener("change", updateReferencePreviews);
+      });
+      updateReferencePreviews();
+    }
+
+    function selectedReferenceImages() {
+      return [...document.querySelectorAll("[data-ref-image-index]")]
+        .sort((a, b) => Number(a.dataset.refImageIndex) - Number(b.dataset.refImageIndex))
+        .map((select) => select.value)
+        .filter(Boolean);
+    }
+
+    function updateReferencePreviews() {
+      const byId = new Map((state.availableReferenceImages || []).map((item) => [item.id, item]));
+      document.querySelectorAll("[data-ref-image-index]").forEach((select) => {
+        const image = byId.get(select.value);
+        const preview = document.querySelector(`[data-ref-preview="${select.dataset.refImageIndex}"]`);
+        if (!preview) return;
+        if (image) {
+          preview.src = image.url;
+          preview.title = image.name;
+          preview.style.visibility = "visible";
+        } else {
+          preview.removeAttribute("src");
+          preview.removeAttribute("title");
+          preview.style.visibility = "hidden";
+        }
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[char]));
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value);
     }
 
     function myClipLock(clipId) {
@@ -1395,7 +1489,7 @@
           public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
           generation_mode: $("generationMode").value,
           default_prompt: $("defaultPrompt").value.trim(),
-          reference_images: $("referenceImages").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+          reference_images: selectedReferenceImages(),
           seedance_model: $("seedanceModel").value.trim() || "doubao-seedance-2-0-fast-260128",
           seedance_base_url: $("seedanceBaseUrl").value.trim() || "https://ark.cn-beijing.volces.com/api/v3",
           seedance_resolution: $("seedanceResolution").value || "480p",

@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .locks import LockError, acquire_lock, list_locks, release_lock, renew_lock
-from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, ROOT, ensure_dirs
+from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, REFERENCE_IMAGES_DIR, ROOT, ensure_dirs
 from .schema import (
     EpisodeBatchRequest,
     GenerationRunRequest,
@@ -252,4 +252,5 @@ _mount_static("/clips", CLIPS_DIR)
 _mount_static("/generated", GENERATED_DIR)
 _mount_static("/accepted", ACCEPTED_DIR)
 _mount_static("/final", FINAL_DIR)
+_mount_static("/reference_images", REFERENCE_IMAGES_DIR)
 _mount_static("/assets", FRONTEND_DIR)

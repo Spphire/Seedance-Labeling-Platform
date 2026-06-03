@@ -16,6 +16,7 @@ GENERATED_DIR = DATA_DIR / "generated"
 ACCEPTED_DIR = DATA_DIR / "accepted_clips"
 FINAL_DIR = DATA_DIR / "final_episodes"
 LOGS_DIR = ROOT / "logs"
+REFERENCE_IMAGES_DIR = ROOT / "app" / "reference_images"
 
 
 def ensure_dirs() -> None:
