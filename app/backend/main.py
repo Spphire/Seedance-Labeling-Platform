@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import db
+from .locks import LockError, acquire_lock, list_locks, release_lock, renew_lock
+from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, ROOT, ensure_dirs
+from .schema import (
+    EpisodeBatchRequest,
+    GenerationRunRequest,
+    ImportHeadVideoRequest,
+    LockReleaseRequest,
+    LockRenewRequest,
+    LockRequest,
+    LockTokenRequest,
+    PreprocessRequest,
+    ReviewRequest,
+)
+from .services import (
+    auto_accept_all,
+    import_head_video,
+    list_clips,
+    list_episodes,
+    list_jobs,
+    preprocess,
+    queue_stitch_episode,
+    refresh_clip_public_urls,
+    retry_clip,
+    retry_job,
+    review_clip,
+    run_generation,
+    submit_episodes,
+)
+from .settings import load_settings, public_settings, save_settings
+
+
+FRONTEND_DIR = ROOT / "app" / "frontend"
+
+
+app = FastAPI(title="Seedance Labeling Platform", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _init() -> None:
+    ensure_dirs()
+    db.init_db()
+    load_settings()
+
+
+@app.on_event("startup")
+def startup() -> None:
+    _init()
+    refresh_clip_public_urls()
+
+
+def _public_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, LockError):
+        return HTTPException(status_code=exc.status_code, detail=exc.detail())
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/")
+def index() -> FileResponse:
+    _init()
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="frontend index.html not found")
+    return FileResponse(index_path)
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    _init()
+    return {"ok": True, "root": str(ROOT), "settings": public_settings()}
+
+
+@app.get("/api/settings")
+def get_settings() -> dict[str, Any]:
+    return public_settings()
+
+
+@app.post("/api/settings")
+def post_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    values = payload.get("values", payload)
+    saved = save_settings(values)
+    if "public_base_url" in values:
+        refresh_clip_public_urls()
+    return {key: value for key, value in saved.items() if key != "seedance_api_key"}
+
+
+@app.post("/api/episodes/batch")
+def post_episodes_batch(payload: EpisodeBatchRequest) -> list[dict[str, Any]]:
+    try:
+        return submit_episodes(payload.episodes_text)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/pipeline/preprocess")
+def post_preprocess(payload: PreprocessRequest) -> list[dict[str, Any]]:
+    try:
+        return preprocess(payload.uuids, payload.fetch_remote, payload.lock_tokens)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/pipeline/import_head")
+def post_import_head(payload: ImportHeadVideoRequest) -> dict[str, Any]:
+    try:
+        return import_head_video(payload.uuid, payload.path, payload.lock_token)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/generation/run")
+def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
+    try:
+        lock_tokens = {}
+        if payload.clip_ids and payload.lock_token:
+            lock_tokens = {str(clip_id): payload.lock_token for clip_id in payload.clip_ids}
+        return run_generation(payload.mode, payload.clip_ids, payload.dry_run, lock_tokens)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/generation/{job_id}/retry")
+def post_generation_retry(job_id: int, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+    try:
+        return retry_job(job_id, payload.lock_token if payload else None)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/clips/{clip_id}/retry")
+def post_clip_retry(clip_id: int, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+    try:
+        return retry_clip(clip_id, lock_token=payload.lock_token if payload else None)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/review/{clip_id}")
+def post_review(clip_id: int, payload: ReviewRequest) -> dict[str, Any]:
+    try:
+        return review_clip(clip_id, payload.decision, payload.job_id, payload.note, payload.lock_token)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/episodes/{uuid}/stitch")
+def post_stitch(uuid: str, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+    try:
+        return queue_stitch_episode(uuid.lower(), payload.lock_token if payload else None, require_lock_token=True)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/test/auto_accept")
+def post_auto_accept(payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    try:
+        uuid = None
+        if payload:
+            uuid = payload.get("uuid")
+        return auto_accept_all(uuid.lower() if isinstance(uuid, str) and uuid else None)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.get("/api/episodes")
+def get_episodes() -> list[dict[str, Any]]:
+    return list_episodes()
+
+
+@app.get("/api/clips")
+def get_clips() -> list[dict[str, Any]]:
+    return list_clips()
+
+
+@app.get("/api/jobs")
+def get_jobs() -> list[dict[str, Any]]:
+    return list_jobs()
+
+
+@app.get("/api/locks")
+def get_locks() -> list[dict[str, Any]]:
+    return list_locks()
+
+
+@app.post("/api/locks/acquire")
+def post_lock_acquire(payload: LockRequest) -> dict[str, Any]:
+    try:
+        return acquire_lock(
+            payload.resource_type,
+            payload.resource_id,
+            payload.owner_id,
+            payload.owner_name,
+            payload.ttl_sec,
+            payload.force,
+        )
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/locks/renew")
+def post_lock_renew(payload: LockRenewRequest) -> dict[str, Any]:
+    try:
+        return renew_lock(payload.token, payload.owner_id, payload.ttl_sec)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/locks/release")
+def post_lock_release(payload: LockReleaseRequest) -> dict[str, Any]:
+    try:
+        return release_lock(payload.token, payload.owner_id)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.get("/api/state")
+def get_state() -> dict[str, Any]:
+    return {
+        "episodes": list_episodes(),
+        "clips": list_clips(),
+        "jobs": list_jobs(),
+        "locks": list_locks(),
+        "settings": public_settings(),
+    }
+
+
+def _mount_static(prefix: str, directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    app.mount(prefix, StaticFiles(directory=directory), name=prefix.strip("/"))
+
+
+_mount_static("/clips", CLIPS_DIR)
+_mount_static("/generated", GENERATED_DIR)
+_mount_static("/accepted", ACCEPTED_DIR)
+_mount_static("/final", FINAL_DIR)
+_mount_static("/assets", FRONTEND_DIR)

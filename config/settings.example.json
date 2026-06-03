@@ -1,0 +1,15 @@
+{
+  "dm3_host": "DM3data",
+  "dm3_nedf_root": "/mnt/nm_data/data/nedf",
+  "public_base_url": "http://106.14.2.243:18080",
+  "generation_mode": "mock",
+  "mock_concurrency": 8,
+  "seedance_concurrency": 3,
+  "seedance_model": "doubao-seedance-2-0-fast-260128",
+  "seedance_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+  "seedance_api_key": "",
+  "seedance_resolution": "480p",
+  "seedance_ratio": "4:3",
+  "default_prompt": "保持参考视频中的视角方向、背景、动作和时序连续性，生成与输入 clip 时长一致的视频。",
+  "reference_images": []
+}

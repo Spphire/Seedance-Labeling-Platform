@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from .paths import CONFIG_DIR
+
+
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
+SECRET_KEYS = {"seedance_api_key"}
+DEFAULT_PUBLIC_BASE_URL = "http://106.14.2.243:18080"
+
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "dm3_host": "DM3data",
+    "dm3_nedf_root": "/mnt/nm_data/data/nedf",
+    "public_base_url": DEFAULT_PUBLIC_BASE_URL,
+    "generation_mode": "mock",
+    "mock_concurrency": 8,
+    "seedance_concurrency": 3,
+    "seedance_model": "doubao-seedance-2-0-fast-260128",
+    "seedance_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "seedance_api_key": "",
+    "seedance_resolution": "480p",
+    "seedance_ratio": "4:3",
+    "default_prompt": (
+        "保持参考视频中的视角方向、背景、动作和时序连续性，"
+        "生成与输入 clip 时长一致的视频。"
+    ),
+    "reference_images": [],
+}
+
+
+def load_settings() -> dict[str, Any]:
+    if not SETTINGS_PATH.exists():
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2), encoding="utf-8")
+        return dict(DEFAULT_SETTINGS)
+    data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    merged = dict(DEFAULT_SETTINGS)
+    merged.update(data)
+    return merged
+
+
+def save_settings(data: dict[str, Any]) -> dict[str, Any]:
+    merged = load_settings()
+    merged.update(data)
+    SETTINGS_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    return merged
+
+
+def public_settings() -> dict[str, Any]:
+    settings = load_settings()
+    visible = {key: value for key, value in settings.items() if key not in SECRET_KEYS}
+    visible["seedance_api_key_set"] = bool(settings.get("seedance_api_key"))
+    return visible
+
+
+def public_url_for(static_kind: str, relative_path: Path) -> str:
+    settings = load_settings()
+    base = str(settings["public_base_url"]).rstrip("/")
+    rel = relative_path.as_posix()
+    return f"{base}/{static_kind}/{rel}"

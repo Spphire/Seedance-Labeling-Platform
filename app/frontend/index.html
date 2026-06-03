@@ -1,0 +1,1294 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seedance 数据标注平台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #1b1f24;
+      --muted: #69707a;
+      --line: #d8dde4;
+      --accent: #176b87;
+      --accent-ink: #ffffff;
+      --ok: #1c7c54;
+      --warn: #9f6a00;
+      --bad: #b42318;
+      --focus: #dff4ff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 14px;
+    }
+
+    button, input, textarea, select {
+      font: inherit;
+    }
+
+    button {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 0 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    button:hover {
+      border-color: var(--accent);
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+    }
+
+    button.good {
+      background: var(--ok);
+      border-color: var(--ok);
+      color: #fff;
+    }
+
+    button.bad {
+      background: var(--bad);
+      border-color: var(--bad);
+      color: #fff;
+    }
+
+    button.warn {
+      background: var(--warn);
+      border-color: var(--warn);
+      color: #fff;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+
+    textarea, input, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 8px 10px;
+    }
+
+    textarea {
+      min-height: 116px;
+      resize: vertical;
+      line-height: 1.45;
+    }
+
+    .shell {
+      height: 100vh;
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      grid-template-rows: 54px minmax(0, 1fr);
+    }
+
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 18px;
+      background: #1f2933;
+      color: #fff;
+      border-bottom: 1px solid #111820;
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .header-actions input {
+      width: 230px;
+      height: 34px;
+      background: #111820;
+      border-color: #3d4854;
+      color: #fff;
+    }
+
+    .header-actions .reviewer {
+      width: 160px;
+    }
+
+    aside {
+      overflow: auto;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+
+    main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: 43px minmax(0, 1fr) 116px;
+      background: var(--bg);
+    }
+
+    .block {
+      margin-bottom: 14px;
+    }
+
+    .block h2 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 650;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 8px;
+    }
+
+    .row > * {
+      flex: 1;
+    }
+
+    .row > button,
+    .row > select {
+      flex: 0 0 auto;
+    }
+
+    .episode-list, .clip-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: #fff;
+    }
+
+    .item.active {
+      border-color: var(--accent);
+      background: var(--focus);
+    }
+
+    .item.stitching {
+      border-color: var(--accent);
+      background: #eef9fc;
+    }
+
+    .item.final-ready {
+      border-color: #a7e0c8;
+    }
+
+    .item.needs-attention {
+      border-color: #f3c26b;
+      background: #fffaf0;
+    }
+
+    .item-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 650;
+      font-size: 13px;
+    }
+
+    .item-title span:first-child {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 5px;
+      overflow-wrap: anywhere;
+    }
+
+    .episode-stage {
+      margin-top: 7px;
+      font-weight: 650;
+      color: #354252;
+    }
+
+    .episode-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 7px;
+    }
+
+    .progress {
+      height: 6px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #eef2f6;
+      margin-top: 8px;
+    }
+
+    .progress span {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--ok);
+      transition: width 0.2s ease;
+    }
+
+    .episode-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    .episode-actions a,
+    .episode-actions button {
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 0 8px;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .episode-actions a:hover,
+    .episode-actions button:hover {
+      border-color: var(--accent);
+    }
+
+    .tabs {
+      display: flex;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .tab {
+      min-width: 150px;
+      max-width: 240px;
+      height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0 10px;
+      border-right: 1px solid var(--line);
+      cursor: pointer;
+      background: #fff;
+    }
+
+    .tab.active {
+      background: var(--focus);
+      border-bottom: 2px solid var(--accent);
+    }
+
+    .tab span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tab button {
+      min-height: 24px;
+      width: 24px;
+      padding: 0;
+      border-radius: 50%;
+      color: var(--muted);
+    }
+
+    .workspace {
+      min-height: 0;
+      overflow: auto;
+      padding: 16px;
+    }
+
+    .empty {
+      height: 100%;
+      min-height: 360px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .review-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    .review-title {
+      min-width: 0;
+    }
+
+    .review-title h2 {
+      margin: 0 0 4px;
+      font-size: 20px;
+      letter-spacing: 0;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .videos {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+
+    .video-pane {
+      background: #0f1419;
+      border: 1px solid #111820;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .video-pane h3 {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0;
+      padding: 0 10px;
+      color: #e5e9ef;
+      font-size: 13px;
+      font-weight: 650;
+      background: #1f2933;
+    }
+
+    video {
+      display: block;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      background: #000;
+    }
+
+    .sync-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 14px;
+    }
+
+    .notice {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: #354252;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+    }
+
+    .notice.stitching {
+      border-color: #9cd7ec;
+      background: #eef9fc;
+    }
+
+    .notice.failed {
+      border-color: #f3aaa6;
+      background: #fff1f0;
+    }
+
+    .notice.locked {
+      border-color: #f3c26b;
+      background: #fffaf0;
+    }
+
+    .statusbar {
+      border-top: 1px solid var(--line);
+      background: #fff;
+      padding: 10px 14px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: var(--muted);
+      font-family: Consolas, "Segoe UI", monospace;
+      font-size: 12px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border-radius: 999px;
+      padding: 0 8px;
+      font-size: 12px;
+      background: #eef2f6;
+      color: #354252;
+      white-space: nowrap;
+    }
+
+    .badge.accepted {
+      background: #def7ec;
+      color: #03543f;
+    }
+
+    .badge.ready {
+      background: #def7ec;
+      color: #03543f;
+    }
+
+    .badge.failed,
+    .badge.rejected {
+      background: #fde8e8;
+      color: #9b1c1c;
+    }
+
+    .badge.generated,
+    .badge.generating {
+      background: #e1effe;
+      color: #1e429f;
+    }
+
+    .badge.stitching {
+      background: #e1effe;
+      color: #1e429f;
+    }
+
+    .badge.stitching::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      margin-right: 6px;
+      animation: pulse 1s ease-in-out infinite;
+    }
+
+    .badge.stale,
+    .badge.missing,
+    .badge.pending {
+      background: #eef2f6;
+      color: #354252;
+    }
+
+    .badge.flagged {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .badge.locked {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .badge.mine {
+      background: #def7ec;
+      color: #03543f;
+    }
+
+    @keyframes pulse {
+      0%, 100% {
+        opacity: 0.35;
+      }
+
+      50% {
+        opacity: 1;
+      }
+    }
+
+    @media (max-width: 980px) {
+      .shell {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto minmax(0, 1fr);
+      }
+
+      header {
+        min-height: 54px;
+        flex-wrap: wrap;
+        padding: 10px 14px;
+      }
+
+      aside {
+        max-height: 42vh;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      main {
+        grid-template-rows: 43px minmax(0, 1fr) 116px;
+      }
+
+      .videos {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>Seedance 数据标注平台</h1>
+      <div class="header-actions">
+        <input id="reviewerName" class="reviewer" placeholder="审核人">
+        <input id="publicBaseUrl" placeholder="public base url">
+        <button id="saveSettings">保存配置</button>
+        <button id="refresh" class="primary">刷新</button>
+      </div>
+    </header>
+
+    <aside>
+      <section class="block">
+        <h2>批量 episode</h2>
+        <textarea id="episodeText" spellcheck="false" placeholder="c412f233-549f-43cd-89c3-af0b496ae742"></textarea>
+        <div class="row">
+          <button id="submitEpisodes" class="primary">提交</button>
+          <button id="preprocess">预处理</button>
+        </div>
+        <div class="row">
+          <input id="headVideoPath" placeholder="已有 head MP4 路径">
+          <button id="importHead">导入</button>
+        </div>
+        <div class="row">
+          <select id="generationMode">
+            <option value="mock">mock</option>
+            <option value="seedance">seedance</option>
+          </select>
+          <button id="generate">生成</button>
+          <button id="dryRun">dry-run</button>
+        </div>
+        <div class="row">
+          <button id="autoAccept">全部保留</button>
+        </div>
+      </section>
+
+      <section class="block">
+        <h2>Episodes</h2>
+        <div id="episodeList" class="episode-list"></div>
+      </section>
+
+      <section class="block">
+        <h2>Clips</h2>
+        <div id="clipList" class="clip-list"></div>
+      </section>
+    </aside>
+
+    <main>
+      <nav id="tabs" class="tabs"></nav>
+      <section id="workspace" class="workspace">
+        <div class="empty">选择一个 clip 开始审核</div>
+      </section>
+      <div id="status" class="statusbar">ready</div>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      episodes: [],
+      clips: [],
+      jobs: [],
+      locks: [],
+      settings: {},
+      tabs: [],
+      activeClipId: null,
+      selectedEpisode: null,
+      pollTimer: null,
+      renewTimer: null,
+      clientId: "",
+      reviewerName: "",
+      clipLocks: {},
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status");
+    window.__seedanceState = state;
+
+    function initIdentity() {
+      let clientId = localStorage.getItem("seedance_client_id");
+      if (!clientId) {
+        clientId = `client-${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`;
+        localStorage.setItem("seedance_client_id", clientId);
+      }
+      let reviewerName = localStorage.getItem("seedance_reviewer_name") || "";
+      if (!reviewerName) {
+        reviewerName = `审核员-${clientId.slice(-4)}`;
+        localStorage.setItem("seedance_reviewer_name", reviewerName);
+      }
+      state.clientId = clientId;
+      state.reviewerName = reviewerName;
+      $("reviewerName").value = reviewerName;
+    }
+
+    function updateReviewerName(value) {
+      const name = value.trim() || `审核员-${state.clientId.slice(-4)}`;
+      state.reviewerName = name;
+      localStorage.setItem("seedance_reviewer_name", name);
+      $("reviewerName").value = name;
+    }
+
+    function log(message, data) {
+      const suffix = data === undefined ? "" : "\n" + JSON.stringify(data, null, 2);
+      statusEl.textContent = `${new Date().toLocaleTimeString()}  ${message}${suffix}`;
+    }
+
+    async function api(path, options = {}) {
+      const opts = { ...options };
+      opts.headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+      if (opts.body && typeof opts.body !== "string") {
+        opts.body = JSON.stringify(opts.body);
+      }
+      const res = await fetch(path, opts);
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (err) {
+          data = text;
+        }
+      }
+      if (!res.ok) {
+        const detail = data && data.detail ? data.detail : text;
+        const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        err.status = res.status;
+        err.detail = detail;
+        throw err;
+      }
+      return data;
+    }
+
+    async function refresh() {
+      const data = await api("/api/state");
+      state.episodes = data.episodes || [];
+      state.clips = data.clips || [];
+      state.jobs = data.jobs || [];
+      state.locks = data.locks || [];
+      state.settings = data.settings || {};
+      $("publicBaseUrl").value = state.settings.public_base_url || "";
+      $("generationMode").value = state.settings.generation_mode || "mock";
+      reconcileLocks();
+      render();
+      log("state refreshed");
+      schedulePolling();
+      scheduleRenewals();
+    }
+
+    function shortUuid(uuid) {
+      return uuid ? `${uuid.slice(0, 8)}...${uuid.slice(-6)}` : "";
+    }
+
+    function badge(status) {
+      return `<span class="badge ${status || ""}">${status || "unknown"}</span>`;
+    }
+
+    function myClipLock(clipId) {
+      return state.clipLocks[String(clipId)] || null;
+    }
+
+    function isMine(lock) {
+      return !!lock && lock.owner_id === state.clientId;
+    }
+
+    function lockText(lock) {
+      if (!lock) return "";
+      const seconds = Math.ceil(lock.expires_in_sec || 0);
+      return `${lock.owner_name || "其他人"} 锁定中 · ${seconds}s`;
+    }
+
+    function clipCanEdit(clip) {
+      return !!myClipLock(clip.id);
+    }
+
+    function reconcileLocks() {
+      const serverLocks = new Map(
+        (state.locks || [])
+          .filter((lock) => lock.resource_type === "clip")
+          .map((lock) => [String(lock.resource_id), lock])
+      );
+      Object.keys(state.clipLocks).forEach((clipId) => {
+        const serverLock = serverLocks.get(clipId);
+        if (!serverLock || !isMine(serverLock)) {
+          delete state.clipLocks[clipId];
+        }
+      });
+      state.clips.forEach((clip) => {
+        const serverLock = serverLocks.get(String(clip.id));
+        if (serverLock) {
+          clip.lock = serverLock;
+        }
+      });
+    }
+
+    function lockPayload(resourceType, resourceId, force = false) {
+      return {
+        resource_type: resourceType,
+        resource_id: String(resourceId),
+        owner_id: state.clientId,
+        owner_name: state.reviewerName,
+        ttl_sec: 90,
+        force,
+      };
+    }
+
+    async function acquireClipLock(clipId, force = false) {
+      try {
+        const lock = await api("/api/locks/acquire", {
+          method: "POST",
+          body: lockPayload("clip", clipId, force),
+        });
+        state.clipLocks[String(clipId)] = lock;
+        log(`clip ${clipId} locked by ${state.reviewerName}`);
+        await refresh();
+        return lock;
+      } catch (err) {
+        log(formatApiError(err));
+        await refresh();
+        return null;
+      }
+    }
+
+    async function renewClipLock(clipId) {
+      const lock = myClipLock(clipId);
+      if (!lock) return null;
+      try {
+        const renewed = await api("/api/locks/renew", {
+          method: "POST",
+          body: { token: lock.token, owner_id: state.clientId, ttl_sec: 90 },
+        });
+        state.clipLocks[String(clipId)] = renewed;
+        return renewed;
+      } catch (err) {
+        delete state.clipLocks[String(clipId)];
+        log(formatApiError(err));
+        await refresh();
+        return null;
+      }
+    }
+
+    async function releaseClipLock(clipId) {
+      const lock = myClipLock(clipId);
+      delete state.clipLocks[String(clipId)];
+      if (!lock) return;
+      try {
+        await api("/api/locks/release", {
+          method: "POST",
+          body: { token: lock.token, owner_id: state.clientId },
+        });
+      } catch (err) {
+        log(formatApiError(err));
+      }
+    }
+
+    async function withEpisodeLock(uuid, task) {
+      const lock = await api("/api/locks/acquire", {
+        method: "POST",
+        body: lockPayload("episode", uuid),
+      });
+      try {
+        return await task(lock);
+      } finally {
+        await api("/api/locks/release", {
+          method: "POST",
+          body: { token: lock.token, owner_id: state.clientId },
+        }).catch((err) => log(formatApiError(err)));
+      }
+    }
+
+    function scheduleRenewals() {
+      if (state.renewTimer) {
+        clearTimeout(state.renewTimer);
+        state.renewTimer = null;
+      }
+      if (!Object.keys(state.clipLocks).length) return;
+      state.renewTimer = setTimeout(async () => {
+        await Promise.all(Object.keys(state.clipLocks).map((clipId) => renewClipLock(clipId)));
+        scheduleRenewals();
+      }, 30000);
+    }
+
+    function formatApiError(err) {
+      if (err && err.detail && typeof err.detail === "object") {
+        return err.detail.lock ? `${err.detail.message}: ${lockText(err.detail.lock)}` : (err.detail.message || JSON.stringify(err.detail));
+      }
+      try {
+        const parsed = JSON.parse(err.message);
+        if (parsed.message) {
+          return parsed.lock ? `${parsed.message}: ${lockText(parsed.lock)}` : parsed.message;
+        }
+      } catch {}
+      return err.message;
+    }
+
+    function pct(value, total) {
+      if (!total) return 0;
+      return Math.max(0, Math.min(100, Math.round((value / total) * 100)));
+    }
+
+    function uuidsFromText(text) {
+      const matches = text.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g) || [];
+      return [...new Set(matches.map((item) => item.toLowerCase()))];
+    }
+
+    function episodeClass(episode) {
+      const classes = ["item"];
+      if (state.selectedEpisode === episode.uuid) classes.push("active");
+      if (episode.final_status === "stitching") classes.push("stitching");
+      if (episode.final_status === "ready") classes.push("final-ready");
+      if (episode.generated_failed_clip_count || episode.flagged_clip_count || episode.rejected_clip_count) {
+        classes.push("needs-attention");
+      }
+      return classes.join(" ");
+    }
+
+    function episodeStage(episode) {
+      return episode.episode_stage || "等待处理";
+    }
+
+    function episodeFacts(episode) {
+      const facts = [
+        `${episode.accepted_clip_count || 0}/${episode.clip_count || 0} accepted`,
+        `${episode.review_remaining_count || 0} 待处理`,
+      ];
+      if (episode.generating_clip_count) facts.push(`${episode.generating_clip_count} 生成中`);
+      if (episode.generated_clip_count) facts.push(`${episode.generated_clip_count} 待审核`);
+      if (episode.generated_failed_clip_count) facts.push(`${episode.generated_failed_clip_count} 失败`);
+      if (episode.flagged_clip_count) facts.push(`${episode.flagged_clip_count} 标记问题`);
+      if (episode.rejected_clip_count) facts.push(`${episode.rejected_clip_count} 已丢弃`);
+      return facts;
+    }
+
+    function schedulePolling() {
+      if (state.pollTimer) {
+        clearTimeout(state.pollTimer);
+        state.pollTimer = null;
+      }
+      const hasActiveWork = state.episodes.some((episode) => episode.final_status === "stitching")
+        || state.clips.some((clip) => clip.status === "generating");
+      if (hasActiveWork) {
+        state.pollTimer = setTimeout(() => {
+          refresh().catch((err) => log(err.message));
+        }, 1500);
+      }
+    }
+
+    function renderEpisodes() {
+      const target = $("episodeList");
+      target.innerHTML = "";
+      state.episodes.forEach((episode) => {
+        const accepted = episode.accepted_clip_count || 0;
+        const total = episode.clip_count || 0;
+        const progress = pct(accepted, total);
+        const div = document.createElement("div");
+        div.className = episodeClass(episode);
+        div.innerHTML = `
+          <div class="item-title"><span>${shortUuid(episode.uuid)}</span>${badge(episode.final_status || episode.status)}</div>
+          <div class="episode-stage">${episodeStage(episode)}</div>
+          <div class="progress" title="${progress}% accepted"><span style="width: ${progress}%"></span></div>
+          <div class="episode-facts">${episodeFacts(episode).map((fact) => `<span class="badge">${fact}</span>`).join("")}</div>
+          <div class="meta">${episode.uuid}</div>
+          <div class="episode-actions">
+            ${episode.final_url ? `<a href="${episode.final_url}" target="_blank" rel="noreferrer">打开 final</a>` : ""}
+            ${total && accepted === total && episode.final_status !== "stitching" ? `<button data-episode-stitch="${episode.uuid}">重新合成</button>` : ""}
+          </div>
+        `;
+        div.addEventListener("click", () => {
+          state.selectedEpisode = state.selectedEpisode === episode.uuid ? null : episode.uuid;
+          render();
+        });
+        div.querySelectorAll("[data-episode-stitch]").forEach((button) => {
+          button.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            button.disabled = true;
+            try {
+              const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/stitch`, {
+                method: "POST",
+                body: { lock_token: lock.token },
+              }));
+              log("episode stitch queued", result);
+              await refresh();
+            } catch (err) {
+              log(err.message);
+            } finally {
+              button.disabled = false;
+            }
+          });
+        });
+        target.appendChild(div);
+      });
+    }
+
+    function renderClips() {
+      const target = $("clipList");
+      target.innerHTML = "";
+      const clips = state.selectedEpisode
+        ? state.clips.filter((clip) => clip.episode_uuid === state.selectedEpisode)
+        : state.clips;
+      clips.forEach((clip) => {
+        const div = document.createElement("div");
+        div.className = `item ${state.activeClipId === clip.id ? "active" : ""}`;
+        const lock = clip.lock;
+        const lockBadge = lock ? badge(isMine(lock) ? "mine" : "locked") : "";
+        div.innerHTML = `
+          <div class="item-title">
+            <span>${shortUuid(clip.episode_uuid)} #${String(clip.clip_index).padStart(4, "0")}</span>
+            ${badge(clip.status)}
+          </div>
+          <div class="meta">${Number(clip.start_sec).toFixed(2)}s + ${Number(clip.duration_sec).toFixed(2)}s</div>
+          ${lock ? `<div class="meta">${lockBadge} ${lockText(lock)}</div>` : ""}
+        `;
+        div.addEventListener("click", () => openTab(clip.id));
+        target.appendChild(div);
+      });
+    }
+
+    async function openTab(clipId) {
+      if (!state.tabs.includes(clipId)) {
+        state.tabs.push(clipId);
+      }
+      state.activeClipId = clipId;
+      render();
+      if (!myClipLock(clipId)) {
+        await acquireClipLock(clipId);
+      }
+    }
+    window.openTab = openTab;
+
+    async function closeTab(clipId, event) {
+      event.stopPropagation();
+      const index = state.tabs.indexOf(clipId);
+      if (index >= 0) {
+        state.tabs.splice(index, 1);
+      }
+      if (state.activeClipId === clipId) {
+        state.activeClipId = state.tabs[index] || state.tabs[index - 1] || null;
+      }
+      await releaseClipLock(clipId);
+      render();
+    }
+
+    function renderTabs() {
+      const target = $("tabs");
+      target.innerHTML = "";
+      state.tabs.forEach((clipId) => {
+        const clip = state.clips.find((item) => item.id === clipId);
+        if (!clip) return;
+        const tab = document.createElement("div");
+        tab.className = `tab ${state.activeClipId === clipId ? "active" : ""}`;
+        tab.innerHTML = `<span>${shortUuid(clip.episode_uuid)} #${clip.clip_index}</span><button title="关闭">×</button>`;
+        tab.addEventListener("click", () => {
+          state.activeClipId = clipId;
+          render();
+        });
+        tab.querySelector("button").addEventListener("click", (event) => closeTab(clipId, event));
+        target.appendChild(tab);
+      });
+    }
+
+    function renderWorkspace() {
+      const target = $("workspace");
+      const clip = state.clips.find((item) => item.id === state.activeClipId);
+      if (!clip) {
+        target.innerHTML = `<div class="empty">选择一个 clip 开始审核</div>`;
+        return;
+      }
+      const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid) || {};
+      const generated = clip.generated_url || "";
+      const episodeNotice = renderEpisodeNotice(episode);
+      const canEdit = clipCanEdit(clip);
+      const lockNotice = renderClipLockNotice(clip, canEdit);
+      target.innerHTML = `
+        ${episodeNotice}
+        ${lockNotice}
+        <div class="review-head">
+          <div class="review-title">
+            <h2>${shortUuid(clip.episode_uuid)} · clip #${String(clip.clip_index).padStart(4, "0")}</h2>
+            <div class="meta">start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · job ${clip.latest_job_id || "-"} · final ${episode.final_status || "-"}</div>
+          </div>
+          <div class="actions">
+            <button class="good" data-action="accept" ${generated && canEdit ? "" : "disabled"}>保留</button>
+            <button class="bad" data-action="reject" ${canEdit ? "" : "disabled"}>丢弃</button>
+            <button data-action="rerun" ${canEdit ? "" : "disabled"}>重跑</button>
+            <button class="warn" data-action="flag" ${canEdit ? "" : "disabled"}>标记问题</button>
+          </div>
+        </div>
+        <div class="videos">
+          <div class="video-pane">
+            <h3><span>原 clip</span><span>${badge(clip.status)}</span></h3>
+            <video id="originalVideo" src="${clip.video_url || ""}" controls playsinline></video>
+          </div>
+          <div class="video-pane">
+            <h3><span>生成结果</span><span>${generated ? "ready" : "waiting"}</span></h3>
+            <video id="generatedVideo" src="${generated}" controls playsinline></video>
+          </div>
+        </div>
+        <div class="sync-row">
+          <button id="playBoth">同步播放</button>
+          <button id="pauseBoth">暂停</button>
+          <button id="restartBoth">回到开头</button>
+        </div>
+      `;
+      const takeover = document.querySelector("[data-action='takeover-lock']");
+      if (takeover) {
+        takeover.addEventListener("click", async () => acquireClipLock(clip.id, true));
+      }
+      wireReviewActions(clip);
+      wireSync();
+    }
+
+    function renderClipLockNotice(clip, canEdit) {
+      const lock = myClipLock(clip.id) || clip.lock;
+      if (canEdit) {
+        return `<div class="notice">你正在锁定这个 clip，可以安全审核。锁会自动续租，关闭标签页会释放。</div>`;
+      }
+      if (lock) {
+        return `
+          <div class="notice locked">
+            这个 clip 正在被 ${lock.owner_name || "其他人"} 审核，当前为只读模式。
+            <button data-action="takeover-lock">接管锁</button>
+          </div>
+        `;
+      }
+      return `<div class="notice locked">这个 clip 尚未拿到编辑锁，正在尝试锁定。若一直不可编辑，请刷新或重新打开标签页。</div>`;
+    }
+
+    function renderEpisodeNotice(episode) {
+      if (!episode || !episode.uuid) return "";
+      if (episode.final_status === "stitching") {
+        return `<div class="notice stitching">这个 episode 的所有 clip 已经保留，正在后台合成完整 final。旧 final 会保留到新文件合成完成后再被替换。</div>`;
+      }
+      if (episode.final_status === "ready") {
+        return `<div class="notice">这个 episode 已经全部保留并合成 final。${episode.final_url ? `<a href="${episode.final_url}" target="_blank" rel="noreferrer">打开 final</a>` : ""}</div>`;
+      }
+      if (episode.final_status === "failed") {
+        return `<div class="notice failed">这个 episode 的 final 合成失败，可以在左侧 episode 卡片点“重新合成”。${episode.error ? `错误：${episode.error}` : ""}</div>`;
+      }
+      if ((episode.generated_failed_clip_count || 0) > 0) {
+        return `<div class="notice failed">这个 episode 有 ${episode.generated_failed_clip_count} 个 clip 生成失败，建议先重跑失败 clip。</div>`;
+      }
+      if ((episode.generated_clip_count || 0) > 0 || (episode.flagged_clip_count || 0) > 0 || (episode.rejected_clip_count || 0) > 0) {
+        return `<div class="notice">这个 episode 还需要人工判断：${episode.review_remaining_count || 0} 个 clip 尚未保留。</div>`;
+      }
+      return "";
+    }
+
+    function wireSync() {
+      const original = $("originalVideo");
+      const generated = $("generatedVideo");
+      const pair = [original, generated].filter(Boolean);
+      $("playBoth").addEventListener("click", () => {
+        pair.forEach((video) => video.play());
+      });
+      $("pauseBoth").addEventListener("click", () => {
+        pair.forEach((video) => video.pause());
+      });
+      $("restartBoth").addEventListener("click", () => {
+        pair.forEach((video) => { video.currentTime = 0; });
+      });
+      if (original && generated) {
+        original.addEventListener("play", () => {
+          if (Math.abs(generated.currentTime - original.currentTime) > 0.2) {
+            generated.currentTime = original.currentTime;
+          }
+          generated.play();
+        });
+        original.addEventListener("pause", () => generated.pause());
+        original.addEventListener("seeked", () => {
+          generated.currentTime = original.currentTime;
+        });
+      }
+    }
+
+    function wireReviewActions(clip) {
+      document.querySelectorAll("[data-action]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const action = button.dataset.action;
+          button.disabled = true;
+          try {
+            const lock = myClipLock(clip.id);
+            if (!lock) {
+              throw new Error("这个 clip 没有编辑锁，不能提交审核操作");
+            }
+            if (action === "rerun") {
+              const result = await api(`/api/clips/${clip.id}/retry`, {
+                method: "POST",
+                body: { lock_token: lock.token },
+              });
+              log("rerun submitted", result);
+            } else {
+              const decision = action === "accept" ? "accept" : action === "reject" ? "reject" : "flag";
+              const result = await api(`/api/review/${clip.id}`, {
+                method: "POST",
+                body: { decision, job_id: clip.latest_job_id, note: "", lock_token: lock.token },
+              });
+              log(`review ${decision}`, result);
+            }
+            await refresh();
+          } catch (err) {
+            log(err.message);
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+    }
+
+    function render() {
+      renderEpisodes();
+      renderClips();
+      renderTabs();
+      renderWorkspace();
+    }
+
+    initIdentity();
+
+    $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
+    $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
+
+    window.addEventListener("beforeunload", () => {
+      Object.keys(state.clipLocks).forEach((clipId) => {
+        const lock = state.clipLocks[clipId];
+        if (!lock) return;
+        const body = JSON.stringify({ token: lock.token, owner_id: state.clientId });
+        navigator.sendBeacon?.("/api/locks/release", new Blob([body], { type: "application/json" }));
+      });
+    });
+
+    $("refresh").addEventListener("click", () => refresh().catch((err) => log(formatApiError(err))));
+    $("saveSettings").addEventListener("click", async () => {
+      try {
+        const values = {
+          public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
+          generation_mode: $("generationMode").value,
+        };
+        const result = await api("/api/settings", { method: "POST", body: { values } });
+        log("settings saved", result);
+        await refresh();
+      } catch (err) {
+        log(err.message);
+      }
+    });
+    $("submitEpisodes").addEventListener("click", async () => {
+      try {
+        const result = await api("/api/episodes/batch", {
+          method: "POST",
+          body: { episodes_text: $("episodeText").value },
+        });
+        log("episodes submitted", result);
+        await refresh();
+      } catch (err) {
+        log(err.message);
+      }
+    });
+    $("preprocess").addEventListener("click", async () => {
+      const lockTokens = {};
+      try {
+        log("preprocess running");
+        let uuids = state.selectedEpisode ? [state.selectedEpisode] : uuidsFromText($("episodeText").value);
+        if (!uuids.length) {
+          uuids = state.episodes.map((episode) => episode.uuid);
+        }
+        if (!uuids.length) throw new Error("没有可预处理的 episode");
+        if (uuids) {
+          for (const uuid of uuids) {
+            const lock = await api("/api/locks/acquire", {
+              method: "POST",
+              body: lockPayload("episode", uuid),
+            });
+            lockTokens[uuid] = lock.token;
+          }
+        }
+        const result = await api("/api/pipeline/preprocess", {
+          method: "POST",
+          body: { uuids, fetch_remote: true, lock_tokens: lockTokens },
+        });
+        log("preprocess finished", result);
+        await refresh();
+      } catch (err) {
+        log(formatApiError(err));
+      } finally {
+        await Promise.all(Object.values(lockTokens).map((token) => api("/api/locks/release", {
+          method: "POST",
+          body: { token, owner_id: state.clientId },
+        }).catch((err) => log(formatApiError(err)))));
+      }
+    });
+    $("importHead").addEventListener("click", async () => {
+      try {
+        const text = $("episodeText").value;
+        const match = text.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+        if (!match) throw new Error("episode 文本里需要一个 UUID");
+        const path = $("headVideoPath").value.trim();
+        if (!path) throw new Error("需要填写已有 head MP4 路径");
+        const uuid = match[0].toLowerCase();
+        const result = await withEpisodeLock(uuid, (lock) => api("/api/pipeline/import_head", {
+          method: "POST",
+          body: { uuid, path, lock_token: lock.token },
+        }));
+        log("head video imported", result);
+        await refresh();
+      } catch (err) {
+        log(formatApiError(err));
+      }
+    });
+    $("generate").addEventListener("click", async () => {
+      try {
+        const mode = $("generationMode").value;
+        const result = await api("/api/generation/run", { method: "POST", body: { mode, dry_run: false } });
+        log(`${mode} generation finished`, result);
+        await refresh();
+      } catch (err) {
+        log(err.message);
+      }
+    });
+    $("dryRun").addEventListener("click", async () => {
+      try {
+        const result = await api("/api/generation/run", { method: "POST", body: { mode: "seedance", dry_run: true } });
+        log("seedance dry-run payloads written", result);
+        await refresh();
+      } catch (err) {
+        log(err.message);
+      }
+    });
+    $("autoAccept").addEventListener("click", async () => {
+      try {
+        const result = await api("/api/test/auto_accept", { method: "POST", body: { uuid: state.selectedEpisode } });
+        log("auto accept finished", result);
+        await refresh();
+      } catch (err) {
+        log(err.message);
+      }
+    });
+
+    refresh().catch((err) => log(err.message));
+  </script>
+</body>
+</html>
