@@ -6,6 +6,7 @@ import shutil
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ["SEEDANCE_PLATFORM_ROOT"] = str(Path(__file__).resolve().parent / "_tmp_platform")
 
@@ -15,7 +16,7 @@ from app.backend import db
 from app.backend.main import app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
-from app.backend.services import create_clips, refresh_clip_public_urls, review_clip, run_generation
+from app.backend.services import create_clips, list_clips, queue_generation, refresh_clip_public_urls, review_clip, run_generation
 from app.backend.settings import DEFAULT_SETTINGS, save_settings
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
 
@@ -152,6 +153,40 @@ class MockPipelineTest(unittest.TestCase):
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["duration"], 6)
         self.assertIn("video_url", json.dumps(payload))
+
+    def test_seedance_queue_marks_running_and_blocks_duplicate(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000011"
+        now = db.now()
+        save_settings({"generation_mode": "seedance", "seedance_seconds_per_video_second": 24})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.2)
+        clips = create_clips(uuid, head, 5.2)
+
+        with patch("app.backend.services._GENERATION_EXECUTOR.submit") as submit:
+            first = queue_generation(mode="seedance")
+            second = queue_generation(mode="seedance")
+
+        self.assertEqual(first[0]["status"], "queued")
+        self.assertEqual(first[0]["estimated_total_sec"], 144)
+        self.assertEqual(second, [])
+        submit.assert_called_once()
+
+        clip = db.one("SELECT * FROM clips WHERE id=?", (clips[0]["id"],))
+        self.assertEqual(clip["status"], "generating")
+        job = db.one("SELECT * FROM generation_jobs WHERE clip_id=?", (clips[0]["id"],))
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["estimated_total_sec"], 144)
+        listed = [item for item in list_clips() if item["id"] == clips[0]["id"]][0]
+        self.assertEqual(listed["latest_job"]["status"], "running")
+        self.assertIsNone(listed["generated_url"])
 
     def test_public_settings_do_not_expose_api_key(self) -> None:
         save_settings({"seedance_api_key": "secret-token"})

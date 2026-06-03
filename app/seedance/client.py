@@ -53,6 +53,25 @@ class SeedanceClient:
         client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
         result = client.content_generation.tasks.create(**payload)
         task_id = result.id
+        return self.wait_and_download(client, task_id, output_path)
+
+    def create_task(self, prompt: str, public_url: str, duration_sec: float) -> dict[str, Any]:
+        api_key = self.settings.get("seedance_api_key")
+        if not api_key:
+            raise RuntimeError("seedance_api_key is required for seedance mode")
+        payload = self.dry_run_payload(prompt, public_url, duration_sec)
+        client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
+        result = client.content_generation.tasks.create(**payload)
+        return {"task_id": result.id}
+
+    def wait_for_task(self, task_id: str, output_path: Path) -> dict[str, Any]:
+        api_key = self.settings.get("seedance_api_key")
+        if not api_key:
+            raise RuntimeError("seedance_api_key is required for seedance mode")
+        client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
+        return self.wait_and_download(client, task_id, output_path)
+
+    def wait_and_download(self, client: Ark, task_id: str, output_path: Path) -> dict[str, Any]:
         while True:
             task = client.content_generation.tasks.get(task_id=task_id)
             if task.status == "succeeded":
@@ -76,4 +95,3 @@ class SeedanceClient:
                 end = min([p for p in [text.find('"', idx), text.find("\\", idx)] if p >= 0] or [len(text)])
                 return text[idx:end]
         return ""
-

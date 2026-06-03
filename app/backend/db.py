@@ -77,6 +77,9 @@ def init_db() -> None:
                 output_url TEXT,
                 output_path TEXT,
                 error TEXT,
+                started_at REAL,
+                completed_at REAL,
+                estimated_total_sec REAL,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -114,6 +117,15 @@ def init_db() -> None:
             ON resource_locks(expires_at);
             """
         )
+        _ensure_column(conn, "generation_jobs", "started_at", "REAL")
+        _ensure_column(conn, "generation_jobs", "completed_at", "REAL")
+        _ensure_column(conn, "generation_jobs", "estimated_total_sec", "REAL")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def rows(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:

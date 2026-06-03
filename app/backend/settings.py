@@ -10,6 +10,14 @@ from .paths import CONFIG_DIR
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 SECRET_KEYS = {"seedance_api_key"}
 DEFAULT_PUBLIC_BASE_URL = "http://106.14.2.243:18080"
+DEFAULT_PROMPT = (
+    "把@视频1中的真人手换成@图片1@图片2的机械臂，"
+    "把@视频1中真人手臂换成@图片3@图片4中的机械臂，"
+    "爪夹形态、动作、画面、背景保持不变"
+)
+LEGACY_DEFAULT_PROMPTS = {
+    "保持参考视频中的视角方向、背景、动作和时序连续性，生成与输入 clip 时长一致的视频。",
+}
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -24,10 +32,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "seedance_api_key": "",
     "seedance_resolution": "480p",
     "seedance_ratio": "4:3",
-    "default_prompt": (
-        "保持参考视频中的视角方向、背景、动作和时序连续性，"
-        "生成与输入 clip 时长一致的视频。"
-    ),
+    "seedance_seconds_per_video_second": 24,
+    "default_prompt": DEFAULT_PROMPT,
     "reference_images": [],
 }
 
@@ -38,6 +44,8 @@ def load_settings() -> dict[str, Any]:
         SETTINGS_PATH.write_text(json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2), encoding="utf-8")
         return dict(DEFAULT_SETTINGS)
     data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    if data.get("default_prompt") in LEGACY_DEFAULT_PROMPTS:
+        data["default_prompt"] = DEFAULT_PROMPT
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data)
     return merged

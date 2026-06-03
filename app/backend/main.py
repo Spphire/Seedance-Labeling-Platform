@@ -29,12 +29,12 @@ from .services import (
     list_episodes,
     list_jobs,
     preprocess,
+    queue_generation,
     queue_stitch_episode,
     refresh_clip_public_urls,
     retry_clip,
     retry_job,
     review_clip,
-    run_generation,
     submit_episodes,
 )
 from .settings import load_settings, public_settings, save_settings
@@ -133,7 +133,7 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
         lock_tokens = {}
         if payload.clip_ids and payload.lock_token:
             lock_tokens = {str(clip_id): payload.lock_token for clip_id in payload.clip_ids}
-        return run_generation(payload.mode, payload.clip_ids, payload.dry_run, lock_tokens)
+        return queue_generation(payload.mode, payload.clip_ids, payload.dry_run, lock_tokens)
     except Exception as exc:
         raise _public_error(exc) from exc
 

@@ -188,6 +188,13 @@
       font-weight: 650;
     }
 
+    .hint {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
     .admin-actions {
       display: flex;
       gap: 8px;
@@ -315,6 +322,10 @@
       width: 0;
       background: var(--ok);
       transition: width 0.2s ease;
+    }
+
+    .progress.running span {
+      background: var(--accent);
     }
 
     .episode-actions {
@@ -636,6 +647,50 @@
           <label for="publicBaseUrl">Clip 访问地址</label>
           <input id="publicBaseUrl" placeholder="http://106.14.2.243:18080">
         </div>
+        <div class="field">
+          <label for="seedanceApiKey">Seedance API Key</label>
+          <input id="seedanceApiKey" type="password" autocomplete="off" placeholder="留空则不修改">
+          <div id="seedanceApiKeyHint" class="hint"></div>
+        </div>
+        <div class="field">
+          <label for="defaultPrompt">默认 Prompt</label>
+          <textarea id="defaultPrompt" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <label for="referenceImages">参考图路径或 URL</label>
+          <textarea id="referenceImages" spellcheck="false" placeholder="每行一个；需要 4 张时填 4 行"></textarea>
+        </div>
+        <div class="field">
+          <label for="seedanceModel">Seedance 模型</label>
+          <input id="seedanceModel" placeholder="doubao-seedance-2-0-fast-260128">
+        </div>
+        <div class="field">
+          <label for="seedanceBaseUrl">Seedance Base URL</label>
+          <input id="seedanceBaseUrl" placeholder="https://ark.cn-beijing.volces.com/api/v3">
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="seedanceResolution">分辨率</label>
+            <select id="seedanceResolution">
+              <option value="480p">480p</option>
+              <option value="720p">720p</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="seedanceRatio">画面比例</label>
+            <input id="seedanceRatio" placeholder="4:3">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="seedanceConcurrency">并发数</label>
+            <input id="seedanceConcurrency" type="number" min="1" step="1" placeholder="3">
+          </div>
+          <div class="field">
+            <label for="seedanceSecondsPerVideoSecond">预计耗时倍数</label>
+            <input id="seedanceSecondsPerVideoSecond" type="number" min="1" step="1" placeholder="24">
+          </div>
+        </div>
         <div class="admin-actions">
           <button id="closeSettings">关闭</button>
           <button id="saveSettings" class="primary">保存配置</button>
@@ -774,6 +829,16 @@
       $("dm3NedfRoot").value = state.settings.dm3_nedf_root || "/mnt/nm_data/data/nedf";
       $("publicBaseUrl").value = state.settings.public_base_url || "";
       $("generationMode").value = state.settings.generation_mode || "mock";
+      $("seedanceApiKey").value = "";
+      $("seedanceApiKeyHint").textContent = state.settings.seedance_api_key_set ? "服务器已保存 API Key；留空不会覆盖。" : "尚未保存 API Key。";
+      $("defaultPrompt").value = state.settings.default_prompt || "";
+      $("referenceImages").value = (state.settings.reference_images || []).join("\n");
+      $("seedanceModel").value = state.settings.seedance_model || "doubao-seedance-2-0-fast-260128";
+      $("seedanceBaseUrl").value = state.settings.seedance_base_url || "https://ark.cn-beijing.volces.com/api/v3";
+      $("seedanceResolution").value = state.settings.seedance_resolution || "480p";
+      $("seedanceRatio").value = state.settings.seedance_ratio || "4:3";
+      $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
+      $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
       reconcileLocks();
       render();
       log("state refreshed");
@@ -932,6 +997,28 @@
       return Math.max(0, Math.min(100, Math.round((value / total) * 100)));
     }
 
+    function formatDuration(seconds) {
+      if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "-";
+      const value = Math.max(0, Math.round(Number(seconds)));
+      const minutes = Math.floor(value / 60);
+      const rest = value % 60;
+      return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
+    }
+
+    function jobSummary(job) {
+      if (!job) return "";
+      if (job.status === "running") {
+        return `job ${job.id} · 已耗时 ${formatDuration(job.elapsed_sec)} · 预计剩余 ${formatDuration(job.remaining_estimated_sec)}`;
+      }
+      if (job.status === "succeeded") {
+        return `job ${job.id} · 完成耗时 ${formatDuration(job.elapsed_sec)} · ${Number(job.seconds_per_video_second || 0).toFixed(1)}s/视频秒`;
+      }
+      if (job.status === "failed") {
+        return `job ${job.id} · 失败 · ${job.error || ""}`;
+      }
+      return `job ${job.id} · ${job.status}`;
+    }
+
     function uuidsFromText(text) {
       const matches = text.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g) || [];
       return [...new Set(matches.map((item) => item.toLowerCase()))];
@@ -1036,12 +1123,15 @@
         div.className = `item ${state.activeClipId === clip.id ? "active" : ""}`;
         const lock = clip.lock;
         const lockBadge = lock ? badge(isMine(lock) ? "mine" : "locked") : "";
+        const job = clip.latest_job;
         div.innerHTML = `
           <div class="item-title">
             <span>${shortUuid(clip.episode_uuid)} #${String(clip.clip_index).padStart(4, "0")}</span>
             ${badge(clip.status)}
           </div>
           <div class="meta">${Number(clip.start_sec).toFixed(2)}s + ${Number(clip.duration_sec).toFixed(2)}s</div>
+          ${job ? `<div class="meta">${jobSummary(job)}</div>` : ""}
+          ${job && job.status === "running" ? `<div class="progress running" title="${job.progress_pct}%"><span style="width: ${job.progress_pct}%"></span></div>` : ""}
           ${lock ? `<div class="meta">${lockBadge} ${lockText(lock)}</div>` : ""}
         `;
         div.addEventListener("click", () => openTab(clip.id));
@@ -1101,22 +1191,26 @@
       }
       const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid) || {};
       const generated = clip.generated_url || "";
+      const job = clip.latest_job || null;
+      const isGenerating = clip.status === "generating" || (job && job.status === "running");
       const episodeNotice = renderEpisodeNotice(episode);
       const canEdit = clipCanEdit(clip);
       const lockNotice = renderClipLockNotice(clip, canEdit);
+      const jobNotice = renderJobNotice(job);
       target.innerHTML = `
         ${episodeNotice}
         ${lockNotice}
+        ${jobNotice}
         <div class="review-head">
           <div class="review-title">
             <h2>${shortUuid(clip.episode_uuid)} · clip #${String(clip.clip_index).padStart(4, "0")}</h2>
-            <div class="meta">start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · job ${clip.latest_job_id || "-"} · final ${episode.final_status || "-"}</div>
+            <div class="meta">start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
           </div>
           <div class="actions">
-            <button class="good" data-action="accept" ${generated && canEdit ? "" : "disabled"}>保留</button>
-            <button class="bad" data-action="reject" ${canEdit ? "" : "disabled"}>丢弃</button>
-            <button data-action="rerun" ${canEdit ? "" : "disabled"}>重跑</button>
-            <button class="warn" data-action="flag" ${canEdit ? "" : "disabled"}>标记问题</button>
+            <button class="good" data-action="accept" ${generated && canEdit && !isGenerating ? "" : "disabled"}>保留</button>
+            <button class="bad" data-action="reject" ${canEdit && !isGenerating ? "" : "disabled"}>丢弃</button>
+            <button data-action="rerun" ${canEdit && !isGenerating ? "" : "disabled"}>重跑</button>
+            <button class="warn" data-action="flag" ${canEdit && !isGenerating ? "" : "disabled"}>标记问题</button>
           </div>
         </div>
         <div class="videos">
@@ -1144,6 +1238,9 @@
     }
 
     function renderClipLockNotice(clip, canEdit) {
+      if (clip.status === "generating") {
+        return `<div class="notice stitching">这个 clip 正在生成中，已锁定重跑和审核操作。完成后会自动拉取生成视频并刷新。</div>`;
+      }
       const lock = myClipLock(clip.id) || clip.lock;
       if (canEdit) {
         return `<div class="notice">你正在锁定这个 clip，可以安全审核。锁会自动续租，关闭标签页会释放。</div>`;
@@ -1157,6 +1254,22 @@
         `;
       }
       return `<div class="notice locked">这个 clip 尚未拿到编辑锁，正在尝试锁定。若一直不可编辑，请刷新或重新打开标签页。</div>`;
+    }
+
+    function renderJobNotice(job) {
+      if (!job) return "";
+      if (job.status === "running") {
+        return `
+          <div class="notice stitching">
+            Seedance 处理中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。
+            <div class="progress running" title="${job.progress_pct}%"><span style="width: ${job.progress_pct}%"></span></div>
+          </div>
+        `;
+      }
+      if (job.status === "failed") {
+        return `<div class="notice failed">Seedance 生成失败：${job.error || "未知错误"}</div>`;
+      }
+      return "";
     }
 
     function renderEpisodeNotice(episode) {
@@ -1281,7 +1394,19 @@
           dm3_nedf_root: $("dm3NedfRoot").value.trim() || "/mnt/nm_data/data/nedf",
           public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
           generation_mode: $("generationMode").value,
+          default_prompt: $("defaultPrompt").value.trim(),
+          reference_images: $("referenceImages").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+          seedance_model: $("seedanceModel").value.trim() || "doubao-seedance-2-0-fast-260128",
+          seedance_base_url: $("seedanceBaseUrl").value.trim() || "https://ark.cn-beijing.volces.com/api/v3",
+          seedance_resolution: $("seedanceResolution").value || "480p",
+          seedance_ratio: $("seedanceRatio").value.trim() || "4:3",
+          seedance_concurrency: Math.max(1, Number.parseInt($("seedanceConcurrency").value, 10) || 3),
+          seedance_seconds_per_video_second: Math.max(1, Number.parseFloat($("seedanceSecondsPerVideoSecond").value) || 24),
         };
+        const apiKey = $("seedanceApiKey").value.trim();
+        if (apiKey) {
+          values.seedance_api_key = apiKey;
+        }
         const result = await api("/api/settings", { method: "POST", body: { values } });
         log("settings saved", result);
         $("settingsOverlay").classList.add("hidden");
