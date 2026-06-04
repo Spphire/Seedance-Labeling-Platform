@@ -834,7 +834,11 @@
         <div class="field">
           <label>参考图顺序</label>
           <div id="referenceImageOrder" class="ref-image-order"></div>
-          <div class="hint">按顺序对应 prompt 中的 @图片1、@图片2、@图片3、@图片4。</div>
+          <div class="row">
+            <button id="addReferenceImageSlot">添加参考图</button>
+            <button id="removeReferenceImageSlot">移除最后一张</button>
+          </div>
+          <div class="hint">按顺序对应 prompt 中的 @图片1、@图片2……；参考图数量跟随组合，也可手动增减。</div>
         </div>
         <div class="field">
           <label for="seedanceModel">Seedance 模型</label>
@@ -903,6 +907,10 @@
         <div class="field">
           <label>本次参考图顺序</label>
           <div id="runReferenceImageOrder" class="ref-image-order"></div>
+          <div class="row">
+            <button id="addRunReferenceImageSlot">添加参考图</button>
+            <button id="removeRunReferenceImageSlot">移除最后一张</button>
+          </div>
           <div class="hint">这里只影响本次生成/重跑；管理员默认值在 /admin 中保存。</div>
         </div>
         <div class="admin-actions">
@@ -1220,7 +1228,8 @@
       const target = $(targetId);
       const available = state.availableReferenceImages || [];
       target.innerHTML = "";
-      for (let index = 0; index < 4; index += 1) {
+      const rowCount = Math.max(1, selected.length);
+      for (let index = 0; index < rowCount; index += 1) {
         const value = selected[index] || available[index]?.id || "";
         const row = document.createElement("div");
         row.className = "ref-image-row";
@@ -1242,13 +1251,39 @@
         });
       });
       updateReferencePreviews(scope);
+      updateReferenceSlotControls(scope);
+    }
+
+    function referenceImageValues(scope) {
+      return [...document.querySelectorAll(`[data-ref-image-scope="${scope}"]`)]
+        .sort((a, b) => Number(a.dataset.refImageIndex) - Number(b.dataset.refImageIndex))
+        .map((select) => select.value);
     }
 
     function selectedReferenceImages(scope) {
-      return [...document.querySelectorAll(`[data-ref-image-scope="${scope}"]`)]
-        .sort((a, b) => Number(a.dataset.refImageIndex) - Number(b.dataset.refImageIndex))
-        .map((select) => select.value)
+      return referenceImageValues(scope)
         .filter(Boolean);
+    }
+
+    function updateReferenceSlotControls(scope) {
+      const removeButton = scope === "settings" ? $("removeReferenceImageSlot") : $("removeRunReferenceImageSlot");
+      if (!removeButton) return;
+      removeButton.disabled = document.querySelectorAll(`[data-ref-image-scope="${scope}"]`).length <= 1;
+    }
+
+    function addReferenceImageSlot(targetId, scope, onChange) {
+      const values = referenceImageValues(scope);
+      values.push("");
+      renderReferenceImageSelectors(targetId, values, scope, onChange);
+      if (onChange) onChange();
+    }
+
+    function removeReferenceImageSlot(targetId, scope, onChange) {
+      const values = referenceImageValues(scope);
+      if (values.length <= 1) return;
+      values.pop();
+      renderReferenceImageSelectors(targetId, values, scope, onChange);
+      if (onChange) onChange();
     }
 
     function updateReferencePreviews(scope) {
@@ -2236,10 +2271,15 @@
     $("generationMode").addEventListener("change", updateRunSettingsSummary);
     $("runPrompt").addEventListener("input", updateRunSettingsSummary);
     $("runPresetSelect").addEventListener("change", () => applyRunPreset($("runPresetSelect").value));
+    $("addReferenceImageSlot").addEventListener("click", () => addReferenceImageSlot("referenceImageOrder", "settings", markSettingsDirty));
+    $("removeReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("referenceImageOrder", "settings", markSettingsDirty));
+    $("addRunReferenceImageSlot").addEventListener("click", () => addReferenceImageSlot("runReferenceImageOrder", "run", updateRunSettingsSummary));
+    $("removeRunReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("runReferenceImageOrder", "run", updateRunSettingsSummary));
     $("adminPresetSelect").addEventListener("change", () => {
       const nextPresetId = $("adminPresetSelect").value;
       captureActiveAdminPreset();
       state.activeAdminPresetId = nextPresetId;
+      renderAdminPresetSelector();
       populateAdminPresetForm();
       markSettingsDirty();
     });

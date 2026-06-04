@@ -16,6 +16,10 @@ DEFAULT_PROMPT = (
     "把@视频1中真人手臂换成@图片3@图片4中的机械臂，"
     "爪夹形态、动作、画面、背景保持不变"
 )
+IPHONE2DEPLOY_PROMPT = (
+    "把@视频1中的真人手臂和手机换成@图片1@图片2的机械臂和上面安装的相机，"
+    "爪夹形态、动作、画面、背景保持不变"
+)
 LEGACY_DEFAULT_PROMPTS = {
     "保持参考视频中的视角方向、背景、动作和时序连续性，生成与输入 clip 时长一致的视频。",
 }
@@ -28,14 +32,25 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/l-far-iphone.png",
     "app/reference_images/r-far-iphone.png",
 ]
+IPHONE2DEPLOY_REFERENCE_IMAGES = [
+    "app/reference_images/l-near-iphone.png",
+    "app/reference_images/r-near-iphone.png",
+]
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
+GENERATION_PRESETS_VERSION = 2
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
         "name": "iPhone 默认组合",
         "prompt": DEFAULT_PROMPT,
         "reference_images": DEFAULT_REFERENCE_IMAGES,
-    }
+    },
+    {
+        "id": "iphone2deploy",
+        "name": "iphone2deploy",
+        "prompt": IPHONE2DEPLOY_PROMPT,
+        "reference_images": IPHONE2DEPLOY_REFERENCE_IMAGES,
+    },
 ]
 REFERENCE_IMAGE_RENAMES = {
     "app/reference_images/l-near.png": "app/reference_images/l-near-iphone.png",
@@ -77,6 +92,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "default_prompt": DEFAULT_PROMPT,
     "reference_images": DEFAULT_REFERENCE_IMAGES,
     "default_generation_preset_id": DEFAULT_GENERATION_PRESET_ID,
+    "generation_presets_version": GENERATION_PRESETS_VERSION,
     "generation_presets": DEFAULT_GENERATION_PRESETS,
 }
 
@@ -104,6 +120,15 @@ def _normalized_reference_images(value: Any) -> list[str]:
     return _renamed_reference_images(refs)
 
 
+def _preset_copy(preset: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(preset["id"]),
+        "name": str(preset["name"]),
+        "prompt": str(preset["prompt"]),
+        "reference_images": list(preset["reference_images"]),
+    }
+
+
 def _normalize_generation_presets(data: dict[str, Any]) -> bool:
     changed = False
     default_prompt_present = "default_prompt" in data
@@ -118,14 +143,9 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
         changed = True
     raw_presets = data.get("generation_presets")
     if not isinstance(raw_presets, list) or not raw_presets:
-        raw_presets = [
-            {
-                "id": DEFAULT_GENERATION_PRESET_ID,
-                "name": "iPhone 默认组合",
-                "prompt": normalized_default_prompt,
-                "reference_images": normalized_reference_images or list(DEFAULT_REFERENCE_IMAGES),
-            }
-        ]
+        raw_presets = [_preset_copy(preset) for preset in DEFAULT_GENERATION_PRESETS]
+        raw_presets[0]["prompt"] = normalized_default_prompt
+        raw_presets[0]["reference_images"] = normalized_reference_images or list(DEFAULT_REFERENCE_IMAGES)
         changed = True
 
     presets: list[dict[str, Any]] = []
@@ -152,6 +172,24 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
         if normalized != item:
             changed = True
         presets.append(normalized)
+
+    try:
+        presets_version = int(data.get("generation_presets_version") or 1)
+    except (TypeError, ValueError):
+        presets_version = 1
+    if presets_version < GENERATION_PRESETS_VERSION:
+        for preset in DEFAULT_GENERATION_PRESETS:
+            if str(preset["id"]) in seen_ids:
+                continue
+            copied = _preset_copy(preset)
+            presets.append(copied)
+            seen_ids.add(copied["id"])
+            changed = True
+        data["generation_presets_version"] = GENERATION_PRESETS_VERSION
+        changed = True
+    elif data.get("generation_presets_version") != GENERATION_PRESETS_VERSION:
+        data["generation_presets_version"] = GENERATION_PRESETS_VERSION
+        changed = True
 
     default_id = str(data.get("default_generation_preset_id") or "").strip()
     if default_id not in seen_ids:
@@ -188,13 +226,6 @@ def _settings_from_disk() -> dict[str, Any]:
         return dict(DEFAULT_SETTINGS)
     data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     changed = False
-    if _prompt_needs_repair(data.get("default_prompt")):
-        data["default_prompt"] = DEFAULT_PROMPT
-        changed = True
-    refs = _normalized_reference_images(data.get("reference_images"))
-    if data.get("reference_images") != refs:
-        data["reference_images"] = refs
-        changed = True
     if _normalize_generation_presets(data):
         changed = True
     if changed:

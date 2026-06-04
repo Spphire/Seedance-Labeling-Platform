@@ -27,7 +27,17 @@ from app.backend.services import (
     review_clip,
     run_generation,
 )
-from app.backend.settings import DEFAULT_PROMPT, DEFAULT_SETTINGS, SETTINGS_PATH, load_settings, public_settings, save_settings
+from app.backend.settings import (
+    DEFAULT_PROMPT,
+    DEFAULT_SETTINGS,
+    GENERATION_PRESETS_VERSION,
+    IPHONE2DEPLOY_PROMPT,
+    IPHONE2DEPLOY_REFERENCE_IMAGES,
+    SETTINGS_PATH,
+    load_settings,
+    public_settings,
+    save_settings,
+)
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
 from app.seedance.client import SeedanceClient, resolve_image_value
 
@@ -282,9 +292,51 @@ class MockPipelineTest(unittest.TestCase):
             ],
         )
         self.assertEqual(settings["default_generation_preset_id"], "iphone-default")
-        self.assertEqual(settings["generation_presets"][0]["id"], "iphone-default")
-        self.assertEqual(settings["generation_presets"][0]["prompt"], DEFAULT_PROMPT)
-        self.assertEqual(settings["generation_presets"][0]["reference_images"], settings["reference_images"])
+        self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+        self.assertEqual(presets["iphone-default"]["prompt"], DEFAULT_PROMPT)
+        self.assertEqual(presets["iphone-default"]["reference_images"], settings["reference_images"])
+        self.assertEqual(presets["iphone2deploy"]["name"], "iphone2deploy")
+        self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(len(presets["iphone2deploy"]["reference_images"]), 2)
+
+    def test_old_generation_presets_gain_iphone2deploy_once(self) -> None:
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "default_prompt": DEFAULT_PROMPT,
+                    "reference_images": DEFAULT_SETTINGS["reference_images"],
+                    "default_generation_preset_id": "iphone-default",
+                    "generation_presets": [
+                        {
+                            "id": "iphone-default",
+                            "name": "iPhone 默认组合",
+                            "prompt": DEFAULT_PROMPT,
+                            "reference_images": DEFAULT_SETTINGS["reference_images"],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+
+        self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertIn("iphone2deploy", presets)
+        self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(persisted["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == "iphone2deploy"]), 1)
+
+        persisted["generation_presets"] = [item for item in persisted["generation_presets"] if item["id"] != "iphone2deploy"]
+        SETTINGS_PATH.write_text(json.dumps(persisted, ensure_ascii=False, indent=2), encoding="utf-8")
+        settings = load_settings()
+        self.assertNotIn("iphone2deploy", {item["id"] for item in settings["generation_presets"]})
 
     def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
         save_settings(

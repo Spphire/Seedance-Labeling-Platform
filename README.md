@@ -54,7 +54,7 @@ API key 不要提交到 Git。服务器部署后有两种配置方式：
 - 在右上角齿轮的后台管理员设置里填写 `Seedance API Key` 并保存。它会写入服务器本机被 `.gitignore` 忽略的 `config/settings.json`。
 - 或者用环境变量启动服务：`SEEDANCE_API_KEY=... bash run_server.sh`。兼容实验脚本里的 `ARK_API_KEY`，但 `SEEDANCE_API_KEY` 优先级更高。
 
-切到真实生成前，先在标注页选择 Prompt/ref 图组合，必要时做本次临时微调，再点 `dry-run`，确认写出的 payload 里 `content` 顺序是 prompt、图片1-4、视频1，且 `duration` 是当前 clip 秒数的向上取整。确认后再把运行模式切到 `seedance（真实消耗额度）`。
+切到真实生成前，先在标注页选择 Prompt/ref 图组合，必要时做本次临时微调，再点 `dry-run`，确认写出的 payload 里 `content` 顺序是 prompt、当前组合的参考图、视频1，且 `duration` 是当前 clip 秒数的向上取整。确认后再把运行模式切到 `seedance（真实消耗额度）`。
 
 ## 多人协作
 
