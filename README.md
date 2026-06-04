@@ -65,6 +65,8 @@ API key 不要提交到 Git。服务器部署后有两种配置方式：
 - 批量生成会跳过正在被人工锁定的 clip，避免覆盖别人正在审核的片段。
 - 自动 final 拼接是后台派生产物，不需要人工 episode 锁；它会检查 clip 状态，过期结果不会覆盖新结果。
 
+标注员日常操作请参考 [Seedance 标注员 SOP](docs/ANNOTATOR_SOP.md)。
+
 ## Data Layout
 
 - `data/episodes`：从 DM3data 拉取的原始 episode。
