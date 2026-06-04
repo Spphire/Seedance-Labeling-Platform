@@ -631,13 +631,6 @@
       background: #000;
     }
 
-    .sync-row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      margin-top: 14px;
-    }
-
     .notice {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -1885,11 +1878,6 @@
             <video id="generatedVideo" src="${generated}" controls playsinline></video>
           </div>
         </div>
-        <div class="sync-row">
-          <button id="playBoth">同步播放</button>
-          <button id="pauseBoth">暂停</button>
-          <button id="restartBoth">回到开头</button>
-        </div>
       `;
       target.dataset.signature = signature;
       const takeover = document.querySelector("[data-action='takeover-lock']");
@@ -1933,11 +1921,6 @@
             <h3><span>合成 final</span><span>${badge(episode.final_status || "missing")}</span></h3>
             <video id="generatedVideo" src="${finalReady ? episode.final_url : ""}" controls playsinline></video>
           </div>
-        </div>
-        <div class="sync-row">
-          <button id="playBoth" ${finalReady ? "" : "disabled"}>同步播放</button>
-          <button id="pauseBoth">暂停</button>
-          <button id="restartBoth">回到开头</button>
         </div>
       `;
       target.dataset.signature = signature;
@@ -2017,28 +2000,71 @@
     function wireSync() {
       const original = $("originalVideo");
       const generated = $("generatedVideo");
-      const pair = [original, generated].filter(Boolean);
-      $("playBoth").addEventListener("click", () => {
-        pair.forEach((video) => video.play());
-      });
-      $("pauseBoth").addEventListener("click", () => {
-        pair.forEach((video) => video.pause());
-      });
-      $("restartBoth").addEventListener("click", () => {
-        pair.forEach((video) => { video.currentTime = 0; });
-      });
-      if (original && generated) {
-        original.addEventListener("play", () => {
-          if (Math.abs(generated.currentTime - original.currentTime) > 0.2) {
-            generated.currentTime = original.currentTime;
+      const pair = [original, generated].filter((video) => video && (video.currentSrc || video.getAttribute("src")));
+      if (pair.length < 2) return;
+
+      let syncing = false;
+      const unlock = () => window.setTimeout(() => { syncing = false; }, 80);
+      const peers = (source) => pair.filter((video) => video !== source);
+      const syncTime = (source, target, threshold = 0.08) => {
+        if (!Number.isFinite(source.currentTime)) return;
+        if (Math.abs(target.currentTime - source.currentTime) > threshold) {
+          target.currentTime = source.currentTime;
+        }
+      };
+      const syncPlaybackRate = (source) => {
+        peers(source).forEach((target) => {
+          if (target.playbackRate !== source.playbackRate) {
+            target.playbackRate = source.playbackRate;
           }
-          generated.play();
         });
-        original.addEventListener("pause", () => generated.pause());
-        original.addEventListener("seeked", () => {
-          generated.currentTime = original.currentTime;
+      };
+
+      pair.forEach((video) => {
+        video.addEventListener("play", () => {
+          if (syncing) return;
+          syncing = true;
+          syncPlaybackRate(video);
+          peers(video).forEach((target) => {
+            syncTime(video, target);
+            target.play().catch(() => {});
+          });
+          unlock();
         });
-      }
+        video.addEventListener("pause", () => {
+          if (syncing) return;
+          syncing = true;
+          peers(video).forEach((target) => {
+            syncTime(video, target);
+            target.pause();
+          });
+          unlock();
+        });
+        video.addEventListener("seeking", () => {
+          if (syncing) return;
+          syncing = true;
+          peers(video).forEach((target) => syncTime(video, target, 0));
+          unlock();
+        });
+        video.addEventListener("seeked", () => {
+          if (syncing) return;
+          syncing = true;
+          peers(video).forEach((target) => syncTime(video, target, 0));
+          unlock();
+        });
+        video.addEventListener("ratechange", () => {
+          if (syncing) return;
+          syncing = true;
+          syncPlaybackRate(video);
+          unlock();
+        });
+        video.addEventListener("timeupdate", () => {
+          if (syncing || video.paused) return;
+          peers(video).forEach((target) => {
+            if (!target.paused) syncTime(video, target, 0.25);
+          });
+        });
+      });
     }
 
     function wireReviewActions(clip) {
