@@ -563,6 +563,7 @@
     }
 
     .badge.failed,
+    .badge.damaged,
     .badge.rejected {
       background: #fde8e8;
       color: #9b1c1c;
@@ -894,17 +895,20 @@
       return uuid ? `${uuid.slice(0, 8)}...${uuid.slice(-6)}` : "";
     }
 
-    function badge(status) {
-      return `<span class="badge ${status || ""}">${status || "unknown"}</span>`;
+    function badge(status, label) {
+      return `<span class="badge ${status || ""}">${label || status || "unknown"}</span>`;
     }
 
     function episodeBadges(episode) {
-      const values = [episode.status || "unknown"];
+      const values = [badge(episode.status || "unknown")];
+      if (episode.preprocess_health === "damaged") {
+        values.push(badge("damaged", "损坏"));
+      }
       const finalStatus = episode.final_status || "";
       if (finalStatus && finalStatus !== "missing") {
-        values.push(finalStatus);
+        values.push(badge(finalStatus));
       }
-      return values.map((value) => badge(value)).join("");
+      return values.join("");
     }
 
     function renderReferenceImageSelectors(selected) {
@@ -1153,7 +1157,7 @@
       if (state.selectedEpisode === episode.uuid) classes.push("active");
       if (episode.final_status === "stitching") classes.push("stitching");
       if (episode.final_status === "ready") classes.push("final-ready");
-      if (episode.generated_failed_clip_count || episode.flagged_clip_count || episode.rejected_clip_count) {
+      if (episode.generated_failed_clip_count || episode.flagged_clip_count || episode.rejected_clip_count || episode.preprocess_health === "damaged") {
         classes.push("needs-attention");
       }
       return classes.join(" ");
@@ -1173,6 +1177,7 @@
       if (episode.generated_failed_clip_count) facts.push(`${episode.generated_failed_clip_count} 失败`);
       if (episode.flagged_clip_count) facts.push(`${episode.flagged_clip_count} 标记问题`);
       if (episode.rejected_clip_count) facts.push(`${episode.rejected_clip_count} 已丢弃`);
+      if (episode.preprocess_health === "damaged") facts.push(`损坏：${episode.preprocess_health_reason || "需要重新预处理"}`);
       return facts;
     }
 

@@ -85,6 +85,9 @@ def list_episodes() -> list[dict[str, Any]]:
             """
         )
     }
+    clip_paths_by_episode: dict[str, list[str]] = {}
+    for row in db.rows("SELECT episode_uuid, local_path FROM clips"):
+        clip_paths_by_episode.setdefault(row["episode_uuid"], []).append(row["local_path"])
     for episode in episodes:
         aggregate = counts.get(episode["uuid"], {})
         clip_count = int(aggregate.get("clip_count") or 0)
@@ -103,6 +106,9 @@ def list_episodes() -> list[dict[str, Any]]:
             "flagged_clip_count",
         ]:
             episode[key] = int(aggregate.get(key) or 0)
+        health, health_reason = episode_preprocess_health(episode, clip_paths_by_episode.get(episode["uuid"], []))
+        episode["preprocess_health"] = health
+        episode["preprocess_health_reason"] = health_reason
         episode["review_remaining_count"] = max(clip_count - accepted, 0)
         episode["manual_decision_count"] = generated + flagged + rejected
         episode["episode_stage"] = describe_episode_stage(episode)
@@ -114,10 +120,28 @@ def list_episodes() -> list[dict[str, Any]]:
     return episodes
 
 
+def episode_preprocess_health(episode: dict[str, Any], clip_paths: list[str]) -> tuple[str, str]:
+    if episode.get("status") != "preprocessed":
+        return "not_ready", ""
+    head_value = episode.get("head_video_path")
+    if not head_value:
+        return "damaged", "head video path missing"
+    if not Path(head_value).exists():
+        return "damaged", "head video file missing"
+    if not clip_paths:
+        return "damaged", "clip files missing"
+    missing = sum(1 for path in clip_paths if not path or not Path(path).exists())
+    if missing:
+        return "damaged", f"{missing} clip file(s) missing"
+    return "ok", ""
+
+
 def describe_episode_stage(episode: dict[str, Any]) -> str:
     clip_count = int(episode.get("clip_count") or 0)
     accepted = int(episode.get("accepted_clip_count") or 0)
     final_status = episode.get("final_status") or "missing"
+    if episode.get("preprocess_health") == "damaged":
+        return "预处理文件疑似损坏，需要重新预处理"
     if clip_count == 0:
         return "未切片"
     if accepted == clip_count:

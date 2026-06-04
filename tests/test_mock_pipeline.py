@@ -18,6 +18,7 @@ from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import (
     create_clips,
+    list_episodes,
     list_clips,
     preprocess_one,
     queue_generation,
@@ -174,6 +175,24 @@ class MockPipelineTest(unittest.TestCase):
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["duration"], 6)
         self.assertIn("video_url", json.dumps(payload))
+
+    def test_preprocessed_episode_with_missing_files_is_marked_damaged(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000018"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, head_video_path, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, ?)
+                """,
+                (uuid, "mock", "mock", str(HEAD_VIDEOS_DIR / "missing.mp4"), now, now),
+            )
+
+        episode = next(item for item in list_episodes() if item["uuid"] == uuid)
+
+        self.assertEqual(episode["preprocess_health"], "damaged")
+        self.assertIn("head video file missing", episode["preprocess_health_reason"])
+        self.assertEqual(episode["episode_stage"], "预处理文件疑似损坏，需要重新预处理")
 
     def test_seedance_dry_run_includes_reference_images_in_order(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000012"
