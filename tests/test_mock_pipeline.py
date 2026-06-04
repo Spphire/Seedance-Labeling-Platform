@@ -13,7 +13,7 @@ os.environ["SEEDANCE_PLATFORM_ROOT"] = str(Path(__file__).resolve().parent / "_t
 from fastapi.testclient import TestClient
 
 from app.backend import db
-from app.backend.main import app
+from app.backend.main import FRONTEND_DIR, app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import (
@@ -154,6 +154,17 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(stream["avg_frame_rate"], "30/1")
         self.assertAlmostEqual(float(info["format"]["duration"]), 8.0, delta=0.25)
 
+    def test_frontend_label_and_admin_routes_are_served(self) -> None:
+        FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
+        (FRONTEND_DIR / "index.html").write_text("<html>runPrompt 管理员全局视图</html>", encoding="utf-8")
+        label = self.client.get("/label")
+        admin = self.client.get("/admin")
+
+        self.assertEqual(label.status_code, 200, label.text)
+        self.assertEqual(admin.status_code, 200, admin.text)
+        self.assertIn("runPrompt", label.text)
+        self.assertIn("管理员全局视图", admin.text)
+
     def test_seedance_dry_run_writes_payload_only(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000002"
         now = db.now()
@@ -221,6 +232,43 @@ class MockPipelineTest(unittest.TestCase):
             [resolve_image_value(item) for item in [refs[2], refs[0], refs[3], refs[1]]],
         )
         self.assertEqual(payload["content"][-1]["type"], "video_url")
+
+    def test_generation_api_dry_run_uses_prompt_and_reference_overrides(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000020"
+        now = db.now()
+        refs = self.make_reference_images()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.2)
+        clips = create_clips(uuid, head, 5.2)
+
+        res = self.client.post(
+            "/api/generation/run",
+            json={
+                "mode": "seedance",
+                "dry_run": True,
+                "prompt": "custom prompt",
+                "reference_images": [refs[1], refs[3]],
+                "operator_id": "client-a",
+                "operator_name": "Alice",
+            },
+        )
+
+        self.assertEqual(res.status_code, 200, res.text)
+        payload = json.loads(Path(res.json()[0]["output_path"]).read_text(encoding="utf-8"))
+        image_items = [item for item in payload["content"] if item["type"] == "image_url"]
+        self.assertEqual(payload["content"][0]["text"], "custom prompt")
+        self.assertEqual([item["image_url"]["url"] for item in image_items], [resolve_image_value(refs[1]), resolve_image_value(refs[3])])
+        job = db.one("SELECT * FROM generation_jobs WHERE clip_id=?", (clips[0]["id"],))
+        self.assertEqual(job["prompt"], "custom prompt")
+        self.assertEqual(json.loads(job["reference_images_json"]), [refs[1], refs[3]])
 
     def test_default_reference_images_are_seedance_prompt_order(self) -> None:
         settings = load_settings()
@@ -377,13 +425,101 @@ class MockPipelineTest(unittest.TestCase):
         clips = create_clips(uuid, head, 5.0)
 
         with patch("app.backend.services._GENERATION_EXECUTOR.submit") as submit:
-            res = self.client.post("/api/generation/run", json={})
+            res = self.client.post(
+                "/api/generation/run",
+                json={"operator_id": "client-a", "operator_name": "Alice"},
+            )
 
         self.assertEqual(res.status_code, 200, res.text)
         self.assertEqual(res.json()[0]["status"], "queued")
         submit.assert_called_once()
         job = db.one("SELECT * FROM generation_jobs WHERE clip_id=?", (clips[0]["id"],))
         self.assertEqual(job["mode"], "mock")
+        self.assertEqual(job["operator_id"], "client-a")
+        self.assertEqual(job["operator_name"], "Alice")
+
+    def test_seedance_usage_endpoint_summarizes_calls(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000019"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO clips(episode_uuid, clip_index, start_sec, duration_sec, local_path, public_url, status, created_at, updated_at)
+                VALUES (?, 0, 0, 5, ?, ?, 'generated', ?, ?)
+                """,
+                (uuid, str(CLIPS_DIR / uuid / "clip_0000.mp4"), "http://localhost/clip.mp4", now, now),
+            )
+            clip_id = cur.lastrowid
+            job_cur = conn.execute(
+                """
+                INSERT INTO generation_jobs(
+                    clip_id, mode, requested_duration_sec, operator_id, operator_name,
+                    task_id, status, started_at, completed_at, created_at, updated_at
+                )
+                VALUES (?, 'seedance', 6, 'client-a', 'Alice', 'task-1', 'succeeded', ?, ?, ?, ?)
+                """,
+                (clip_id, now, now, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO seedance_api_calls(
+                    job_id, clip_id, operator_id, operator_name, status, task_id,
+                    model, requested_duration_sec, clip_duration_sec, usage_json,
+                    raw_response_json, created_at, updated_at
+                )
+                VALUES (?, ?, 'client-a', 'Alice', 'succeeded', 'task-1', 'seedance-fast', 6, 5, ?, ?, ?, ?)
+                """,
+                (job_cur.lastrowid, clip_id, json.dumps({"total_tokens": 123}), json.dumps({"large": True}), now, now),
+            )
+
+        res = self.client.get("/api/usage/seedance")
+
+        self.assertEqual(res.status_code, 200, res.text)
+        data = res.json()
+        self.assertEqual(data["summary"][0]["operator_id"], "client-a")
+        self.assertEqual(data["summary"][0]["call_count"], 1)
+        self.assertEqual(data["summary"][0]["requested_duration_sec"], 6)
+        self.assertEqual(data["recent_calls"][0]["usage"], {"total_tokens": 123})
+        self.assertNotIn("raw_response_json", data["recent_calls"][0])
+
+    def test_reviewer_activity_endpoint_summarizes_review_operator(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000021"
+        clips, results = self.make_episode_with_generated_clip(uuid, 5.0)
+        clip_id = clips[0]["id"]
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "client-a", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+
+        review = self.client.post(
+            f"/api/review/{clip_id}",
+            json={
+                "decision": "accept",
+                "job_id": results[0]["job_id"],
+                "lock_token": lock.json()["token"],
+                "operator_id": "client-a",
+                "operator_name": "Alice",
+            },
+        )
+        self.assertEqual(review.status_code, 200, review.text)
+
+        res = self.client.get("/api/reviews/activity")
+
+        self.assertEqual(res.status_code, 200, res.text)
+        data = res.json()
+        self.assertEqual(data["summary"][0]["operator_id"], "client-a")
+        self.assertEqual(data["summary"][0]["review_count"], 1)
+        self.assertEqual(data["summary"][0]["accept_count"], 1)
+        self.assertEqual(data["recent_reviews"][0]["operator_name"], "Alice")
+        self.assertEqual(data["recent_reviews"][0]["decision"], "accept")
 
     def test_retry_api_mock_mode_uses_async_timing_when_enabled(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000015"

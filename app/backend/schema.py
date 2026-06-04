@@ -32,6 +32,10 @@ class GenerationRunRequest(BaseModel):
     clip_ids: list[int] | None = None
     dry_run: bool = False
     lock_token: str | None = None
+    operator_id: str | None = None
+    operator_name: str | None = None
+    prompt: str | None = None
+    reference_images: list[str] | None = None
 
 
 class ReviewRequest(BaseModel):
@@ -39,6 +43,10 @@ class ReviewRequest(BaseModel):
     job_id: int | None = None
     note: str = ""
     lock_token: str | None = None
+    operator_id: str | None = None
+    operator_name: str | None = None
+    prompt: str | None = None
+    reference_images: list[str] | None = None
 
 
 class ImportHeadVideoRequest(BaseModel):
@@ -75,3 +83,7 @@ class LockReleaseRequest(BaseModel):
 class LockTokenRequest(BaseModel):
     lock_token: str | None = None
     mode: str | None = None
+    operator_id: str | None = None
+    operator_name: str | None = None
+    prompt: str | None = None
+    reference_images: list[str] | None = None

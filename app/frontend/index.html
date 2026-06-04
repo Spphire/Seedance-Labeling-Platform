@@ -102,6 +102,10 @@
       grid-template-rows: 54px minmax(0, 1fr);
     }
 
+    .shell.admin-route {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
     header {
       grid-column: 1 / -1;
       display: flex;
@@ -195,6 +199,45 @@
       line-height: 1.35;
     }
 
+    .route-link {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    .route-link.active {
+      color: #ffffff;
+    }
+
+    .usage-panel {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .usage-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+      font-size: 12px;
+    }
+
+    .usage-row strong {
+      display: block;
+      margin-bottom: 3px;
+    }
+
+    .run-content-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 8px;
+    }
+
     .ref-image-order {
       display: grid;
       gap: 8px;
@@ -237,11 +280,27 @@
       padding: 14px;
     }
 
+    .shell.admin-route aside {
+      display: none;
+    }
+
     main {
       min-width: 0;
       display: grid;
       grid-template-rows: 43px minmax(0, 1fr) 116px;
       background: var(--bg);
+    }
+
+    .shell.admin-route main {
+      grid-column: 1 / -1;
+    }
+
+    .shell.admin-route .tabs {
+      display: none;
+    }
+
+    .shell.admin-route main {
+      grid-template-rows: minmax(0, 1fr) 116px;
     }
 
     .block {
@@ -437,6 +496,86 @@
       place-items: center;
       color: var(--muted);
       text-align: center;
+    }
+
+    .admin-dashboard {
+      display: grid;
+      gap: 16px;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    .admin-section {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+    }
+
+    .admin-section h3 {
+      margin: 0;
+      font-size: 15px;
+    }
+
+    .admin-section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .admin-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .admin-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    .admin-table th,
+    .admin-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+
+    .admin-table th {
+      color: var(--muted);
+      font-weight: 650;
     }
 
     .review-head {
@@ -647,14 +786,21 @@
       .videos {
         grid-template-columns: 1fr;
       }
+
+      .metric-grid,
+      .admin-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="shell">
+  <div id="appShell" class="shell">
     <header>
       <h1>Seedance 数据标注平台</h1>
       <div class="header-actions">
+        <a id="labelRoute" class="route-link" href="/label">标注</a>
+        <a id="adminRoute" class="route-link" href="/admin">管理员</a>
         <input id="reviewerName" class="reviewer" placeholder="审核人">
         <button id="openSettings" class="icon-button" title="后台管理员设置" aria-label="后台管理员设置">&#9881;</button>
         <button id="refresh" class="primary">刷新</button>
@@ -721,6 +867,12 @@
             <input id="seedanceSecondsPerVideoSecond" type="number" min="1" step="1" placeholder="24">
           </div>
         </div>
+        <div class="field">
+          <label>Seedance 用量监控</label>
+          <button id="refreshUsage">刷新用量</button>
+          <div id="seedanceUsageSummary" class="usage-panel"></div>
+          <div id="seedanceUsageRecent" class="usage-panel"></div>
+        </div>
         <div class="admin-actions">
           <button id="closeSettings">关闭</button>
           <button id="saveSettings" class="primary">保存配置</button>
@@ -728,7 +880,7 @@
       </section>
     </div>
 
-    <aside>
+    <aside id="labelSidebar">
       <section class="block">
         <h2>批量 episode</h2>
         <textarea id="episodeText" spellcheck="false" placeholder="c412f233-549f-43cd-89c3-af0b496ae742"></textarea>
@@ -746,6 +898,18 @@
             <option value="seedance">seedance（真实消耗额度）</option>
           </select>
           <div class="hint">每次打开页面默认 mock；右侧重跑也会使用这里的模式。</div>
+        </div>
+        <div class="field">
+          <label for="runPrompt">本次 Prompt</label>
+          <textarea id="runPrompt" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <label>本次参考图顺序</label>
+          <div id="runReferenceImageOrder" class="ref-image-order"></div>
+          <div class="run-content-actions">
+            <button id="resetRunDefaults">恢复默认</button>
+          </div>
+          <div class="hint">这里只影响本次生成/重跑；管理员默认值在 /admin 中保存。</div>
         </div>
         <div class="row">
           <button id="generate">生成</button>
@@ -783,6 +947,9 @@
       jobs: [],
       locks: [],
       settings: {},
+      seedanceUsage: null,
+      reviewerActivity: null,
+      route: location.pathname.startsWith("/admin") ? "admin" : "label",
       tabs: [],
       activeClipId: null,
       selectedEpisode: null,
@@ -793,6 +960,7 @@
       clipLocks: {},
       workspaceSignature: "",
       settingsDirty: false,
+      runDefaultsInitialized: false,
     };
 
     const $ = (id) => document.getElementById(id);
@@ -820,6 +988,26 @@
       state.reviewerName = name;
       localStorage.setItem("seedance_reviewer_name", name);
       $("reviewerName").value = name;
+    }
+
+    function operatorPayload() {
+      return { operator_id: state.clientId, operator_name: state.reviewerName };
+    }
+
+    function generationContentPayload() {
+      return {
+        ...operatorPayload(),
+        prompt: $("runPrompt").value.trim() || state.settings.default_prompt || "",
+        reference_images: selectedReferenceImages("run"),
+      };
+    }
+
+    function applyRouteMode() {
+      $("appShell").classList.toggle("admin-route", state.route === "admin");
+      $("labelRoute").classList.toggle("active", state.route === "label");
+      $("adminRoute").classList.toggle("active", state.route === "admin");
+      $("openSettings").style.display = state.route === "admin" ? "" : "none";
+      $("settingsOverlay").classList.add("hidden");
     }
 
     function log(message, data) {
@@ -861,12 +1049,18 @@
       state.locks = data.locks || [];
       state.settings = data.settings || {};
       state.availableReferenceImages = state.settings.available_reference_images || [];
+      if (state.route === "admin") {
+        await loadAdminData({ render: false }).catch((err) => log(formatApiError(err)));
+      }
       if (!$("generationMode").dataset.initialized) {
         $("generationMode").value = "mock";
         $("generationMode").dataset.initialized = "1";
       }
       if (!state.settingsDirty) {
         syncSettingsForm();
+      }
+      if (!state.runDefaultsInitialized) {
+        syncRunFormFromDefaults();
       }
       reconcileLocks();
       render(options);
@@ -882,13 +1076,19 @@
       $("seedanceApiKey").value = "";
       $("seedanceApiKeyHint").textContent = state.settings.seedance_api_key_set ? "服务器已保存 API Key；留空不会覆盖。" : "尚未保存 API Key。";
       $("defaultPrompt").value = state.settings.default_prompt || "";
-      renderReferenceImageSelectors(state.settings.reference_images || []);
+      renderReferenceImageSelectors("referenceImageOrder", state.settings.reference_images || [], "settings", markSettingsDirty);
       $("seedanceModel").value = state.settings.seedance_model || "doubao-seedance-2-0-fast-260128";
       $("seedanceBaseUrl").value = state.settings.seedance_base_url || "https://ark.cn-beijing.volces.com/api/v3";
       $("seedanceResolution").value = state.settings.seedance_resolution || "480p";
       $("seedanceRatio").value = state.settings.seedance_ratio || "4:3";
       $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
+    }
+
+    function syncRunFormFromDefaults() {
+      $("runPrompt").value = state.settings.default_prompt || "";
+      renderReferenceImageSelectors("runReferenceImageOrder", state.settings.reference_images || [], "run");
+      state.runDefaultsInitialized = true;
     }
 
     function shortUuid(uuid) {
@@ -911,8 +1111,8 @@
       return values.join("");
     }
 
-    function renderReferenceImageSelectors(selected) {
-      const target = $("referenceImageOrder");
+    function renderReferenceImageSelectors(targetId, selected, scope, onChange) {
+      const target = $(targetId);
       const available = state.availableReferenceImages || [];
       target.innerHTML = "";
       for (let index = 0; index < 4; index += 1) {
@@ -925,32 +1125,32 @@
         ].join("");
         row.innerHTML = `
           <span>图片${index + 1}</span>
-          <select data-ref-image-index="${index}">${options}</select>
-          <img class="ref-preview" alt="" data-ref-preview="${index}">
+          <select data-ref-image-scope="${scope}" data-ref-image-index="${index}">${options}</select>
+          <img class="ref-preview" alt="" data-ref-preview="${scope}-${index}">
         `;
         target.appendChild(row);
       }
-      target.querySelectorAll("[data-ref-image-index]").forEach((select) => {
+      target.querySelectorAll(`[data-ref-image-scope="${scope}"]`).forEach((select) => {
         select.addEventListener("change", () => {
-          markSettingsDirty();
-          updateReferencePreviews();
+          if (onChange) onChange();
+          updateReferencePreviews(scope);
         });
       });
-      updateReferencePreviews();
+      updateReferencePreviews(scope);
     }
 
-    function selectedReferenceImages() {
-      return [...document.querySelectorAll("[data-ref-image-index]")]
+    function selectedReferenceImages(scope) {
+      return [...document.querySelectorAll(`[data-ref-image-scope="${scope}"]`)]
         .sort((a, b) => Number(a.dataset.refImageIndex) - Number(b.dataset.refImageIndex))
         .map((select) => select.value)
         .filter(Boolean);
     }
 
-    function updateReferencePreviews() {
+    function updateReferencePreviews(scope) {
       const byId = new Map((state.availableReferenceImages || []).map((item) => [item.id, item]));
-      document.querySelectorAll("[data-ref-image-index]").forEach((select) => {
+      document.querySelectorAll(`[data-ref-image-scope="${scope}"]`).forEach((select) => {
         const image = byId.get(select.value);
-        const preview = document.querySelector(`[data-ref-preview="${select.dataset.refImageIndex}"]`);
+        const preview = document.querySelector(`[data-ref-preview="${scope}-${select.dataset.refImageIndex}"]`);
         if (!preview) return;
         if (image) {
           preview.src = image.url;
@@ -1133,6 +1333,187 @@
       return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
     }
 
+    function formatTimestamp(seconds) {
+      if (!seconds) return "-";
+      return new Date(Number(seconds) * 1000).toLocaleString();
+    }
+
+    async function loadSeedanceUsage(options = {}) {
+      const data = await api("/api/usage/seedance?limit=50");
+      state.seedanceUsage = data;
+      if (options.render !== false) {
+        renderSeedanceUsage();
+        if (state.route === "admin") render({ forceWorkspace: true });
+      }
+      return data;
+    }
+
+    async function loadReviewerActivity(options = {}) {
+      const data = await api("/api/reviews/activity?limit=50");
+      state.reviewerActivity = data;
+      if (options.render !== false && state.route === "admin") {
+        render({ forceWorkspace: true });
+      }
+      return data;
+    }
+
+    async function loadAdminData(options = {}) {
+      const [usage, reviews] = await Promise.all([
+        loadSeedanceUsage({ render: false }),
+        loadReviewerActivity({ render: false }),
+      ]);
+      if (options.render !== false && state.route === "admin") {
+        render({ forceWorkspace: true });
+      }
+      return { usage, reviews };
+    }
+
+    function renderSeedanceUsage() {
+      const data = state.seedanceUsage || {};
+      const summaryTarget = $("seedanceUsageSummary");
+      const recentTarget = $("seedanceUsageRecent");
+      const summary = data.summary || [];
+      const recent = data.recent_calls || [];
+      summaryTarget.innerHTML = summary.length
+        ? summary.map((row) => `
+          <div class="usage-row">
+            <div>
+              <strong>${escapeHtml(row.operator_name || row.operator_id || "unknown")}</strong>
+              <span>${Number(row.clip_count || 0)} clips · ${Number(row.call_count || 0)} calls · ${Number(row.succeeded_count || 0)} ok · ${Number(row.failed_count || 0)} failed</span>
+            </div>
+            <div>${formatDuration(row.requested_duration_sec || 0)}</div>
+          </div>
+        `).join("")
+        : `<div class="hint">暂无真实 Seedance 调用记录。</div>`;
+      recentTarget.innerHTML = recent.length
+        ? recent.map((row) => `
+          <div class="usage-row">
+            <div>
+              <strong>${escapeHtml(row.episode_uuid ? `${shortUuid(row.episode_uuid)} #${row.clip_index}` : `clip ${row.clip_id || "-"}`)}</strong>
+              <span>${escapeHtml(row.operator_name || row.operator_id || "unknown")} · ${escapeHtml(row.status || "-")} · task ${escapeHtml(row.task_id || "-")} · usage ${row.usage ? "yes" : "none"}</span>
+            </div>
+            <div>${formatTimestamp(row.created_at)}</div>
+          </div>
+        `).join("")
+        : "";
+    }
+
+    function countItems(items, predicate) {
+      return items.reduce((total, item) => total + (predicate(item) ? 1 : 0), 0);
+    }
+
+    function usageSummaryRows() {
+      const summary = state.seedanceUsage?.summary || [];
+      return summary.length
+        ? summary.map((row) => `
+          <div class="usage-row">
+            <div>
+              <strong>${escapeHtml(row.operator_name || row.operator_id || "unknown")}</strong>
+              <span>${Number(row.clip_count || 0)} clips · ${Number(row.call_count || 0)} calls · ${Number(row.succeeded_count || 0)} ok · ${Number(row.failed_count || 0)} failed</span>
+            </div>
+            <div>${formatDuration(row.requested_duration_sec || 0)}</div>
+          </div>
+        `).join("")
+        : `<div class="hint">暂无真实 Seedance 调用记录。</div>`;
+    }
+
+    function reviewSummaryRows() {
+      const summary = state.reviewerActivity?.summary || [];
+      return summary.length
+        ? summary.map((row) => `
+          <div class="usage-row">
+            <div>
+              <strong>${escapeHtml(row.operator_name || row.operator_id || "unknown")}</strong>
+              <span>${Number(row.review_count || 0)} reviews · ${Number(row.accept_count || 0)} accept · ${Number(row.reject_count || 0)} reject · ${Number(row.flag_count || 0)} flag</span>
+            </div>
+            <div>${formatTimestamp(row.last_reviewed_at)}</div>
+          </div>
+        `).join("")
+        : `<div class="hint">暂无人工标注记录。</div>`;
+    }
+
+    function recentUsageTable() {
+      const rows = state.seedanceUsage?.recent_calls || [];
+      if (!rows.length) return `<div class="hint">暂无最近调用。</div>`;
+      return `
+        <table class="admin-table">
+          <thead><tr><th>Clip</th><th>操作员</th><th>状态</th><th>Task</th><th>时间</th></tr></thead>
+          <tbody>
+            ${rows.slice(0, 12).map((row) => `
+              <tr>
+                <td>${escapeHtml(row.episode_uuid ? `${shortUuid(row.episode_uuid)} #${row.clip_index}` : `clip ${row.clip_id || "-"}`)}</td>
+                <td>${escapeHtml(row.operator_name || row.operator_id || "unknown")}</td>
+                <td>${escapeHtml(row.status || "-")}</td>
+                <td>${escapeHtml(row.task_id || "-")}</td>
+                <td>${formatTimestamp(row.created_at)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function recentReviewTable() {
+      const rows = state.reviewerActivity?.recent_reviews || [];
+      if (!rows.length) return `<div class="hint">暂无最近标注。</div>`;
+      return `
+        <table class="admin-table">
+          <thead><tr><th>Clip</th><th>标注员</th><th>决策</th><th>Job</th><th>时间</th></tr></thead>
+          <tbody>
+            ${rows.slice(0, 12).map((row) => `
+              <tr>
+                <td>${escapeHtml(row.episode_uuid ? `${shortUuid(row.episode_uuid)} #${row.clip_index}` : `clip ${row.clip_id || "-"}`)}</td>
+                <td>${escapeHtml(row.operator_name || row.operator_id || "unknown")}</td>
+                <td>${escapeHtml(row.decision || "-")}</td>
+                <td>${escapeHtml(row.job_id || "-")}</td>
+                <td>${formatTimestamp(row.reviewed_at)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function locksTable() {
+      const locks = state.locks || [];
+      if (!locks.length) return `<div class="hint">当前没有锁。</div>`;
+      return `
+        <table class="admin-table">
+          <thead><tr><th>资源</th><th>占用者</th><th>剩余</th></tr></thead>
+          <tbody>
+            ${locks.slice(0, 20).map((lock) => `
+              <tr>
+                <td>${escapeHtml(lock.resource_type)} · ${escapeHtml(lock.resource_id)}</td>
+                <td>${escapeHtml(lock.owner_name || lock.owner_id || "-")}</td>
+                <td>${formatDuration(lock.expires_in_sec || 0)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function jobsTable() {
+      const jobs = state.jobs || [];
+      if (!jobs.length) return `<div class="hint">暂无生成任务。</div>`;
+      return `
+        <table class="admin-table">
+          <thead><tr><th>Job</th><th>Clip</th><th>模式</th><th>操作员</th><th>状态</th></tr></thead>
+          <tbody>
+            ${jobs.slice(0, 16).map((job) => `
+              <tr>
+                <td>${escapeHtml(job.id)}</td>
+                <td>${escapeHtml(job.episode_uuid ? `${shortUuid(job.episode_uuid)} #${job.clip_index}` : job.clip_id || "-")}</td>
+                <td>${escapeHtml(job.mode || "-")}</td>
+                <td>${escapeHtml(job.operator_name || job.operator_id || "unknown")}</td>
+                <td>${escapeHtml(job.status || "-")}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
     function jobSummary(job) {
       if (!job) return "";
       if (job.status === "running") {
@@ -1312,8 +1693,126 @@
       });
     }
 
+    function renderAdminWorkspace() {
+      const target = $("workspace");
+      const episodes = state.episodes || [];
+      const clips = state.clips || [];
+      const jobs = state.jobs || [];
+      const usageSummary = state.seedanceUsage?.summary || [];
+      const reviewSummary = state.reviewerActivity?.summary || [];
+      const signature = [
+        "admin",
+        episodes.length,
+        clips.length,
+        jobs.length,
+        state.locks.length,
+        usageSummary.length,
+        reviewSummary.length,
+        jobs[0]?.updated_at || "",
+        state.seedanceUsage?.recent_calls?.[0]?.updated_at || "",
+        state.reviewerActivity?.recent_reviews?.[0]?.reviewed_at || "",
+      ].join("|");
+      if (target.dataset.signature === signature) {
+        return;
+      }
+      const accepted = countItems(clips, (clip) => clip.status === "accepted");
+      const waitingReview = countItems(clips, (clip) => ["generated", "flagged", "rejected"].includes(clip.status));
+      const generating = countItems(clips, (clip) => clip.status === "generating");
+      const failed = countItems(clips, (clip) => clip.status === "generated_failed");
+      const totalCalls = usageSummary.reduce((total, row) => total + Number(row.call_count || 0), 0);
+      const totalReviews = reviewSummary.reduce((total, row) => total + Number(row.review_count || 0), 0);
+      target.innerHTML = `
+        <div class="admin-dashboard">
+          <div class="review-head">
+            <div class="review-title">
+              <h2>管理员全局视图</h2>
+              <div class="meta">全局进度、Seedance 用量、标注员活动和当前锁。</div>
+            </div>
+            <div class="actions">
+              <button data-admin-action="settings">默认设置</button>
+              <button class="primary" data-admin-action="refresh">刷新</button>
+            </div>
+          </div>
+
+          <div class="metric-grid">
+            <div class="metric"><span>Episodes</span><strong>${episodes.length}</strong></div>
+            <div class="metric"><span>Clips</span><strong>${clips.length}</strong></div>
+            <div class="metric"><span>已保留</span><strong>${accepted}</strong></div>
+            <div class="metric"><span>待处理</span><strong>${waitingReview + generating + failed}</strong></div>
+          </div>
+
+          <div class="admin-grid">
+            <section class="admin-section">
+              <div class="admin-section-head">
+                <h3>Seedance 用量</h3>
+                <span class="badge">${totalCalls} calls</span>
+              </div>
+              <div class="usage-panel">${usageSummaryRows()}</div>
+            </section>
+            <section class="admin-section">
+              <div class="admin-section-head">
+                <h3>标注员标注</h3>
+                <span class="badge">${totalReviews} reviews</span>
+              </div>
+              <div class="usage-panel">${reviewSummaryRows()}</div>
+            </section>
+          </div>
+
+          <div class="admin-grid">
+            <section class="admin-section">
+              <div class="admin-section-head"><h3>最近 Seedance 调用</h3></div>
+              ${recentUsageTable()}
+            </section>
+            <section class="admin-section">
+              <div class="admin-section-head"><h3>最近人工标注</h3></div>
+              ${recentReviewTable()}
+            </section>
+          </div>
+
+          <div class="admin-grid">
+            <section class="admin-section">
+              <div class="admin-section-head"><h3>当前锁</h3><span class="badge">${state.locks.length}</span></div>
+              ${locksTable()}
+            </section>
+            <section class="admin-section">
+              <div class="admin-section-head"><h3>最近生成任务</h3></div>
+              ${jobsTable()}
+            </section>
+          </div>
+        </div>
+      `;
+      target.dataset.signature = signature;
+      wireAdminActions();
+    }
+
+    function wireAdminActions() {
+      document.querySelectorAll("[data-admin-action]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const action = button.dataset.adminAction;
+          if (action === "settings") {
+            $("settingsOverlay").classList.remove("hidden");
+            $("dm3NedfRoot").focus();
+            renderSeedanceUsage();
+            return;
+          }
+          if (action === "refresh") {
+            button.disabled = true;
+            try {
+              await refresh({ forceWorkspace: true });
+            } finally {
+              button.disabled = false;
+            }
+          }
+        });
+      });
+    }
+
     function renderWorkspace() {
       const target = $("workspace");
+      if (state.route === "admin") {
+        renderAdminWorkspace();
+        return;
+      }
       const clip = state.clips.find((item) => item.id === state.activeClipId);
       if (!clip) {
         const episode = state.episodes.find((item) => item.uuid === state.selectedEpisode);
@@ -1543,14 +2042,14 @@
               const mode = $("generationMode").value || "mock";
               const result = await api(`/api/clips/${clip.id}/retry`, {
                 method: "POST",
-                body: { lock_token: lock.token, mode },
+                body: { lock_token: lock.token, mode, ...generationContentPayload() },
               });
               log(`${mode} rerun submitted`, result);
             } else {
               const decision = action === "accept" ? "accept" : action === "reject" ? "reject" : "flag";
               const result = await api(`/api/review/${clip.id}`, {
                 method: "POST",
-                body: { decision, job_id: clip.latest_job_id, note: "", lock_token: lock.token },
+                body: { decision, job_id: clip.latest_job_id, note: "", lock_token: lock.token, ...operatorPayload() },
               });
               log(`review ${decision}`, result);
             }
@@ -1575,9 +2074,15 @@
     }
 
     initIdentity();
+    applyRouteMode();
 
     $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
+    $("resetRunDefaults").addEventListener("click", () => {
+      state.runDefaultsInitialized = false;
+      syncRunFormFromDefaults();
+      log("本次 prompt/ref 已恢复管理员默认值");
+    });
     ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "seedanceApiKey", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
       $(id).addEventListener("input", markSettingsDirty);
       $(id).addEventListener("change", markSettingsDirty);
@@ -1596,6 +2101,7 @@
     $("openSettings").addEventListener("click", () => {
       $("settingsOverlay").classList.remove("hidden");
       $("dm3NedfRoot").focus();
+      loadSeedanceUsage().catch((err) => log(formatApiError(err)));
     });
     $("closeSettings").addEventListener("click", () => {
       $("settingsOverlay").classList.add("hidden");
@@ -1612,7 +2118,7 @@
           dm3_nedf_root: $("dm3NedfRoot").value.trim() || "/mnt/nm_data/data/nedf",
           public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
           default_prompt: $("defaultPrompt").value.trim(),
-          reference_images: selectedReferenceImages(),
+          reference_images: selectedReferenceImages("settings"),
           seedance_model: $("seedanceModel").value.trim() || "doubao-seedance-2-0-fast-260128",
           seedance_base_url: $("seedanceBaseUrl").value.trim() || "https://ark.cn-beijing.volces.com/api/v3",
           seedance_resolution: $("seedanceResolution").value || "480p",
@@ -1683,16 +2189,24 @@
     $("generate").addEventListener("click", async () => {
       try {
         const mode = $("generationMode").value;
-        const result = await api("/api/generation/run", { method: "POST", body: { mode, dry_run: false } });
+        const result = await api("/api/generation/run", { method: "POST", body: { mode, dry_run: false, ...generationContentPayload() } });
         log(`${mode} generation finished`, result);
         await refresh();
       } catch (err) {
         log(err.message);
       }
     });
+    $("refreshUsage").addEventListener("click", async () => {
+      try {
+        const data = await loadSeedanceUsage();
+        log("seedance usage refreshed", data.summary || []);
+      } catch (err) {
+        log(formatApiError(err));
+      }
+    });
     $("dryRun").addEventListener("click", async () => {
       try {
-        const result = await api("/api/generation/run", { method: "POST", body: { mode: "seedance", dry_run: true } });
+        const result = await api("/api/generation/run", { method: "POST", body: { mode: "seedance", dry_run: true, ...generationContentPayload() } });
         log("seedance dry-run payloads written", result);
         await refresh();
       } catch (err) {

@@ -40,10 +40,17 @@ class SeedanceClient:
         shutil.copy2(clip_path, output_path)
         return {"task_id": f"mock-{int(time.time() * 1000)}", "output_url": "", "output_path": str(output_path)}
 
-    def dry_run_payload(self, prompt: str, public_url: str, duration_sec: float) -> dict[str, Any]:
+    def dry_run_payload(
+        self,
+        prompt: str,
+        public_url: str,
+        duration_sec: float,
+        reference_images: list[str] | None = None,
+    ) -> dict[str, Any]:
         duration = int(math.ceil(duration_sec))
         content = [{"type": "text", "text": prompt}]
-        for item in self.settings.get("reference_images", []):
+        refs = self.settings.get("reference_images", []) if reference_images is None else reference_images
+        for item in refs:
             uri = resolve_image_value(str(item))
             content.append({"type": "image_url", "image_url": {"url": uri}, "role": "reference_image"})
         content.append({"type": "video_url", "video_url": {"url": public_url}, "role": "reference_video"})
@@ -57,24 +64,38 @@ class SeedanceClient:
             "watermark": False,
         }
 
-    def generate(self, prompt: str, public_url: str, duration_sec: float, output_path: Path) -> dict[str, Any]:
+    def generate(
+        self,
+        prompt: str,
+        public_url: str,
+        duration_sec: float,
+        output_path: Path,
+        reference_images: list[str] | None = None,
+    ) -> dict[str, Any]:
         api_key = self.settings.get("seedance_api_key")
         if not api_key:
             raise RuntimeError("seedance_api_key is required for seedance mode")
-        payload = self.dry_run_payload(prompt, public_url, duration_sec)
+        payload = self.dry_run_payload(prompt, public_url, duration_sec, reference_images)
         client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
         result = client.content_generation.tasks.create(**payload)
         task_id = result.id
         return self.wait_and_download(client, task_id, output_path, input_url=public_url)
 
-    def create_task(self, prompt: str, public_url: str, duration_sec: float) -> dict[str, Any]:
+    def create_task(
+        self,
+        prompt: str,
+        public_url: str,
+        duration_sec: float,
+        reference_images: list[str] | None = None,
+    ) -> dict[str, Any]:
         api_key = self.settings.get("seedance_api_key")
         if not api_key:
             raise RuntimeError("seedance_api_key is required for seedance mode")
-        payload = self.dry_run_payload(prompt, public_url, duration_sec)
+        payload = self.dry_run_payload(prompt, public_url, duration_sec, reference_images)
         client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
         result = client.content_generation.tasks.create(**payload)
-        return {"task_id": result.id}
+        data = self._model_dump(result)
+        return {"task_id": result.id, "usage": self._find_usage(data), "raw_response": data}
 
     def wait_for_task(self, task_id: str, output_path: Path, input_url: str | None = None) -> dict[str, Any]:
         api_key = self.settings.get("seedance_api_key")
@@ -99,7 +120,13 @@ class SeedanceClient:
                     raise RuntimeError(f"Seedance succeeded but no output URL found: {data}")
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 urllib.request.urlretrieve(output_url, output_path)
-                return {"task_id": task_id, "output_url": output_url, "output_path": str(output_path)}
+                return {
+                    "task_id": task_id,
+                    "output_url": output_url,
+                    "output_path": str(output_path),
+                    "usage": self._find_usage(data),
+                    "raw_response": data,
+                }
             if task.status == "failed":
                 data = self._model_dump(task)
                 raise RuntimeError(str(data.get("error") or "Seedance task failed"))
@@ -146,6 +173,14 @@ class SeedanceClient:
             if cls._is_output_url(url, input_urls):
                 return url
         return ""
+
+    @staticmethod
+    def _find_usage(data: dict[str, Any]) -> Any:
+        for key in ["usage", "usage_info", "token_usage", "billing", "cost"]:
+            value = data.get(key)
+            if value:
+                return value
+        return None
 
     @staticmethod
     def _is_output_url(value: str, input_urls: set[str]) -> bool:

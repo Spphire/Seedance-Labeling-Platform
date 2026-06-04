@@ -72,6 +72,10 @@ def init_db() -> None:
                 clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
                 mode TEXT NOT NULL,
                 requested_duration_sec INTEGER NOT NULL,
+                operator_id TEXT,
+                operator_name TEXT,
+                prompt TEXT,
+                reference_images_json TEXT,
                 task_id TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 output_url TEXT,
@@ -85,10 +89,31 @@ def init_db() -> None:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS seedance_api_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER REFERENCES generation_jobs(id) ON DELETE SET NULL,
+                clip_id INTEGER REFERENCES clips(id) ON DELETE SET NULL,
+                operator_id TEXT,
+                operator_name TEXT,
+                call_type TEXT NOT NULL DEFAULT 'create_task',
+                status TEXT NOT NULL,
+                task_id TEXT,
+                model TEXT,
+                requested_duration_sec INTEGER,
+                clip_duration_sec REAL,
+                usage_json TEXT,
+                raw_response_json TEXT,
+                error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
                 job_id INTEGER REFERENCES generation_jobs(id) ON DELETE SET NULL,
+                operator_id TEXT,
+                operator_name TEXT,
                 decision TEXT NOT NULL,
                 note TEXT,
                 accepted_path TEXT,
@@ -115,11 +140,29 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_resource_locks_expires_at
             ON resource_locks(expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_seedance_api_calls_operator
+            ON seedance_api_calls(operator_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_seedance_api_calls_clip
+            ON seedance_api_calls(clip_id, created_at);
             """
         )
         _ensure_column(conn, "generation_jobs", "started_at", "REAL")
         _ensure_column(conn, "generation_jobs", "completed_at", "REAL")
         _ensure_column(conn, "generation_jobs", "estimated_total_sec", "REAL")
+        _ensure_column(conn, "generation_jobs", "operator_id", "TEXT")
+        _ensure_column(conn, "generation_jobs", "operator_name", "TEXT")
+        _ensure_column(conn, "generation_jobs", "prompt", "TEXT")
+        _ensure_column(conn, "generation_jobs", "reference_images_json", "TEXT")
+        _ensure_column(conn, "reviews", "operator_id", "TEXT")
+        _ensure_column(conn, "reviews", "operator_name", "TEXT")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reviews_operator
+            ON reviews(operator_id, reviewed_at)
+            """
+        )
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:

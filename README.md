@@ -28,7 +28,7 @@ bash run_tests.sh
 bash run_server.sh
 ```
 
-管理员开放 TCP `18080` 后，标注平台访问地址为 `http://106.14.2.243:18080`。
+管理员开放 TCP `18080` 后，标注员访问 `http://106.14.2.243:18080/label`，管理员访问 `http://106.14.2.243:18080/admin`。管理员页查看全局进度、Seedance 用量、标注员活动，并维护默认 prompt/ref 图顺序。
 
 平台生成给 Seedance 的 clip URL 默认也是 `http://106.14.2.243:18080/clips/...`。如果后续切到 OSS 预签名 URL，只需要在 UI 的 Settings 里修改 `public_base_url`，已有 clip 记录会自动刷新。
 
@@ -45,7 +45,7 @@ $env:SEEDANCE_RELOAD="1"
 
 默认 `generation_mode=mock`，生成阶段只复制原始 clip 到 `data/generated`，不会调用 Seedance API。
 
-真实 Seedance 生成需要显式保存配置为 `seedance`，并填写 `seedance_api_key`。建议先用 `dry-run` 验证请求 JSON，其中 `duration` 会使用 `ceil(clip_duration_sec)`。
+真实 Seedance 生成需要在本次运行模式中显式切到 `seedance`，并由管理员填写 `seedance_api_key`。建议先用 `dry-run` 验证请求 JSON，其中 `duration` 会使用 `ceil(clip_duration_sec)`。
 
 ## 真实 Seedance 配置
 
@@ -54,7 +54,7 @@ API key 不要提交到 Git。服务器部署后有两种配置方式：
 - 在右上角齿轮的后台管理员设置里填写 `Seedance API Key` 并保存。它会写入服务器本机被 `.gitignore` 忽略的 `config/settings.json`。
 - 或者用环境变量启动服务：`SEEDANCE_API_KEY=... bash run_server.sh`。兼容实验脚本里的 `ARK_API_KEY`，但 `SEEDANCE_API_KEY` 优先级更高。
 
-切到真实生成前，先点 `dry-run`，确认写出的 payload 里 `content` 顺序是 prompt、图片1-4、视频1，且 `duration` 是当前 clip 秒数的向上取整。确认后再把运行模式切到 `seedance（真实消耗额度）`。
+切到真实生成前，先在标注页确认本次 Prompt 和 ref 图顺序，再点 `dry-run`，确认写出的 payload 里 `content` 顺序是 prompt、图片1-4、视频1，且 `duration` 是当前 clip 秒数的向上取整。确认后再把运行模式切到 `seedance（真实消耗额度）`。
 
 ## 多人协作
 

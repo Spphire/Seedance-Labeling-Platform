@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import secrets
 import shutil
 import threading
@@ -215,6 +216,81 @@ def list_jobs() -> list[dict[str, Any]]:
         job["generated_url"] = static_url_from_path(job.get("output_path"), GENERATED_DIR, "generated")
         enrich_job_timing(job)
     return jobs
+
+
+def list_seedance_usage(limit: int = 100) -> dict[str, Any]:
+    calls = db.rows(
+        """
+        SELECT
+            a.*,
+            c.episode_uuid,
+            c.clip_index
+        FROM seedance_api_calls a
+        LEFT JOIN clips c ON c.id = a.clip_id
+        ORDER BY a.created_at DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    summary_rows = db.rows(
+        """
+        SELECT
+            COALESCE(operator_id, '') AS operator_id,
+            COALESCE(operator_name, '') AS operator_name,
+            COUNT(*) AS call_count,
+            SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS succeeded_count,
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(COALESCE(requested_duration_sec, 0)) AS requested_duration_sec,
+            COUNT(DISTINCT clip_id) AS clip_count,
+            MAX(created_at) AS last_call_at
+        FROM seedance_api_calls
+        GROUP BY COALESCE(operator_id, ''), COALESCE(operator_name, '')
+        ORDER BY last_call_at DESC
+        """
+    )
+    for call in calls:
+        call["usage"] = parse_json_text(call.get("usage_json"))
+        call.pop("usage_json", None)
+        call.pop("raw_response_json", None)
+    return {"summary": summary_rows, "recent_calls": calls}
+
+
+def list_reviewer_activity(limit: int = 100) -> dict[str, Any]:
+    reviews = db.rows(
+        """
+        SELECT
+            r.*,
+            c.episode_uuid,
+            c.clip_index,
+            c.status AS clip_status,
+            j.mode AS job_mode,
+            j.task_id
+        FROM reviews r
+        LEFT JOIN clips c ON c.id = r.clip_id
+        LEFT JOIN generation_jobs j ON j.id = r.job_id
+        ORDER BY r.reviewed_at DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    summary_rows = db.rows(
+        """
+        SELECT
+            COALESCE(operator_id, '') AS operator_id,
+            COALESCE(operator_name, '') AS operator_name,
+            COUNT(*) AS review_count,
+            SUM(CASE WHEN decision='accept' THEN 1 ELSE 0 END) AS accept_count,
+            SUM(CASE WHEN decision='reject' THEN 1 ELSE 0 END) AS reject_count,
+            SUM(CASE WHEN decision='flag' THEN 1 ELSE 0 END) AS flag_count,
+            SUM(CASE WHEN decision='rerun' THEN 1 ELSE 0 END) AS rerun_count,
+            COUNT(DISTINCT clip_id) AS clip_count,
+            MAX(reviewed_at) AS last_reviewed_at
+        FROM reviews
+        GROUP BY COALESCE(operator_id, ''), COALESCE(operator_name, '')
+        ORDER BY last_reviewed_at DESC
+        """
+    )
+    return {"summary": summary_rows, "recent_reviews": reviews}
 
 
 def enrich_job_timing(job: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -537,6 +613,10 @@ def run_generation(
     dry_run: bool = False,
     lock_tokens: dict[str, str] | None = None,
     force: bool = False,
+    operator_id: str | None = None,
+    operator_name: str | None = None,
+    prompt: str | None = None,
+    reference_images: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     settings = load_settings()
     mode = mode or DEFAULT_REQUEST_MODE
@@ -555,12 +635,29 @@ def run_generation(
     if not clips:
         return []
     client = SeedanceClient(settings)
+    operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     concurrency_key = "mock_concurrency" if mode == "mock" or dry_run else "seedance_concurrency"
     max_workers = max(1, int(settings.get(concurrency_key, 1)))
     max_workers = min(max_workers, len(clips))
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(run_generation_for_clip, client, clip, mode, settings, dry_run, force) for clip in clips]
+        futures = [
+            executor.submit(
+                run_generation_for_clip,
+                client,
+                clip,
+                mode,
+                settings,
+                dry_run,
+                force,
+                operator_id,
+                operator_name,
+                generation_prompt,
+                generation_refs,
+            )
+            for clip in clips
+        ]
         for future in as_completed(futures):
             results.append(future.result())
     return results
@@ -572,13 +669,17 @@ def queue_generation(
     dry_run: bool = False,
     lock_tokens: dict[str, str] | None = None,
     force: bool = False,
+    operator_id: str | None = None,
+    operator_name: str | None = None,
+    prompt: str | None = None,
+    reference_images: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     settings = load_settings()
     mode = mode or DEFAULT_REQUEST_MODE
     if dry_run:
-        return run_generation(mode, clip_ids, dry_run, lock_tokens, force)
+        return run_generation(mode, clip_ids, dry_run, lock_tokens, force, operator_id, operator_name, prompt, reference_images)
     if mode == "mock" and not settings.get("mock_async"):
-        return run_generation(mode, clip_ids, dry_run, lock_tokens, force)
+        return run_generation(mode, clip_ids, dry_run, lock_tokens, force, operator_id, operator_name, prompt, reference_images)
     if mode not in {"mock", "seedance"}:
         raise ValueError("mode must be mock or seedance")
     if clip_ids is not None and len(clip_ids) == 0:
@@ -594,8 +695,10 @@ def queue_generation(
     if not clips:
         return []
     claimed = []
+    operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     for clip in clips:
-        item = claim_async_generation_job(clip, mode, settings, force)
+        item = claim_async_generation_job(clip, mode, settings, force, operator_id, operator_name, generation_prompt, generation_refs)
         if item.get("status") == "queued":
             claimed.append(item)
     for item in claimed:
@@ -611,8 +714,13 @@ def claim_async_generation_job(
     mode: str,
     settings: dict[str, Any],
     force: bool = False,
+    operator_id: str = "",
+    operator_name: str = "",
+    prompt: str = "",
+    reference_images: list[str] | None = None,
 ) -> dict[str, Any]:
     requested = requested_seedance_duration(float(clip["duration_sec"]))
+    prompt, reference_images = generation_overrides(settings, prompt, reference_images)
     if mode == "mock":
         estimate = max(0.1, float(clip["duration_sec"]) * float(settings.get("mock_seconds_per_video_second") or 0.25))
     else:
@@ -635,12 +743,25 @@ def claim_async_generation_job(
         cur = conn.execute(
             """
             INSERT INTO generation_jobs(
-                clip_id, mode, requested_duration_sec, status, retry_count,
+                clip_id, mode, requested_duration_sec, operator_id, operator_name,
+                prompt, reference_images_json, status, retry_count,
                 started_at, estimated_total_sec, created_at, updated_at
             )
-            VALUES (?, ?, ?, 'running', 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?, ?, ?)
             """,
-            (clip["id"], mode, requested, now, estimate, now, now),
+            (
+                clip["id"],
+                mode,
+                requested,
+                operator_id,
+                operator_name,
+                prompt,
+                json_text(reference_images or []),
+                now,
+                estimate,
+                now,
+                now,
+            ),
         )
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
@@ -700,18 +821,38 @@ def seedance_job_worker(job_id: int) -> None:
     )
     if not job or job.get("status") != "running":
         return
+    job = dict(job)
     settings = load_settings()
     client = SeedanceClient(settings)
+    job_prompt, job_refs = generation_values_from_job(job, settings)
     out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
     max_workers = max(1, int(settings.get("seedance_concurrency", 1)))
     acquire_generation_slot(max_workers)
     try:
         if not job.get("task_id"):
-            task = client.create_task(settings["default_prompt"], job["public_url"], float(job["duration_sec"]))
+            try:
+                task = client.create_task(job_prompt, job["public_url"], float(job["duration_sec"]), job_refs)
+            except Exception as exc:
+                record_seedance_api_call(job, "failed", error=str(exc))
+                raise
             job["task_id"] = task["task_id"]
+            record_seedance_api_call(
+                job,
+                "submitted",
+                task_id=job["task_id"],
+                usage=task.get("usage"),
+                raw_response=task.get("raw_response"),
+            )
             with db.connect() as conn:
                 conn.execute("UPDATE generation_jobs SET task_id=?, updated_at=? WHERE id=?", (job["task_id"], db.now(), job_id))
         data = client.wait_for_task(job["task_id"], out_path, input_url=job["public_url"])
+        update_seedance_api_call(
+            job,
+            "succeeded",
+            task_id=job["task_id"],
+            usage=data.get("usage"),
+            raw_response=data.get("raw_response"),
+        )
         with db.connect() as conn:
             now = db.now()
             conn.execute(
@@ -724,6 +865,8 @@ def seedance_job_worker(job_id: int) -> None:
             )
             conn.execute("UPDATE clips SET status='generated', updated_at=? WHERE id=? AND status='generating'", (now, job["clip_id"]))
     except Exception as exc:
+        if job.get("task_id"):
+            update_seedance_api_call(job, "failed", task_id=job.get("task_id"), error=str(exc))
         fail_generation_job(job_id, int(job["clip_id"]), str(exc))
     finally:
         release_generation_slot()
@@ -775,6 +918,162 @@ def filter_generation_clips(
     return available
 
 
+def normalize_operator(operator_id: str | None, operator_name: str | None) -> tuple[str, str]:
+    normalized_id = (operator_id or "").strip()
+    normalized_name = (operator_name or "").strip()
+    if not normalized_name:
+        normalized_name = normalized_id
+    return normalized_id, normalized_name
+
+
+def operator_from_lock_token(lock_token: str | None) -> tuple[str, str]:
+    if not lock_token:
+        return "", ""
+    row = db.one("SELECT owner_id, owner_name FROM resource_locks WHERE token=?", (lock_token,))
+    if not row:
+        return "", ""
+    return normalize_operator(row.get("owner_id"), row.get("owner_name"))
+
+
+def generation_overrides(
+    settings: dict[str, Any],
+    prompt: str | None,
+    reference_images: list[str] | None,
+) -> tuple[str, list[str]]:
+    generation_prompt = (prompt or "").strip() or str(settings.get("default_prompt") or "")
+    if reference_images is None:
+        generation_refs = settings.get("reference_images") or []
+    else:
+        generation_refs = reference_images
+    return generation_prompt, [str(item) for item in generation_refs if str(item).strip()]
+
+
+def generation_values_from_job(job: dict[str, Any], settings: dict[str, Any]) -> tuple[str, list[str]]:
+    prompt = (job.get("prompt") or "").strip() or str(settings.get("default_prompt") or "")
+    refs = parse_json_text(job.get("reference_images_json"))
+    if not isinstance(refs, list):
+        refs = settings.get("reference_images") or []
+    return prompt, [str(item) for item in refs if str(item).strip()]
+
+
+def parse_json_text(value: Any) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def json_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def seedance_call_payload(
+    job: dict[str, Any],
+    status: str,
+    task_id: str | None = None,
+    usage: Any = None,
+    raw_response: Any = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    now = db.now()
+    return {
+        "job_id": job.get("id"),
+        "clip_id": job.get("clip_id"),
+        "operator_id": job.get("operator_id") or "",
+        "operator_name": job.get("operator_name") or "",
+        "call_type": "create_task",
+        "status": status,
+        "task_id": task_id or job.get("task_id") or "",
+        "model": load_settings().get("seedance_model") or "",
+        "requested_duration_sec": job.get("requested_duration_sec"),
+        "clip_duration_sec": job.get("duration_sec"),
+        "usage_json": json_text(usage),
+        "raw_response_json": json_text(raw_response),
+        "error": error,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def record_seedance_api_call(
+    job: dict[str, Any],
+    status: str,
+    task_id: str | None = None,
+    usage: Any = None,
+    raw_response: Any = None,
+    error: str | None = None,
+) -> None:
+    payload = seedance_call_payload(job, status, task_id, usage, raw_response, error)
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO seedance_api_calls(
+                job_id, clip_id, operator_id, operator_name, call_type, status,
+                task_id, model, requested_duration_sec, clip_duration_sec,
+                usage_json, raw_response_json, error, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["job_id"],
+                payload["clip_id"],
+                payload["operator_id"],
+                payload["operator_name"],
+                payload["call_type"],
+                payload["status"],
+                payload["task_id"],
+                payload["model"],
+                payload["requested_duration_sec"],
+                payload["clip_duration_sec"],
+                payload["usage_json"],
+                payload["raw_response_json"],
+                payload["error"],
+                payload["created_at"],
+                payload["updated_at"],
+            ),
+        )
+
+
+def update_seedance_api_call(
+    job: dict[str, Any],
+    status: str,
+    task_id: str | None = None,
+    usage: Any = None,
+    raw_response: Any = None,
+    error: str | None = None,
+) -> None:
+    now = db.now()
+    call_id = None
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM seedance_api_calls
+            WHERE job_id=? AND call_type='create_task'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (job.get("id"),),
+        ).fetchone()
+        call_id = row["id"] if row else None
+    if call_id is None:
+        record_seedance_api_call(job, status, task_id, usage, raw_response, error)
+        return
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE seedance_api_calls
+            SET status=?, task_id=?, usage_json=COALESCE(?, usage_json),
+                raw_response_json=COALESCE(?, raw_response_json), error=?, updated_at=?
+            WHERE id=?
+            """,
+            (status, task_id or job.get("task_id") or "", json_text(usage), json_text(raw_response), error, now, call_id),
+        )
+
+
 def run_generation_for_clip(
     client: SeedanceClient,
     clip: dict[str, Any],
@@ -782,8 +1081,13 @@ def run_generation_for_clip(
     settings: dict[str, Any],
     dry_run: bool,
     force: bool = False,
+    operator_id: str = "",
+    operator_name: str = "",
+    prompt: str = "",
+    reference_images: list[str] | None = None,
 ) -> dict[str, Any]:
     requested = requested_seedance_duration(float(clip["duration_sec"]))
+    prompt, reference_images = generation_overrides(settings, prompt, reference_images)
     now = db.now()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -805,12 +1109,25 @@ def run_generation_for_clip(
         cur = conn.execute(
             """
             INSERT INTO generation_jobs(
-                clip_id, mode, requested_duration_sec, status, retry_count,
+                clip_id, mode, requested_duration_sec, operator_id, operator_name,
+                prompt, reference_images_json, status, retry_count,
                 started_at, estimated_total_sec, created_at, updated_at
             )
-            VALUES (?, ?, ?, 'running', 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?, ?, ?)
             """,
-            (clip["id"], mode, requested, now, estimated_total_sec, now, now),
+            (
+                clip["id"],
+                mode,
+                requested,
+                operator_id,
+                operator_name,
+                prompt,
+                json_text(reference_images or []),
+                now,
+                estimated_total_sec,
+                now,
+                now,
+            ),
         )
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
@@ -823,7 +1140,7 @@ def run_generation_for_clip(
         suffix = "dryrun" if dry_run else mode
         out_path = GENERATED_DIR / episode_uuid / f"clip_{int(clip['clip_index']):04d}_job_{job_id}_{suffix}.mp4"
         if dry_run:
-            payload = client.dry_run_payload(settings["default_prompt"], clip["public_url"], float(clip["duration_sec"]))
+            payload = client.dry_run_payload(prompt, clip["public_url"], float(clip["duration_sec"]), reference_images or [])
             out_path = out_path.with_suffix(".json")
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(__import__("json").dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -834,7 +1151,40 @@ def run_generation_for_clip(
             task_id = data["task_id"]
             output_url = data["output_url"]
         else:
-            data = client.generate(settings["default_prompt"], clip["public_url"], float(clip["duration_sec"]), out_path)
+            job_for_call = {
+                "id": job_id,
+                "clip_id": clip["id"],
+                "operator_id": operator_id,
+                "operator_name": operator_name,
+                "requested_duration_sec": requested,
+                "duration_sec": clip["duration_sec"],
+            }
+            try:
+                task = client.create_task(prompt, clip["public_url"], float(clip["duration_sec"]), reference_images or [])
+            except Exception as exc:
+                record_seedance_api_call(job_for_call, "failed", error=str(exc))
+                raise
+            task_id = task["task_id"]
+            job_for_call["task_id"] = task_id
+            record_seedance_api_call(
+                job_for_call,
+                "submitted",
+                task_id=task_id,
+                usage=task.get("usage"),
+                raw_response=task.get("raw_response"),
+            )
+            try:
+                data = client.wait_for_task(task_id, out_path, input_url=clip["public_url"])
+            except Exception as exc:
+                update_seedance_api_call(job_for_call, "failed", task_id=task_id, error=str(exc))
+                raise
+            update_seedance_api_call(
+                job_for_call,
+                "succeeded",
+                task_id=task_id,
+                usage=data.get("usage"),
+                raw_response=data.get("raw_response"),
+            )
             task_id = data["task_id"]
             output_url = data["output_url"]
         with db.connect() as conn:
@@ -854,24 +1204,63 @@ def run_generation_for_clip(
         return {"job_id": job_id, "clip_id": clip["id"], "status": "failed", "error": str(exc)}
 
 
-def retry_job(job_id: int, lock_token: str | None = None) -> dict[str, Any]:
+def retry_job(
+    job_id: int,
+    lock_token: str | None = None,
+    operator_id: str | None = None,
+    operator_name: str | None = None,
+    prompt: str | None = None,
+    reference_images: list[str] | None = None,
+) -> dict[str, Any]:
     job = db.one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))
     if not job:
         raise ValueError("job not found")
     clip = db.one("SELECT * FROM clips WHERE id=?", (job["clip_id"],))
     if not clip:
         raise ValueError("clip not found")
-    return retry_clip(clip["id"], mode=job["mode"], lock_token=lock_token)
+    job_reference_images = parse_json_text(job.get("reference_images_json"))
+    if not isinstance(job_reference_images, list):
+        job_reference_images = None
+    return retry_clip(
+        clip["id"],
+        mode=job["mode"],
+        lock_token=lock_token,
+        operator_id=operator_id,
+        operator_name=operator_name,
+        prompt=prompt if prompt is not None else job.get("prompt"),
+        reference_images=reference_images if reference_images is not None else job_reference_images,
+    )
 
 
-def retry_clip(clip_id: int, mode: str | None = None, lock_token: str | None = None, require_lock_token: bool = True) -> dict[str, Any]:
+def retry_clip(
+    clip_id: int,
+    mode: str | None = None,
+    lock_token: str | None = None,
+    require_lock_token: bool = True,
+    operator_id: str | None = None,
+    operator_name: str | None = None,
+    prompt: str | None = None,
+    reference_images: list[str] | None = None,
+) -> dict[str, Any]:
     clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
     if not clip:
         raise ValueError("clip not found")
     if require_lock_token:
         require_lock("clip", clip_id, lock_token)
     tokens = {str(clip_id): lock_token} if lock_token else {}
-    return queue_generation(clip_ids=[clip_id], mode=mode, lock_tokens=tokens, force=True)[0]
+    normalized_operator_id, normalized_operator_name = normalize_operator(operator_id, operator_name)
+    if not normalized_operator_id:
+        normalized_operator_id, normalized_operator_name = operator_from_lock_token(lock_token)
+    return queue_generation(
+        clip_ids=[clip_id],
+        mode=mode,
+        lock_tokens=tokens,
+        force=True,
+        operator_id=normalized_operator_id,
+        operator_name=normalized_operator_name,
+        prompt=prompt,
+        reference_images=reference_images,
+    )[0]
 
 
 def review_clip(
@@ -881,6 +1270,10 @@ def review_clip(
     note: str = "",
     lock_token: str | None = None,
     require_lock_token: bool = True,
+    operator_id: str | None = None,
+    operator_name: str | None = None,
+    prompt: str | None = None,
+    reference_images: list[str] | None = None,
 ) -> dict[str, Any]:
     if decision not in {"accept", "reject", "rerun", "flag"}:
         raise ValueError("decision must be accept/reject/rerun/flag")
@@ -921,7 +1314,15 @@ def review_clip(
             raise
         accepted_path = str(accepted_path_obj.resolve())
     elif decision == "rerun":
-        rerun_result = retry_clip(clip_id, lock_token=lock_token, require_lock_token=require_lock_token)
+        rerun_result = retry_clip(
+            clip_id,
+            lock_token=lock_token,
+            require_lock_token=require_lock_token,
+            operator_id=operator_id,
+            operator_name=operator_name,
+            prompt=prompt,
+            reference_images=reference_images,
+        )
         job = db.one("SELECT * FROM generation_jobs WHERE id=?", (rerun_result["job_id"],)) or job
         if rerun_result.get("status") == "succeeded":
             status = "generated"
@@ -931,11 +1332,17 @@ def review_clip(
             status = "generated_failed"
     if require_lock_token:
         require_lock("clip", clip_id, lock_token)
+    normalized_operator_id, normalized_operator_name = normalize_operator(operator_id, operator_name)
+    if not normalized_operator_id:
+        normalized_operator_id, normalized_operator_name = operator_from_lock_token(lock_token)
     now = db.now()
     with db.connect() as conn:
         conn.execute(
-            "INSERT INTO reviews(clip_id, job_id, decision, note, accepted_path, reviewed_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (clip_id, job["id"] if job else None, decision, note, accepted_path, now),
+            """
+            INSERT INTO reviews(clip_id, job_id, operator_id, operator_name, decision, note, accepted_path, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (clip_id, job["id"] if job else None, normalized_operator_id, normalized_operator_name, decision, note, accepted_path, now),
         )
         conn.execute("UPDATE clips SET status=?, updated_at=? WHERE id=?", (status, now, clip_id))
         conn.execute("UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=?", (now, clip["episode_uuid"]))

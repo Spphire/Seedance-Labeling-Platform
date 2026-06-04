@@ -29,6 +29,8 @@ from .services import (
     list_clips,
     list_episodes,
     list_jobs,
+    list_reviewer_activity,
+    list_seedance_usage,
     preprocess,
     queue_generation,
     queue_stitch_episode,
@@ -76,13 +78,27 @@ def _public_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/")
-def index() -> FileResponse:
+def frontend_index() -> FileResponse:
     _init()
     index_path = FRONTEND_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="frontend index.html not found")
     return FileResponse(index_path)
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return frontend_index()
+
+
+@app.get("/label")
+def label_index() -> FileResponse:
+    return frontend_index()
+
+
+@app.get("/admin")
+def admin_index() -> FileResponse:
+    return frontend_index()
 
 
 @app.get("/api/health")
@@ -143,7 +159,16 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
         lock_tokens = {}
         if payload.clip_ids and payload.lock_token:
             lock_tokens = {str(clip_id): payload.lock_token for clip_id in payload.clip_ids}
-        return queue_generation(payload.mode, payload.clip_ids, payload.dry_run, lock_tokens)
+        return queue_generation(
+            payload.mode,
+            payload.clip_ids,
+            payload.dry_run,
+            lock_tokens,
+            operator_id=payload.operator_id,
+            operator_name=payload.operator_name,
+            prompt=payload.prompt,
+            reference_images=payload.reference_images,
+        )
     except Exception as exc:
         raise _public_error(exc) from exc
 
@@ -151,7 +176,14 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
 @app.post("/api/generation/{job_id}/retry")
 def post_generation_retry(job_id: int, payload: LockTokenRequest | None = None) -> dict[str, Any]:
     try:
-        return retry_job(job_id, payload.lock_token if payload else None)
+        return retry_job(
+            job_id,
+            payload.lock_token if payload else None,
+            payload.operator_id if payload else None,
+            payload.operator_name if payload else None,
+            payload.prompt if payload else None,
+            payload.reference_images if payload else None,
+        )
     except Exception as exc:
         raise _public_error(exc) from exc
 
@@ -163,6 +195,10 @@ def post_clip_retry(clip_id: int, payload: LockTokenRequest | None = None) -> di
             clip_id,
             mode=payload.mode if payload else None,
             lock_token=payload.lock_token if payload else None,
+            operator_id=payload.operator_id if payload else None,
+            operator_name=payload.operator_name if payload else None,
+            prompt=payload.prompt if payload else None,
+            reference_images=payload.reference_images if payload else None,
         )
     except Exception as exc:
         raise _public_error(exc) from exc
@@ -171,7 +207,17 @@ def post_clip_retry(clip_id: int, payload: LockTokenRequest | None = None) -> di
 @app.post("/api/review/{clip_id}")
 def post_review(clip_id: int, payload: ReviewRequest) -> dict[str, Any]:
     try:
-        return review_clip(clip_id, payload.decision, payload.job_id, payload.note, payload.lock_token)
+        return review_clip(
+            clip_id,
+            payload.decision,
+            payload.job_id,
+            payload.note,
+            payload.lock_token,
+            operator_id=payload.operator_id,
+            operator_name=payload.operator_name,
+            prompt=payload.prompt,
+            reference_images=payload.reference_images,
+        )
     except Exception as exc:
         raise _public_error(exc) from exc
 
@@ -208,6 +254,16 @@ def get_clips() -> list[dict[str, Any]]:
 @app.get("/api/jobs")
 def get_jobs() -> list[dict[str, Any]]:
     return list_jobs()
+
+
+@app.get("/api/usage/seedance")
+def get_seedance_usage(limit: int = 100) -> dict[str, Any]:
+    return list_seedance_usage(limit)
+
+
+@app.get("/api/reviews/activity")
+def get_reviewer_activity(limit: int = 100) -> dict[str, Any]:
+    return list_reviewer_activity(limit)
 
 
 @app.get("/api/locks")
