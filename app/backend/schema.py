@@ -9,6 +9,11 @@ class EpisodeBatchRequest(BaseModel):
     episodes_text: str = Field(..., description="One episode UUID per line or separated by whitespace/commas.")
 
 
+class SubmitPreprocessRequest(EpisodeBatchRequest):
+    fetch_remote: bool = True
+    lock_tokens: dict[str, str] | None = None
+
+
 class PreprocessRequest(BaseModel):
     uuids: list[str] | None = None
     fetch_remote: bool = True

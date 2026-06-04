@@ -106,6 +106,8 @@ def list_episodes() -> list[dict[str, Any]]:
         episode["manual_decision_count"] = generated + flagged + rejected
         episode["episode_stage"] = describe_episode_stage(episode)
         episode["lock"] = episode_locks.get(episode["uuid"])
+        head_path = episode.get("head_video_path")
+        episode["head_video_url"] = static_url_from_path(head_path, HEAD_VIDEOS_DIR, "head_videos") if head_path else None
         final_path = episode.get("final_video_path")
         episode["final_url"] = static_url_from_path(final_path, FINAL_DIR, "final") if final_path else None
     return episodes
@@ -281,13 +283,6 @@ def acquire_stitch_locks(uuid: str, clips: list[dict[str, Any]]) -> list[str]:
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         for resource_type, resource_id in resources:
-            existing = conn.execute(
-                "SELECT * FROM resource_locks WHERE resource_type=? AND resource_id=? AND expires_at > ?",
-                (resource_type, resource_id, now),
-            ).fetchone()
-            if existing and existing["owner_id"] != STITCH_LOCK_OWNER_ID:
-                raise LockError(409, "resource is locked by another reviewer", dict(existing))
-        for resource_type, resource_id in resources:
             conn.execute("DELETE FROM resource_locks WHERE resource_type=? AND resource_id=?", (resource_type, resource_id))
             token = secrets.token_urlsafe(24)
             tokens.append(token)
@@ -399,9 +394,29 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
         if fetch_remote:
             episode_dir = fetch_episode(settings["dm3_host"], settings["dm3_nedf_root"], uuid, local_dir)
         preprocessed_dir = episode_dir / "preprocessed"
+        head_path = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        existing_head = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
+        existing_head_path = Path(existing_head["head_video_path"]) if existing_head and existing_head.get("head_video_path") else head_path
+        if not (preprocessed_dir / "metadata.json").exists() and existing_head_path.exists():
+            duration = video_duration(existing_head_path)
+            clips = create_clips(uuid, existing_head_path, duration)
+            with db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE episodes SET status='preprocessed', head_video_path=?, final_status='missing',
+                    error=NULL, updated_at=? WHERE uuid=?
+                    """,
+                    (str(existing_head_path.resolve()), db.now(), uuid),
+                )
+            return {
+                "uuid": uuid,
+                "status": "preprocessed",
+                "reason": integrity["reason"],
+                "head": {"output_path": str(existing_head_path.resolve()), "duration_sec": duration, "reused": True},
+                "clips": clips,
+            }
         if not (preprocessed_dir / "metadata.json").exists():
             raise RuntimeError(f"Missing preprocessed metadata for {uuid}")
-        head_path = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
         meta = extract_head_video(preprocessed_dir, head_path)
         duration = video_duration(head_path)
         clips = create_clips(uuid, head_path, duration)
@@ -933,20 +948,22 @@ def queue_stitch_episode(
     with _STITCH_LOCK:
         if uuid in _STITCHING_EPISODES:
             return {"uuid": uuid, "queued": False, "final_status": "stitching", "reason": "already stitching"}
+        lock_tokens = acquire_stitch_locks(uuid, clips)
         _STITCHING_EPISODES.add(uuid)
         with db.connect() as conn:
             conn.execute("UPDATE episodes SET final_status='stitching', error=NULL, updated_at=? WHERE uuid=?", (db.now(), uuid))
-        _STITCH_EXECUTOR.submit(_stitch_episode_worker, uuid)
+        _STITCH_EXECUTOR.submit(_stitch_episode_worker, uuid, lock_tokens)
     return {"uuid": uuid, "queued": True, "final_status": "stitching"}
 
 
-def _stitch_episode_worker(uuid: str) -> None:
+def _stitch_episode_worker(uuid: str, lock_tokens: list[str]) -> None:
     try:
         stitch_episode(uuid)
     except Exception as exc:
         with db.connect() as conn:
             conn.execute("UPDATE episodes SET final_status='failed', error=?, updated_at=? WHERE uuid=?", (str(exc), db.now(), uuid))
     finally:
+        release_stitch_locks(lock_tokens)
         with _STITCH_LOCK:
             _STITCHING_EPISODES.discard(uuid)
 

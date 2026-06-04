@@ -16,7 +16,16 @@ from app.backend import db
 from app.backend.main import app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
-from app.backend.services import create_clips, list_clips, queue_generation, refresh_clip_public_urls, review_clip, run_generation
+from app.backend.services import (
+    create_clips,
+    list_clips,
+    preprocess_one,
+    queue_generation,
+    queue_stitch_episode,
+    refresh_clip_public_urls,
+    review_clip,
+    run_generation,
+)
 from app.backend.settings import DEFAULT_PROMPT, DEFAULT_SETTINGS, SETTINGS_PATH, load_settings, public_settings, save_settings
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
 from app.seedance.client import SeedanceClient, resolve_image_value
@@ -142,6 +151,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(stream["width"], 760)
         self.assertEqual(stream["height"], 570)
         self.assertEqual(stream["avg_frame_rate"], "30/1")
+        self.assertAlmostEqual(float(info["format"]["duration"]), 8.0, delta=0.25)
 
     def test_seedance_dry_run_writes_payload_only(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000002"
@@ -484,6 +494,65 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(resolved, source_root / uuid)
         self.assertFalse(local_dir.exists())
 
+    def test_preprocess_skips_complete_episode_and_recovers_missing_clip_file(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000017"
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 16)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, head_video_path, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, ?)
+                """,
+                (uuid, "mock", str((EPISODES_DIR / uuid).resolve()), str(head.resolve()), now, now),
+            )
+        clips = create_clips(uuid, head, 16)
+        before_ids = [clip["id"] for clip in clips]
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        token = lock.json()["token"]
+
+        skipped = preprocess_one(uuid, load_settings(), fetch_remote=False, lock_token=token)
+
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertEqual(skipped["clip_count"], len(clips))
+        self.assertEqual([row["id"] for row in db.rows("SELECT id FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))], before_ids)
+
+        Path(clips[0]["path"]).unlink()
+        rebuilt = preprocess_one(uuid, load_settings(), fetch_remote=False, lock_token=token)
+
+        self.assertEqual(rebuilt["status"], "preprocessed")
+        self.assertIn("clip 0 file is missing", rebuilt["reason"])
+        self.assertNotEqual(
+            [row["id"] for row in db.rows("SELECT id FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))],
+            before_ids,
+        )
+        self.assertTrue(Path(rebuilt["clips"][0]["path"]).exists())
+
+    def test_submit_and_preprocess_combined_endpoint_submits_before_preprocess(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000018"
+        self.assertIsNone(db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,)))
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        res = self.client.post(
+            "/api/pipeline/submit_preprocess",
+            json={"episodes_text": uuid, "fetch_remote": False, "lock_tokens": {uuid: lock.json()["token"]}},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        result = res.json()
+
+        self.assertTrue(any(item["uuid"] == uuid for item in result["episodes"]))
+        self.assertEqual(result["preprocess"][0]["uuid"], uuid)
+        self.assertIn("error", result["preprocess"][0])
+        self.assertIsNotNone(db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,)))
+
     def test_public_base_url_refreshes_existing_clip_records(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000009"
         now = db.now()
@@ -544,6 +613,35 @@ class MockPipelineTest(unittest.TestCase):
         result = run_generation(mode="mock", clip_ids=[clips[0]["id"]])
         with self.assertRaises(ValueError):
             review_clip(clips[1]["id"], "accept", result[0]["job_id"], require_lock_token=False)
+
+    def test_stitch_queue_locks_episode_and_clips_until_worker_finishes(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000019"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 16)
+        clips = create_clips(uuid, head, 16)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='accepted' WHERE episode_uuid=?", (uuid,))
+            conn.execute("UPDATE episodes SET final_status='missing' WHERE uuid=?", (uuid,))
+
+        with patch("app.backend.services._STITCH_EXECUTOR.submit") as submit:
+            result = queue_stitch_episode(uuid, check_episode_lock=False)
+
+        self.assertTrue(result["queued"])
+        submit.assert_called_once()
+        locks = db.rows("SELECT * FROM resource_locks WHERE owner_id='system-stitcher'")
+        resources = {(row["resource_type"], row["resource_id"]) for row in locks}
+        self.assertIn(("episode", uuid), resources)
+        for clip in clips:
+            self.assertIn(("clip", str(clip["id"])), resources)
 
     def test_clip_lock_required_for_review_api(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000005"

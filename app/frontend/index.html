@@ -732,8 +732,7 @@
         <h2>批量 episode</h2>
         <textarea id="episodeText" spellcheck="false" placeholder="c412f233-549f-43cd-89c3-af0b496ae742"></textarea>
         <div class="row">
-          <button id="submitEpisodes" class="primary">提交</button>
-          <button id="preprocess">预处理</button>
+          <button id="submitPreprocess" class="primary">提交并预处理</button>
         </div>
         <div class="row">
           <input id="headVideoPath" placeholder="已有 head MP4 路径">
@@ -770,7 +769,7 @@
     <main>
       <nav id="tabs" class="tabs"></nav>
       <section id="workspace" class="workspace">
-        <div class="empty">选择一个 clip 开始审核</div>
+        <div class="empty">选择一个 episode 查看完整视频，或选择一个 clip 开始审核</div>
       </section>
       <div id="status" class="statusbar">ready</div>
     </main>
@@ -1204,7 +1203,8 @@
         `;
         div.addEventListener("click", () => {
           state.selectedEpisode = state.selectedEpisode === episode.uuid ? null : episode.uuid;
-          render({ forceWorkspace: false });
+          state.activeClipId = null;
+          render({ forceWorkspace: true });
         });
         div.querySelectorAll("[data-episode-stitch]").forEach((button) => {
           button.addEventListener("click", async (event) => {
@@ -1302,7 +1302,13 @@
       const target = $("workspace");
       const clip = state.clips.find((item) => item.id === state.activeClipId);
       if (!clip) {
-        target.innerHTML = `<div class="empty">选择一个 clip 开始审核</div>`;
+        const episode = state.episodes.find((item) => item.uuid === state.selectedEpisode);
+        if (episode) {
+          renderEpisodeWorkspace(episode);
+        } else {
+          target.dataset.signature = "";
+          target.innerHTML = `<div class="empty">选择一个 episode 查看完整视频，或选择一个 clip 开始审核</div>`;
+        }
         return;
       }
       const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid) || {};
@@ -1365,6 +1371,50 @@
         takeover.addEventListener("click", async () => acquireClipLock(clip.id, true));
       }
       wireReviewActions(clip);
+      wireSync();
+    }
+
+    function renderEpisodeWorkspace(episode) {
+      const target = $("workspace");
+      const signature = [
+        "episode",
+        episode.uuid,
+        episode.status || "",
+        episode.final_status || "",
+        episode.head_video_url || "",
+        episode.final_url || "",
+        episode.clip_count || 0,
+        episode.accepted_clip_count || 0,
+      ].join("|");
+      if (target.dataset.signature === signature) {
+        return;
+      }
+      const finalReady = episode.final_status === "ready" && episode.final_url;
+      target.innerHTML = `
+        ${renderEpisodeNotice(episode)}
+        <div class="review-head">
+          <div class="review-title">
+            <h2>${shortUuid(episode.uuid)} · episode</h2>
+            <div class="meta">${episode.uuid} · ${episodeStage(episode)}</div>
+          </div>
+        </div>
+        <div class="videos">
+          <div class="video-pane">
+            <h3><span>原 head 视频</span><span>${badge(episode.status)}</span></h3>
+            <video id="originalVideo" src="${episode.head_video_url || ""}" controls playsinline></video>
+          </div>
+          <div class="video-pane">
+            <h3><span>合成 final</span><span>${badge(episode.final_status || "missing")}</span></h3>
+            <video id="generatedVideo" src="${finalReady ? episode.final_url : ""}" controls playsinline></video>
+          </div>
+        </div>
+        <div class="sync-row">
+          <button id="playBoth" ${finalReady ? "" : "disabled"}>同步播放</button>
+          <button id="pauseBoth">暂停</button>
+          <button id="restartBoth">回到开头</button>
+        </div>
+      `;
+      target.dataset.signature = signature;
       wireSync();
     }
 
@@ -1569,41 +1619,24 @@
         log(err.message);
       }
     });
-    $("submitEpisodes").addEventListener("click", async () => {
-      try {
-        const result = await api("/api/episodes/batch", {
-          method: "POST",
-          body: { episodes_text: $("episodeText").value },
-        });
-        log("episodes submitted", result);
-        await refresh();
-      } catch (err) {
-        log(err.message);
-      }
-    });
-    $("preprocess").addEventListener("click", async () => {
+    $("submitPreprocess").addEventListener("click", async () => {
       const lockTokens = {};
       try {
-        log("preprocess running");
         let uuids = state.selectedEpisode ? [state.selectedEpisode] : uuidsFromText($("episodeText").value);
-        if (!uuids.length) {
-          uuids = state.episodes.map((episode) => episode.uuid);
+        if (!uuids.length) throw new Error("需要在文本框中填写 episode UUID，或先选择一个 episode");
+        log("submit + preprocess running");
+        for (const uuid of uuids) {
+          const lock = await api("/api/locks/acquire", {
+            method: "POST",
+            body: lockPayload("episode", uuid),
+          });
+          lockTokens[uuid] = lock.token;
         }
-        if (!uuids.length) throw new Error("没有可预处理的 episode");
-        if (uuids) {
-          for (const uuid of uuids) {
-            const lock = await api("/api/locks/acquire", {
-              method: "POST",
-              body: lockPayload("episode", uuid),
-            });
-            lockTokens[uuid] = lock.token;
-          }
-        }
-        const result = await api("/api/pipeline/preprocess", {
+        const result = await api("/api/pipeline/submit_preprocess", {
           method: "POST",
-          body: { uuids, fetch_remote: true, lock_tokens: lockTokens },
+          body: { episodes_text: uuids.join("\n"), fetch_remote: true, lock_tokens: lockTokens },
         });
-        log("preprocess finished", result);
+        log("submit + preprocess finished", result);
         await refresh();
       } catch (err) {
         log(formatApiError(err));

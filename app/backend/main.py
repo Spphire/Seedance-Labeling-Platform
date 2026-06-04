@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .locks import LockError, acquire_lock, list_locks, release_lock, renew_lock
-from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, REFERENCE_IMAGES_DIR, ROOT, ensure_dirs
+from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR, ROOT, ensure_dirs
 from .schema import (
     EpisodeBatchRequest,
     GenerationRunRequest,
@@ -21,6 +21,7 @@ from .schema import (
     LockTokenRequest,
     PreprocessRequest,
     ReviewRequest,
+    SubmitPreprocessRequest,
 )
 from .services import (
     auto_accept_all,
@@ -35,6 +36,7 @@ from .services import (
     retry_clip,
     retry_job,
     review_clip,
+    submit_and_preprocess_episodes,
     submit_episodes,
 )
 from .settings import load_settings, public_settings, save_settings
@@ -107,6 +109,14 @@ def post_settings(payload: dict[str, Any]) -> dict[str, Any]:
 def post_episodes_batch(payload: EpisodeBatchRequest) -> list[dict[str, Any]]:
     try:
         return submit_episodes(payload.episodes_text)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/pipeline/submit_preprocess")
+def post_submit_preprocess(payload: SubmitPreprocessRequest) -> dict[str, Any]:
+    try:
+        return submit_and_preprocess_episodes(payload.episodes_text, payload.fetch_remote, payload.lock_tokens)
     except Exception as exc:
         raise _public_error(exc) from exc
 
@@ -253,6 +263,7 @@ def _mount_static(prefix: str, directory: Path) -> None:
 
 
 _mount_static("/clips", CLIPS_DIR)
+_mount_static("/head_videos", HEAD_VIDEOS_DIR)
 _mount_static("/generated", GENERATED_DIR)
 _mount_static("/accepted", ACCEPTED_DIR)
 _mount_static("/final", FINAL_DIR)
