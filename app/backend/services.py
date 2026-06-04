@@ -176,7 +176,7 @@ def enrich_job_timing(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if not job:
         return job
     now = db.now()
-    started = job.get("started_at") or job.get("created_at")
+    started = job.get("started_at")
     completed = job.get("completed_at")
     elapsed = None
     if started:
@@ -423,9 +423,11 @@ def queue_generation(
 ) -> list[dict[str, Any]]:
     settings = load_settings()
     mode = mode or settings["generation_mode"]
-    if dry_run or mode == "mock":
+    if dry_run:
         return run_generation(mode, clip_ids, dry_run, lock_tokens, force)
-    if mode != "seedance":
+    if mode == "mock" and not settings.get("mock_async"):
+        return run_generation(mode, clip_ids, dry_run, lock_tokens, force)
+    if mode not in {"mock", "seedance"}:
         raise ValueError("mode must be mock or seedance")
     if clip_ids is not None and len(clip_ids) == 0:
         return []
@@ -438,21 +440,28 @@ def queue_generation(
         return []
     claimed = []
     for clip in clips:
-        item = claim_seedance_job(clip, settings, force)
+        item = claim_async_generation_job(clip, mode, settings, force)
         if item.get("status") == "queued":
             claimed.append(item)
     for item in claimed:
-        _GENERATION_EXECUTOR.submit(seedance_job_worker, int(item["job_id"]))
+        if mode == "mock":
+            _GENERATION_EXECUTOR.submit(mock_job_worker, int(item["job_id"]))
+        else:
+            _GENERATION_EXECUTOR.submit(seedance_job_worker, int(item["job_id"]))
     return claimed
 
 
-def claim_seedance_job(
+def claim_async_generation_job(
     clip: dict[str, Any],
+    mode: str,
     settings: dict[str, Any],
     force: bool = False,
 ) -> dict[str, Any]:
     requested = requested_seedance_duration(float(clip["duration_sec"]))
-    estimate = requested * float(settings.get("seedance_seconds_per_video_second") or 24)
+    if mode == "mock":
+        estimate = max(0.1, float(clip["duration_sec"]) * float(settings.get("mock_seconds_per_video_second") or 0.25))
+    else:
+        estimate = requested * float(settings.get("seedance_seconds_per_video_second") or 24)
     now = db.now()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -474,9 +483,9 @@ def claim_seedance_job(
                 clip_id, mode, requested_duration_sec, status, retry_count,
                 started_at, estimated_total_sec, created_at, updated_at
             )
-            VALUES (?, 'seedance', ?, 'running', 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'running', 0, ?, ?, ?, ?)
             """,
-            (clip["id"], requested, now, estimate, now, now),
+            (clip["id"], mode, requested, now, estimate, now, now),
         )
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
@@ -485,6 +494,43 @@ def claim_seedance_job(
             (now, clip["episode_uuid"]),
         )
     return {"job_id": job_id, "clip_id": clip["id"], "status": "queued", "estimated_total_sec": estimate}
+
+
+def mock_job_worker(job_id: int) -> None:
+    job = db.one(
+        """
+        SELECT j.*, c.episode_uuid, c.clip_index, c.local_path
+        FROM generation_jobs j
+        JOIN clips c ON c.id = j.clip_id
+        WHERE j.id=?
+        """,
+        (job_id,),
+    )
+    if not job or job.get("status") != "running":
+        return
+    out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_mock.mp4"
+    try:
+        remaining = max(0.0, float(job.get("estimated_total_sec") or 0))
+        while remaining > 0:
+            sleep_for = min(0.5, remaining)
+            time.sleep(sleep_for)
+            remaining -= sleep_for
+            with db.connect() as conn:
+                conn.execute("UPDATE generation_jobs SET updated_at=? WHERE id=? AND status='running'", (db.now(), job_id))
+        data = SeedanceClient(load_settings()).mock_generate(Path(job["local_path"]), out_path)
+        with db.connect() as conn:
+            now = db.now()
+            conn.execute(
+                """
+                UPDATE generation_jobs
+                SET status='succeeded', task_id=?, output_url=?, output_path=?, error=NULL, completed_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (data["task_id"], data["output_url"], str(out_path.resolve()), now, now, job_id),
+            )
+            conn.execute("UPDATE clips SET status='generated', updated_at=? WHERE id=? AND status='generating'", (now, job["clip_id"]))
+    except Exception as exc:
+        fail_generation_job(job_id, int(job["clip_id"]), str(exc))
 
 
 def seedance_job_worker(job_id: int) -> None:

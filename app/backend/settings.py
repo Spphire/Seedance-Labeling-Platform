@@ -18,6 +18,9 @@ DEFAULT_PROMPT = (
 LEGACY_DEFAULT_PROMPTS = {
     "保持参考视频中的视角方向、背景、动作和时序连续性，生成与输入 clip 时长一致的视频。",
 }
+BROKEN_DEFAULT_PROMPTS = {
+    "?@??1???????@??1@??2??????@??1???????@??3@??4???????????????????????",
+}
 DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/l-far.png",
     "app/reference_images/l-near.png",
@@ -32,6 +35,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "public_base_url": DEFAULT_PUBLIC_BASE_URL,
     "generation_mode": "mock",
     "mock_concurrency": 8,
+    "mock_async": False,
+    "mock_seconds_per_video_second": 0.25,
     "seedance_concurrency": 3,
     "seedance_model": "doubao-seedance-2-0-fast-260128",
     "seedance_base_url": "https://ark.cn-beijing.volces.com/api/v3",
@@ -50,10 +55,15 @@ def load_settings() -> dict[str, Any]:
         SETTINGS_PATH.write_text(json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2), encoding="utf-8")
         return dict(DEFAULT_SETTINGS)
     data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    if data.get("default_prompt") in LEGACY_DEFAULT_PROMPTS:
+    changed = False
+    if data.get("default_prompt") in LEGACY_DEFAULT_PROMPTS or data.get("default_prompt") in BROKEN_DEFAULT_PROMPTS:
         data["default_prompt"] = DEFAULT_PROMPT
+        changed = True
     if not data.get("reference_images") and REFERENCE_IMAGES_DIR.exists():
         data["reference_images"] = DEFAULT_REFERENCE_IMAGES
+        changed = True
+    if changed:
+        SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data)
     return merged

@@ -17,7 +17,7 @@ from app.backend.main import app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import create_clips, list_clips, queue_generation, refresh_clip_public_urls, review_clip, run_generation
-from app.backend.settings import DEFAULT_SETTINGS, save_settings
+from app.backend.settings import DEFAULT_PROMPT, DEFAULT_SETTINGS, SETTINGS_PATH, load_settings, save_settings
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
 
 
@@ -229,6 +229,48 @@ class MockPipelineTest(unittest.TestCase):
         data = res.json()
         self.assertNotIn("seedance_api_key", data)
         self.assertTrue(data["seedance_api_key_set"])
+
+    def test_broken_prompt_is_repaired_and_persisted(self) -> None:
+        broken = "?@??1???????@??1@??2??????@??1???????@??3@??4???????????????????????"
+        save_settings({"default_prompt": broken})
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["default_prompt"], DEFAULT_PROMPT)
+        self.assertEqual(persisted["default_prompt"], DEFAULT_PROMPT)
+
+    def test_mock_async_marks_running_then_completes(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000013"
+        now = db.now()
+        save_settings({"mock_async": True, "mock_seconds_per_video_second": 0.02})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+
+        queued = queue_generation(mode="mock")
+        self.assertEqual(queued[0]["status"], "queued")
+        running = db.one("SELECT * FROM generation_jobs WHERE id=?", (queued[0]["job_id"],))
+        self.assertEqual(running["status"], "running")
+        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generating")
+
+        deadline = time.time() + 5
+        job = running
+        while time.time() < deadline:
+            job = db.one("SELECT * FROM generation_jobs WHERE id=?", (queued[0]["job_id"],))
+            if job["status"] == "succeeded":
+                break
+            time.sleep(0.05)
+        self.assertEqual(job["status"], "succeeded")
+        self.assertTrue(Path(job["output_path"]).exists())
+        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generated")
 
     def test_fetch_episode_uses_local_mount_without_copying(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000010"

@@ -4,6 +4,8 @@
   "public_base_url": "http://106.14.2.243:18080",
   "generation_mode": "mock",
   "mock_concurrency": 8,
+  "mock_async": false,
+  "mock_seconds_per_video_second": 0.25,
   "seedance_concurrency": 3,
   "seedance_model": "doubao-seedance-2-0-fast-260128",
   "seedance_base_url": "https://ark.cn-beijing.volces.com/api/v3",

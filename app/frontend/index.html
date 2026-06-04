@@ -787,6 +787,8 @@
       clientId: "",
       reviewerName: "",
       clipLocks: {},
+      workspaceSignature: "",
+      settingsDirty: false,
     };
 
     const $ = (id) => document.getElementById(id);
@@ -847,7 +849,7 @@
       return data;
     }
 
-    async function refresh() {
+    async function refresh(options = {}) {
       const data = await api("/api/state");
       state.episodes = data.episodes || [];
       state.clips = data.clips || [];
@@ -855,6 +857,17 @@
       state.locks = data.locks || [];
       state.settings = data.settings || {};
       state.availableReferenceImages = state.settings.available_reference_images || [];
+      if (!state.settingsDirty) {
+        syncSettingsForm();
+      }
+      reconcileLocks();
+      render(options);
+      log("state refreshed");
+      schedulePolling();
+      scheduleRenewals();
+    }
+
+    function syncSettingsForm() {
       $("dm3Host").value = state.settings.dm3_host || "DM3data";
       $("dm3NedfRoot").value = state.settings.dm3_nedf_root || "/mnt/nm_data/data/nedf";
       $("publicBaseUrl").value = state.settings.public_base_url || "";
@@ -869,11 +882,6 @@
       $("seedanceRatio").value = state.settings.seedance_ratio || "4:3";
       $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
-      reconcileLocks();
-      render();
-      log("state refreshed");
-      schedulePolling();
-      scheduleRenewals();
     }
 
     function shortUuid(uuid) {
@@ -904,7 +912,10 @@
         target.appendChild(row);
       }
       target.querySelectorAll("[data-ref-image-index]").forEach((select) => {
-        select.addEventListener("change", updateReferencePreviews);
+        select.addEventListener("change", () => {
+          markSettingsDirty();
+          updateReferencePreviews();
+        });
       });
       updateReferencePreviews();
     }
@@ -932,6 +943,10 @@
           preview.style.visibility = "hidden";
         }
       });
+    }
+
+    function markSettingsDirty() {
+      state.settingsDirty = true;
     }
 
     function escapeHtml(value) {
@@ -1182,7 +1197,7 @@
         `;
         div.addEventListener("click", () => {
           state.selectedEpisode = state.selectedEpisode === episode.uuid ? null : episode.uuid;
-          render();
+          render({ forceWorkspace: false });
         });
         div.querySelectorAll("[data-episode-stitch]").forEach((button) => {
           button.addEventListener("click", async (event) => {
@@ -1255,7 +1270,7 @@
         state.activeClipId = state.tabs[index] || state.tabs[index - 1] || null;
       }
       await releaseClipLock(clipId);
-      render();
+      render({ forceWorkspace: true });
     }
 
     function renderTabs() {
@@ -1269,7 +1284,7 @@
         tab.innerHTML = `<span>${shortUuid(clip.episode_uuid)} #${clip.clip_index}</span><button title="关闭">×</button>`;
         tab.addEventListener("click", () => {
           state.activeClipId = clipId;
-          render();
+          render({ forceWorkspace: true });
         });
         tab.querySelector("button").addEventListener("click", (event) => closeTab(clipId, event));
         target.appendChild(tab);
@@ -1287,6 +1302,20 @@
       const generated = clip.generated_url || "";
       const job = clip.latest_job || null;
       const isGenerating = clip.status === "generating" || (job && job.status === "running");
+      const signature = [
+        clip.id,
+        clip.status,
+        generated,
+        clip.latest_job_id || "",
+        job ? job.status : "",
+        job ? job.output_path || "" : "",
+        episode.final_status || "",
+        clipCanEdit(clip) ? "edit" : "readonly",
+      ].join("|");
+      if (target.dataset.signature === signature) {
+        updateWorkspaceLiveFields(clip, episode, job);
+        return;
+      }
       const episodeNotice = renderEpisodeNotice(episode);
       const canEdit = clipCanEdit(clip);
       const lockNotice = renderClipLockNotice(clip, canEdit);
@@ -1298,7 +1327,7 @@
         <div class="review-head">
           <div class="review-title">
             <h2>${shortUuid(clip.episode_uuid)} · clip #${String(clip.clip_index).padStart(4, "0")}</h2>
-            <div class="meta">start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
+            <div class="meta" data-live="workspace-meta">start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
           </div>
           <div class="actions">
             <button class="good" data-action="accept" ${generated && canEdit && !isGenerating ? "" : "disabled"}>保留</button>
@@ -1323,12 +1352,28 @@
           <button id="restartBoth">回到开头</button>
         </div>
       `;
+      target.dataset.signature = signature;
       const takeover = document.querySelector("[data-action='takeover-lock']");
       if (takeover) {
         takeover.addEventListener("click", async () => acquireClipLock(clip.id, true));
       }
       wireReviewActions(clip);
       wireSync();
+    }
+
+    function updateWorkspaceLiveFields(clip, episode, job) {
+      const meta = document.querySelector("[data-live='workspace-meta']");
+      if (meta) {
+        meta.textContent = `start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}`;
+      }
+      const progress = document.querySelector("[data-live='job-progress']");
+      if (progress && job && job.status === "running") {
+        progress.style.width = `${job.progress_pct}%`;
+      }
+      const runningText = document.querySelector("[data-live='job-text']");
+      if (runningText && job && job.status === "running") {
+        runningText.textContent = `Seedance 处理中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。`;
+      }
     }
 
     function renderClipLockNotice(clip, canEdit) {
@@ -1355,8 +1400,8 @@
       if (job.status === "running") {
         return `
           <div class="notice stitching">
-            Seedance 处理中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。
-            <div class="progress running" title="${job.progress_pct}%"><span style="width: ${job.progress_pct}%"></span></div>
+            <span data-live="job-text">Seedance 处理中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。</span>
+            <div class="progress running" title="${job.progress_pct}%"><span data-live="job-progress" style="width: ${job.progress_pct}%"></span></div>
           </div>
         `;
       }
@@ -1447,10 +1492,13 @@
       });
     }
 
-    function render() {
+    function render(options = {}) {
       renderEpisodes();
       renderClips();
       renderTabs();
+      if (options.forceWorkspace) {
+        $("workspace").dataset.signature = "";
+      }
       renderWorkspace();
     }
 
@@ -1458,6 +1506,10 @@
 
     $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
+    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "generationMode", "seedanceApiKey", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
+      $(id).addEventListener("input", markSettingsDirty);
+      $(id).addEventListener("change", markSettingsDirty);
+    });
 
     window.addEventListener("beforeunload", () => {
       Object.keys(state.clipLocks).forEach((clipId) => {
@@ -1503,6 +1555,7 @@
         }
         const result = await api("/api/settings", { method: "POST", body: { values } });
         log("settings saved", result);
+        state.settingsDirty = false;
         $("settingsOverlay").classList.add("hidden");
         await refresh();
       } catch (err) {
