@@ -69,3 +69,4 @@ class LockReleaseRequest(BaseModel):
 
 class LockTokenRequest(BaseModel):
     lock_token: str | None = None
+    mode: str | None = None

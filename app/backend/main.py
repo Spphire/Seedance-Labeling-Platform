@@ -149,7 +149,11 @@ def post_generation_retry(job_id: int, payload: LockTokenRequest | None = None) 
 @app.post("/api/clips/{clip_id}/retry")
 def post_clip_retry(clip_id: int, payload: LockTokenRequest | None = None) -> dict[str, Any]:
     try:
-        return retry_clip(clip_id, lock_token=payload.lock_token if payload else None)
+        return retry_clip(
+            clip_id,
+            mode=payload.mode if payload else None,
+            lock_token=payload.lock_token if payload else None,
+        )
     except Exception as exc:
         raise _public_error(exc) from exc
 

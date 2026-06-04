@@ -739,11 +739,15 @@
           <input id="headVideoPath" placeholder="已有 head MP4 路径">
           <button id="importHead">导入</button>
         </div>
-        <div class="row">
+        <div class="field">
+          <label for="generationMode">本次运行模式</label>
           <select id="generationMode">
-            <option value="mock">mock</option>
-            <option value="seedance">seedance</option>
+            <option value="mock">mock（默认，不消耗额度）</option>
+            <option value="seedance">seedance（真实消耗额度）</option>
           </select>
+          <div class="hint">每次打开页面默认 mock；右侧重跑也会使用这里的模式。</div>
+        </div>
+        <div class="row">
           <button id="generate">生成</button>
           <button id="dryRun">dry-run</button>
         </div>
@@ -857,6 +861,10 @@
       state.locks = data.locks || [];
       state.settings = data.settings || {};
       state.availableReferenceImages = state.settings.available_reference_images || [];
+      if (!$("generationMode").dataset.initialized) {
+        $("generationMode").value = "mock";
+        $("generationMode").dataset.initialized = "1";
+      }
       if (!state.settingsDirty) {
         syncSettingsForm();
       }
@@ -871,7 +879,6 @@
       $("dm3Host").value = state.settings.dm3_host || "DM3data";
       $("dm3NedfRoot").value = state.settings.dm3_nedf_root || "/mnt/nm_data/data/nedf";
       $("publicBaseUrl").value = state.settings.public_base_url || "";
-      $("generationMode").value = state.settings.generation_mode || "mock";
       $("seedanceApiKey").value = "";
       $("seedanceApiKeyHint").textContent = state.settings.seedance_api_key_set ? "服务器已保存 API Key；留空不会覆盖。" : "尚未保存 API Key。";
       $("defaultPrompt").value = state.settings.default_prompt || "";
@@ -1469,11 +1476,12 @@
               throw new Error("这个 clip 没有编辑锁，不能提交审核操作");
             }
             if (action === "rerun") {
+              const mode = $("generationMode").value || "mock";
               const result = await api(`/api/clips/${clip.id}/retry`, {
                 method: "POST",
-                body: { lock_token: lock.token },
+                body: { lock_token: lock.token, mode },
               });
-              log("rerun submitted", result);
+              log(`${mode} rerun submitted`, result);
             } else {
               const decision = action === "accept" ? "accept" : action === "reject" ? "reject" : "flag";
               const result = await api(`/api/review/${clip.id}`, {
@@ -1506,7 +1514,7 @@
 
     $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
-    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "generationMode", "seedanceApiKey", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
+    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "seedanceApiKey", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
       $(id).addEventListener("input", markSettingsDirty);
       $(id).addEventListener("change", markSettingsDirty);
     });
@@ -1539,7 +1547,6 @@
           dm3_host: $("dm3Host").value.trim() || "DM3data",
           dm3_nedf_root: $("dm3NedfRoot").value.trim() || "/mnt/nm_data/data/nedf",
           public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
-          generation_mode: $("generationMode").value,
           default_prompt: $("defaultPrompt").value.trim(),
           reference_images: selectedReferenceImages(),
           seedance_model: $("seedanceModel").value.trim() || "doubao-seedance-2-0-fast-260128",
