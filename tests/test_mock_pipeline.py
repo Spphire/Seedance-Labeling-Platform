@@ -256,6 +256,52 @@ class MockPipelineTest(unittest.TestCase):
         job = db.one("SELECT * FROM generation_jobs WHERE id=?", (res.json()["job_id"],))
         self.assertEqual(job["mode"], "mock")
 
+    def test_retry_api_mock_mode_uses_async_timing_when_enabled(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000015"
+        now = db.now()
+        save_settings({"generation_mode": "seedance", "mock_async": True, "mock_seconds_per_video_second": 0.02})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+        clip_id = clips[0]["id"]
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='generated_failed' WHERE id=?", (clip_id,))
+
+        res = self.client.post(
+            f"/api/clips/{clip_id}/retry",
+            json={"lock_token": lock.json()["token"], "mode": "mock"},
+        )
+
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["status"], "queued")
+        running = db.one("SELECT * FROM generation_jobs WHERE id=?", (res.json()["job_id"],))
+        self.assertEqual(running["mode"], "mock")
+        self.assertEqual(running["status"], "running")
+        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clip_id,))["status"], "generating")
+
+        deadline = time.time() + 5
+        job = running
+        while time.time() < deadline:
+            job = db.one("SELECT * FROM generation_jobs WHERE id=?", (res.json()["job_id"],))
+            if job["status"] == "succeeded":
+                break
+            time.sleep(0.05)
+        self.assertEqual(job["status"], "succeeded")
+        self.assertTrue(Path(job["output_path"]).exists())
+
     def test_public_settings_do_not_expose_api_key(self) -> None:
         save_settings({"seedance_api_key": "secret-token"})
         res = self.client.get("/api/settings")
