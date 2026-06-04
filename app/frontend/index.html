@@ -2006,6 +2006,7 @@
       let syncing = false;
       const unlock = () => window.setTimeout(() => { syncing = false; }, 80);
       const peers = (source) => pair.filter((video) => video !== source);
+      const isPlaying = (video) => !video.paused && !video.ended;
       const syncTime = (source, target, threshold = 0.08) => {
         if (!Number.isFinite(source.currentTime)) return;
         if (Math.abs(target.currentTime - source.currentTime) > threshold) {
@@ -2019,6 +2020,15 @@
           }
         });
       };
+      const syncPlaybackState = (source, target) => {
+        if (isPlaying(source)) {
+          if (target.paused) {
+            target.play().catch(() => {});
+          }
+        } else {
+          target.pause();
+        }
+      };
 
       pair.forEach((video) => {
         video.addEventListener("play", () => {
@@ -2027,7 +2037,7 @@
           syncPlaybackRate(video);
           peers(video).forEach((target) => {
             syncTime(video, target);
-            target.play().catch(() => {});
+            syncPlaybackState(video, target);
           });
           unlock();
         });
@@ -2036,20 +2046,26 @@
           syncing = true;
           peers(video).forEach((target) => {
             syncTime(video, target);
-            target.pause();
+            syncPlaybackState(video, target);
           });
           unlock();
         });
         video.addEventListener("seeking", () => {
           if (syncing) return;
           syncing = true;
-          peers(video).forEach((target) => syncTime(video, target, 0));
+          peers(video).forEach((target) => {
+            syncTime(video, target, 0);
+            syncPlaybackState(video, target);
+          });
           unlock();
         });
         video.addEventListener("seeked", () => {
           if (syncing) return;
           syncing = true;
-          peers(video).forEach((target) => syncTime(video, target, 0));
+          peers(video).forEach((target) => {
+            syncTime(video, target, 0);
+            syncPlaybackState(video, target);
+          });
           unlock();
         });
         video.addEventListener("ratechange", () => {
@@ -2061,7 +2077,8 @@
         video.addEventListener("timeupdate", () => {
           if (syncing || video.paused) return;
           peers(video).forEach((target) => {
-            if (!target.paused) syncTime(video, target, 0.25);
+            syncTime(video, target, 0.25);
+            syncPlaybackState(video, target);
           });
         });
       });
