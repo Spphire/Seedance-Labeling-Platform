@@ -898,6 +898,15 @@
       return `<span class="badge ${status || ""}">${status || "unknown"}</span>`;
     }
 
+    function episodeBadges(episode) {
+      const values = [episode.status || "unknown"];
+      const finalStatus = episode.final_status || "";
+      if (finalStatus && finalStatus !== "missing") {
+        values.push(finalStatus);
+      }
+      return values.map((value) => badge(value)).join("");
+    }
+
     function renderReferenceImageSelectors(selected) {
       const target = $("referenceImageOrder");
       const available = state.availableReferenceImages || [];
@@ -1191,7 +1200,7 @@
         const div = document.createElement("div");
         div.className = episodeClass(episode);
         div.innerHTML = `
-          <div class="item-title"><span>${shortUuid(episode.uuid)}</span>${badge(episode.final_status || episode.status)}</div>
+          <div class="item-title"><span>${shortUuid(episode.uuid)}</span>${episodeBadges(episode)}</div>
           <div class="episode-stage">${episodeStage(episode)}</div>
           <div class="progress" title="${progress}% accepted"><span style="width: ${progress}%"></span></div>
           <div class="episode-facts">${episodeFacts(episode).map((fact) => `<span class="badge">${fact}</span>`).join("")}</div>
@@ -1622,7 +1631,8 @@
     $("submitPreprocess").addEventListener("click", async () => {
       const lockTokens = {};
       try {
-        let uuids = state.selectedEpisode ? [state.selectedEpisode] : uuidsFromText($("episodeText").value);
+        const textUuids = uuidsFromText($("episodeText").value);
+        let uuids = textUuids.length ? textUuids : (state.selectedEpisode ? [state.selectedEpisode] : []);
         if (!uuids.length) throw new Error("需要在文本框中填写 episode UUID，或先选择一个 episode");
         log("submit + preprocess running");
         for (const uuid of uuids) {
