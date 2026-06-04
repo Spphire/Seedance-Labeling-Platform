@@ -815,7 +815,20 @@
           <div id="seedanceApiKeyHint" class="hint"></div>
         </div>
         <div class="field">
-          <label for="defaultPrompt">默认 Prompt</label>
+          <label for="adminPresetSelect">Prompt/ref 组合</label>
+          <select id="adminPresetSelect"></select>
+          <div class="row">
+            <button id="addPreset">新增组合</button>
+            <button id="deletePreset">删除组合</button>
+          </div>
+          <div class="hint">当前选中的组合会作为标注页默认组合；保存配置后生效。</div>
+        </div>
+        <div class="field">
+          <label for="presetName">组合名称</label>
+          <input id="presetName" placeholder="iPhone 默认组合">
+        </div>
+        <div class="field">
+          <label for="defaultPrompt">组合 Prompt</label>
           <textarea id="defaultPrompt" spellcheck="false"></textarea>
         </div>
         <div class="field">
@@ -877,6 +890,11 @@
             <option value="seedance">seedance（真实消耗额度）</option>
           </select>
           <div class="hint">每次打开页面默认 mock；右侧重跑也会使用这里的模式。</div>
+        </div>
+        <div class="field">
+          <label for="runPresetSelect">Prompt/ref 组合</label>
+          <select id="runPresetSelect"></select>
+          <div class="hint">选择组合后可继续临时微调 Prompt 和参考图；不会修改管理员默认值。</div>
         </div>
         <div class="field">
           <label for="runPrompt">本次 Prompt</label>
@@ -956,6 +974,9 @@
       workspaceSignature: "",
       settingsDirty: false,
       runDefaultsInitialized: false,
+      adminPresets: [],
+      activeAdminPresetId: "",
+      runPresetId: "",
     };
 
     const $ = (id) => document.getElementById(id);
@@ -1072,8 +1093,10 @@
       $("publicBaseUrl").value = state.settings.public_base_url || "";
       $("seedanceApiKey").value = "";
       $("seedanceApiKeyHint").textContent = state.settings.seedance_api_key_set ? "服务器已保存 API Key；留空不会覆盖。" : "尚未保存 API Key。";
-      $("defaultPrompt").value = state.settings.default_prompt || "";
-      renderReferenceImageSelectors("referenceImageOrder", state.settings.reference_images || [], "settings", markSettingsDirty);
+      state.adminPresets = normalizedGenerationPresets();
+      state.activeAdminPresetId = state.settings.default_generation_preset_id || state.adminPresets[0]?.id || "";
+      renderAdminPresetSelector();
+      populateAdminPresetForm();
       $("seedanceModel").value = state.settings.seedance_model || "doubao-seedance-2-0-fast-260128";
       $("seedanceBaseUrl").value = state.settings.seedance_base_url || "https://ark.cn-beijing.volces.com/api/v3";
       $("seedanceResolution").value = state.settings.seedance_resolution || "480p";
@@ -1082,19 +1105,95 @@
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
     }
 
+    function normalizedGenerationPresets() {
+      const presets = Array.isArray(state.settings.generation_presets) ? state.settings.generation_presets : [];
+      const fallback = [{
+        id: "iphone-default",
+        name: "iPhone 默认组合",
+        prompt: state.settings.default_prompt || "",
+        reference_images: state.settings.reference_images || [],
+      }];
+      const source = presets.length ? presets : fallback;
+      return source.map((preset, index) => ({
+        id: String(preset.id || `preset-${index + 1}`),
+        name: String(preset.name || preset.id || `组合 ${index + 1}`),
+        prompt: String(preset.prompt || state.settings.default_prompt || ""),
+        reference_images: Array.isArray(preset.reference_images) ? [...preset.reference_images] : [],
+      }));
+    }
+
+    function presetById(id, presets = state.adminPresets) {
+      return presets.find((preset) => preset.id === id) || presets[0] || null;
+    }
+
+    function renderAdminPresetSelector() {
+      $("adminPresetSelect").innerHTML = state.adminPresets.map((preset) => (
+        `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.name)}</option>`
+      )).join("");
+      $("adminPresetSelect").value = state.activeAdminPresetId;
+      $("deletePreset").disabled = state.adminPresets.length <= 1;
+    }
+
+    function captureActiveAdminPreset() {
+      const preset = presetById(state.activeAdminPresetId);
+      if (!preset) return;
+      preset.name = $("presetName").value.trim() || "未命名组合";
+      preset.prompt = $("defaultPrompt").value.trim() || state.settings.default_prompt || "";
+      preset.reference_images = selectedReferenceImages("settings");
+      renderAdminPresetSelector();
+    }
+
+    function populateAdminPresetForm() {
+      const preset = presetById(state.activeAdminPresetId);
+      if (!preset) return;
+      $("presetName").value = preset.name;
+      $("defaultPrompt").value = preset.prompt;
+      renderReferenceImageSelectors("referenceImageOrder", preset.reference_images || [], "settings", markSettingsDirty);
+    }
+
+    function settingsPresets() {
+      return normalizedGenerationPresets();
+    }
+
+    function renderRunPresetOptions() {
+      const presets = settingsPresets();
+      $("runPresetSelect").innerHTML = presets.map((preset) => (
+        `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.name)}</option>`
+      )).join("");
+    }
+
+    function activeRunPreset() {
+      return presetById(state.runPresetId, settingsPresets());
+    }
+
+    function applyRunPreset(presetId) {
+      const presets = settingsPresets();
+      const preset = presetById(presetId, presets);
+      if (!preset) return;
+      state.runPresetId = preset.id;
+      $("runPresetSelect").value = preset.id;
+      $("runPrompt").value = preset.prompt;
+      renderReferenceImageSelectors("runReferenceImageOrder", preset.reference_images || [], "run", updateRunSettingsSummary);
+      updateRunSettingsSummary();
+    }
+
     function syncRunFormFromDefaults() {
-      $("runPrompt").value = state.settings.default_prompt || "";
-      renderReferenceImageSelectors("runReferenceImageOrder", state.settings.reference_images || [], "run", updateRunSettingsSummary);
+      renderRunPresetOptions();
+      applyRunPreset(state.settings.default_generation_preset_id || settingsPresets()[0]?.id || "");
       state.runDefaultsInitialized = true;
       updateRunSettingsSummary();
     }
 
     function updateRunSettingsSummary() {
       const prompt = $("runPrompt").value.trim();
-      const defaultPrompt = state.settings.default_prompt || "";
-      const promptLabel = prompt === defaultPrompt ? "默认 Prompt" : "本次 Prompt 已调整";
-      const refCount = selectedReferenceImages("run").length;
-      $("runSettingsSummary").textContent = `${$("generationMode").value || "mock"} · ${promptLabel} · ${refCount} 张 ref 图`;
+      const preset = activeRunPreset();
+      const refs = selectedReferenceImages("run");
+      const presetRefs = preset ? preset.reference_images || [] : [];
+      const promptAdjusted = preset ? prompt !== preset.prompt : false;
+      const refsAdjusted = JSON.stringify(refs) !== JSON.stringify(presetRefs);
+      const tweakLabel = promptAdjusted || refsAdjusted ? "已临时微调" : "未微调";
+      const presetName = preset ? preset.name : "默认组合";
+      $("runSettingsSummary").textContent = `${$("generationMode").value || "mock"} · ${presetName} · ${tweakLabel} · ${refs.length} 张 ref 图`;
     }
 
     function shortUuid(uuid) {
@@ -2136,12 +2235,42 @@
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
     $("generationMode").addEventListener("change", updateRunSettingsSummary);
     $("runPrompt").addEventListener("input", updateRunSettingsSummary);
+    $("runPresetSelect").addEventListener("change", () => applyRunPreset($("runPresetSelect").value));
+    $("adminPresetSelect").addEventListener("change", () => {
+      const nextPresetId = $("adminPresetSelect").value;
+      captureActiveAdminPreset();
+      state.activeAdminPresetId = nextPresetId;
+      populateAdminPresetForm();
+      markSettingsDirty();
+    });
+    $("addPreset").addEventListener("click", () => {
+      captureActiveAdminPreset();
+      const id = `preset-${Date.now()}`;
+      state.adminPresets.push({
+        id,
+        name: "新组合",
+        prompt: $("defaultPrompt").value.trim() || state.settings.default_prompt || "",
+        reference_images: selectedReferenceImages("settings"),
+      });
+      state.activeAdminPresetId = id;
+      renderAdminPresetSelector();
+      populateAdminPresetForm();
+      markSettingsDirty();
+    });
+    $("deletePreset").addEventListener("click", () => {
+      if (state.adminPresets.length <= 1) return;
+      state.adminPresets = state.adminPresets.filter((preset) => preset.id !== state.activeAdminPresetId);
+      state.activeAdminPresetId = state.adminPresets[0]?.id || "";
+      renderAdminPresetSelector();
+      populateAdminPresetForm();
+      markSettingsDirty();
+    });
     $("resetRunDefaults").addEventListener("click", () => {
       state.runDefaultsInitialized = false;
       syncRunFormFromDefaults();
       log("本次 prompt/ref 已恢复管理员默认值");
     });
-    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "seedanceApiKey", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
+    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "seedanceApiKey", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
       $(id).addEventListener("input", markSettingsDirty);
       $(id).addEventListener("change", markSettingsDirty);
     });
@@ -2186,12 +2315,21 @@
     });
     $("saveSettings").addEventListener("click", async () => {
       try {
+        captureActiveAdminPreset();
+        const defaultPreset = presetById(state.activeAdminPresetId);
         const values = {
           dm3_host: $("dm3Host").value.trim() || "DM3data",
           dm3_nedf_root: $("dm3NedfRoot").value.trim() || "/mnt/nm_data/data/nedf",
           public_base_url: $("publicBaseUrl").value.trim() || "http://106.14.2.243:18080",
-          default_prompt: $("defaultPrompt").value.trim(),
-          reference_images: selectedReferenceImages("settings"),
+          default_prompt: defaultPreset ? defaultPreset.prompt : $("defaultPrompt").value.trim(),
+          reference_images: defaultPreset ? defaultPreset.reference_images : selectedReferenceImages("settings"),
+          default_generation_preset_id: state.activeAdminPresetId,
+          generation_presets: state.adminPresets.map((preset) => ({
+            id: preset.id,
+            name: preset.name,
+            prompt: preset.prompt,
+            reference_images: preset.reference_images,
+          })),
           seedance_model: $("seedanceModel").value.trim() || "doubao-seedance-2-0-fast-260128",
           seedance_base_url: $("seedanceBaseUrl").value.trim() || "https://ark.cn-beijing.volces.com/api/v3",
           seedance_resolution: $("seedanceResolution").value || "480p",

@@ -28,6 +28,15 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/l-far-iphone.png",
     "app/reference_images/r-far-iphone.png",
 ]
+DEFAULT_GENERATION_PRESET_ID = "iphone-default"
+DEFAULT_GENERATION_PRESETS = [
+    {
+        "id": DEFAULT_GENERATION_PRESET_ID,
+        "name": "iPhone 默认组合",
+        "prompt": DEFAULT_PROMPT,
+        "reference_images": DEFAULT_REFERENCE_IMAGES,
+    }
+]
 REFERENCE_IMAGE_RENAMES = {
     "app/reference_images/l-near.png": "app/reference_images/l-near-iphone.png",
     "app/reference_images/r-near.png": "app/reference_images/r-near-iphone.png",
@@ -67,6 +76,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "seedance_seconds_per_video_second": 24,
     "default_prompt": DEFAULT_PROMPT,
     "reference_images": DEFAULT_REFERENCE_IMAGES,
+    "default_generation_preset_id": DEFAULT_GENERATION_PRESET_ID,
+    "generation_presets": DEFAULT_GENERATION_PRESETS,
 }
 
 
@@ -86,6 +97,90 @@ def _renamed_reference_images(values: tuple[Any, ...]) -> list[str]:
     return [REFERENCE_IMAGE_RENAMES.get(str(item), str(item)) for item in values]
 
 
+def _normalized_reference_images(value: Any) -> list[str]:
+    refs = tuple(value or [])
+    if (not refs or refs in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
+        return list(DEFAULT_REFERENCE_IMAGES)
+    return _renamed_reference_images(refs)
+
+
+def _normalize_generation_presets(data: dict[str, Any]) -> bool:
+    changed = False
+    default_prompt_present = "default_prompt" in data
+    reference_images_present = "reference_images" in data
+    normalized_default_prompt = data.get("default_prompt")
+    if _prompt_needs_repair(normalized_default_prompt):
+        normalized_default_prompt = DEFAULT_PROMPT
+        changed = True
+    normalized_reference_images = _renamed_reference_images(tuple(data.get("reference_images") or [])) if reference_images_present else None
+    if reference_images_present and (not data.get("reference_images") or tuple(data.get("reference_images") or []) in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
+        normalized_reference_images = list(DEFAULT_REFERENCE_IMAGES)
+        changed = True
+    raw_presets = data.get("generation_presets")
+    if not isinstance(raw_presets, list) or not raw_presets:
+        raw_presets = [
+            {
+                "id": DEFAULT_GENERATION_PRESET_ID,
+                "name": "iPhone 默认组合",
+                "prompt": normalized_default_prompt,
+                "reference_images": normalized_reference_images or list(DEFAULT_REFERENCE_IMAGES),
+            }
+        ]
+        changed = True
+
+    presets: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(raw_presets):
+        item = item if isinstance(item, dict) else {}
+        preset_id = str(item.get("id") or f"preset-{index + 1}").strip() or f"preset-{index + 1}"
+        if preset_id in seen_ids:
+            preset_id = f"{preset_id}-{index + 1}"
+            changed = True
+        seen_ids.add(preset_id)
+        name = str(item.get("name") or preset_id).strip() or preset_id
+        prompt = item.get("prompt")
+        if _prompt_needs_repair(prompt):
+            prompt = DEFAULT_PROMPT
+            changed = True
+        refs = _normalized_reference_images(item.get("reference_images"))
+        normalized = {
+            "id": preset_id,
+            "name": name,
+            "prompt": str(prompt),
+            "reference_images": refs,
+        }
+        if normalized != item:
+            changed = True
+        presets.append(normalized)
+
+    default_id = str(data.get("default_generation_preset_id") or "").strip()
+    if default_id not in seen_ids:
+        default_id = presets[0]["id"]
+        changed = True
+    default_preset = next((item for item in presets if item["id"] == default_id), presets[0])
+    if default_prompt_present and default_preset["prompt"] != normalized_default_prompt:
+        default_preset["prompt"] = str(normalized_default_prompt)
+        changed = True
+    if reference_images_present:
+        assert normalized_reference_images is not None
+        if default_preset["reference_images"] != normalized_reference_images:
+            default_preset["reference_images"] = normalized_reference_images
+            changed = True
+    else:
+        normalized_reference_images = list(default_preset["reference_images"])
+    normalized_default_prompt = str(default_preset["prompt"])
+
+    data["generation_presets"] = presets
+    data["default_generation_preset_id"] = default_id
+    if data.get("default_prompt") != normalized_default_prompt:
+        data["default_prompt"] = normalized_default_prompt
+        changed = True
+    if data.get("reference_images") != normalized_reference_images:
+        data["reference_images"] = normalized_reference_images
+        changed = True
+    return changed
+
+
 def _settings_from_disk() -> dict[str, Any]:
     if not SETTINGS_PATH.exists():
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -96,15 +191,12 @@ def _settings_from_disk() -> dict[str, Any]:
     if _prompt_needs_repair(data.get("default_prompt")):
         data["default_prompt"] = DEFAULT_PROMPT
         changed = True
-    refs = tuple(data.get("reference_images") or [])
-    if (not refs or refs in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
-        data["reference_images"] = DEFAULT_REFERENCE_IMAGES
+    refs = _normalized_reference_images(data.get("reference_images"))
+    if data.get("reference_images") != refs:
+        data["reference_images"] = refs
         changed = True
-    elif refs:
-        renamed_refs = _renamed_reference_images(refs)
-        if renamed_refs != list(refs):
-            data["reference_images"] = renamed_refs
-            changed = True
+    if _normalize_generation_presets(data):
+        changed = True
     if changed:
         SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     merged = dict(DEFAULT_SETTINGS)

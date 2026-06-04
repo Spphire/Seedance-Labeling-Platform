@@ -281,6 +281,10 @@ class MockPipelineTest(unittest.TestCase):
                 "app/reference_images/r-far-iphone.png",
             ],
         )
+        self.assertEqual(settings["default_generation_preset_id"], "iphone-default")
+        self.assertEqual(settings["generation_presets"][0]["id"], "iphone-default")
+        self.assertEqual(settings["generation_presets"][0]["prompt"], DEFAULT_PROMPT)
+        self.assertEqual(settings["generation_presets"][0]["reference_images"], settings["reference_images"])
 
     def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
         save_settings(
@@ -299,6 +303,33 @@ class MockPipelineTest(unittest.TestCase):
 
         self.assertEqual(settings["reference_images"], DEFAULT_SETTINGS["reference_images"])
         self.assertEqual(persisted["reference_images"], DEFAULT_SETTINGS["reference_images"])
+
+    def test_reference_image_names_inside_presets_are_migrated(self) -> None:
+        save_settings(
+            {
+                "default_generation_preset_id": "old-iphone",
+                "generation_presets": [
+                    {
+                        "id": "old-iphone",
+                        "name": "旧 iPhone 组合",
+                        "prompt": DEFAULT_PROMPT,
+                        "reference_images": [
+                            "app/reference_images/l-near.png",
+                            "app/reference_images/r-near.png",
+                            "app/reference_images/l-far.png",
+                            "app/reference_images/r-far.png",
+                        ],
+                    }
+                ],
+            }
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["default_generation_preset_id"], "old-iphone")
+        self.assertEqual(settings["generation_presets"][0]["reference_images"], DEFAULT_SETTINGS["reference_images"])
+        self.assertEqual(persisted["generation_presets"][0]["reference_images"], DEFAULT_SETTINGS["reference_images"])
 
     def test_seedance_queue_marks_running_and_blocks_duplicate(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000011"
