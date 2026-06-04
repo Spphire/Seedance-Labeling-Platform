@@ -23,6 +23,8 @@ _STITCHING_EPISODES: set[str] = set()
 _GENERATION_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="seedance-generation")
 _GENERATION_CONDITION = threading.Condition()
 _GENERATION_ACTIVE = 0
+GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
+GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
 
 
 def submit_episodes(text: str) -> list[dict[str, Any]]:
@@ -398,7 +400,10 @@ def run_generation(
     if clip_ids is not None:
         clips = db.rows("SELECT * FROM clips WHERE id IN (%s)" % ",".join("?" for _ in clip_ids), clip_ids)
     else:
-        clips = db.rows("SELECT * FROM clips WHERE status IN ('pending','generated_failed') ORDER BY episode_uuid, clip_index")
+        clips = db.rows(
+            f"SELECT * FROM clips WHERE status IN ({GENERATION_CANDIDATE_STATUS_PLACEHOLDERS}) ORDER BY episode_uuid, clip_index",
+            GENERATION_CANDIDATE_STATUSES,
+        )
     clips = filter_generation_clips(clips, lock_tokens or {}, strict=clip_ids is not None)
     if not clips:
         return []
@@ -434,7 +439,10 @@ def queue_generation(
     if clip_ids is not None:
         clips = db.rows("SELECT * FROM clips WHERE id IN (%s)" % ",".join("?" for _ in clip_ids), clip_ids)
     else:
-        clips = db.rows("SELECT * FROM clips WHERE status IN ('pending','generated_failed') ORDER BY episode_uuid, clip_index")
+        clips = db.rows(
+            f"SELECT * FROM clips WHERE status IN ({GENERATION_CANDIDATE_STATUS_PLACEHOLDERS}) ORDER BY episode_uuid, clip_index",
+            GENERATION_CANDIDATE_STATUSES,
+        )
     clips = filter_generation_clips(clips, lock_tokens or {}, strict=clip_ids is not None)
     if not clips:
         return []
@@ -474,7 +482,7 @@ def claim_async_generation_job(
         current = conn.execute("SELECT status FROM clips WHERE id=?", (clip["id"],)).fetchone()
         if not current:
             return {"clip_id": clip["id"], "status": "skipped", "reason": "clip not found"}
-        can_claim = current["status"] != "generating" if force else current["status"] in {"pending", "generated_failed"}
+        can_claim = current["status"] != "generating" if force else current["status"] in GENERATION_CANDIDATE_STATUSES
         if not can_claim:
             return {"clip_id": clip["id"], "status": "skipped", "reason": f"clip status is {current['status']}"}
         cur = conn.execute(
@@ -635,7 +643,7 @@ def run_generation_for_clip(
         current = conn.execute("SELECT status FROM clips WHERE id=?", (clip["id"],)).fetchone()
         if not current:
             return {"clip_id": clip["id"], "status": "skipped", "reason": "clip not found"}
-        can_claim = current["status"] != "generating" if force else current["status"] in {"pending", "generated_failed"}
+        can_claim = current["status"] != "generating" if force else current["status"] in GENERATION_CANDIDATE_STATUSES
         if not can_claim:
             return {
                 "clip_id": clip["id"],

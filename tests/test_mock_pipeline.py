@@ -222,6 +222,64 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(listed["latest_job"]["status"], "running")
         self.assertIsNone(listed["generated_url"])
 
+    def test_bulk_generation_includes_rejected_clips(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000016"
+        now = db.now()
+        statuses = ["pending", "generated_failed", "rejected", "generated", "accepted", "flagged", "generating"]
+        clip_ids_by_index = {}
+        save_settings({"mock_async": True, "mock_seconds_per_video_second": 0.02})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+            for index, status in enumerate(statuses):
+                cur = conn.execute(
+                    """
+                    INSERT INTO clips(
+                        episode_uuid, clip_index, start_sec, duration_sec,
+                        local_path, public_url, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid,
+                        index,
+                        float(index),
+                        5.0,
+                        str((CLIPS_DIR / uuid / f"clip_{index:04d}.mp4").resolve()),
+                        f"http://localhost/clips/{uuid}/clip_{index:04d}.mp4",
+                        status,
+                        now,
+                        now,
+                    ),
+                )
+                clip_ids_by_index[index] = cur.lastrowid
+
+        with patch("app.backend.services._GENERATION_EXECUTOR.submit") as submit:
+            queued = queue_generation(mode="mock")
+
+        queued_clip_ids = {item["clip_id"] for item in queued}
+        expected_clip_ids = {clip_ids_by_index[0], clip_ids_by_index[1], clip_ids_by_index[2]}
+        self.assertEqual(len(queued), 3)
+        self.assertEqual(queued_clip_ids, expected_clip_ids)
+        self.assertEqual(submit.call_count, 3)
+
+        final_statuses = {
+            row["clip_index"]: row["status"]
+            for row in db.rows("SELECT clip_index, status FROM clips WHERE episode_uuid=?", (uuid,))
+        }
+        self.assertEqual(final_statuses[0], "generating")
+        self.assertEqual(final_statuses[1], "generating")
+        self.assertEqual(final_statuses[2], "generating")
+        self.assertEqual(final_statuses[3], "generated")
+        self.assertEqual(final_statuses[4], "accepted")
+        self.assertEqual(final_statuses[5], "flagged")
+        self.assertEqual(final_statuses[6], "generating")
+
     def test_retry_api_uses_explicit_mode_instead_of_saved_default(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000014"
         now = db.now()
