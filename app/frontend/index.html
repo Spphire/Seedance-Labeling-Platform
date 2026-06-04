@@ -232,12 +232,6 @@
       margin-bottom: 3px;
     }
 
-    .run-content-actions {
-      display: flex;
-      justify-content: flex-end;
-      margin-top: 8px;
-    }
-
     .ref-image-order {
       display: grid;
       gap: 8px;
@@ -802,7 +796,7 @@
         <a id="labelRoute" class="route-link" href="/label">标注</a>
         <a id="adminRoute" class="route-link" href="/admin">管理员</a>
         <input id="reviewerName" class="reviewer" placeholder="审核人">
-        <button id="openSettings" class="icon-button" title="后台管理员设置" aria-label="后台管理员设置">&#9881;</button>
+        <button id="openSettings" class="icon-button" title="设置" aria-label="设置">&#9881;</button>
         <button id="refresh" class="primary">刷新</button>
       </div>
     </header>
@@ -880,17 +874,9 @@
       </section>
     </div>
 
-    <aside id="labelSidebar">
-      <section class="block">
-        <h2>批量 episode</h2>
-        <textarea id="episodeText" spellcheck="false" placeholder="c412f233-549f-43cd-89c3-af0b496ae742"></textarea>
-        <div class="row">
-          <button id="submitPreprocess" class="primary">提交并预处理</button>
-        </div>
-        <div class="row">
-          <input id="headVideoPath" placeholder="已有 head MP4 路径">
-          <button id="importHead">导入</button>
-        </div>
+    <div id="runSettingsOverlay" class="modal-overlay hidden">
+      <section class="admin-panel" role="dialog" aria-modal="true" aria-labelledby="runSettingsTitle">
+        <h2 id="runSettingsTitle">本次生成设置</h2>
         <div class="field">
           <label for="generationMode">本次运行模式</label>
           <select id="generationMode">
@@ -906,11 +892,30 @@
         <div class="field">
           <label>本次参考图顺序</label>
           <div id="runReferenceImageOrder" class="ref-image-order"></div>
-          <div class="run-content-actions">
-            <button id="resetRunDefaults">恢复默认</button>
-          </div>
           <div class="hint">这里只影响本次生成/重跑；管理员默认值在 /admin 中保存。</div>
         </div>
+        <div class="admin-actions">
+          <button id="resetRunDefaults">恢复默认</button>
+          <button id="closeRunSettings" class="primary">完成</button>
+        </div>
+      </section>
+    </div>
+
+    <aside id="labelSidebar">
+      <section class="block">
+        <h2>批量 episode</h2>
+        <textarea id="episodeText" spellcheck="false" placeholder="c412f233-549f-43cd-89c3-af0b496ae742"></textarea>
+        <div class="row">
+          <button id="submitPreprocess" class="primary">提交并预处理</button>
+        </div>
+        <div class="row">
+          <input id="headVideoPath" placeholder="已有 head MP4 路径">
+          <button id="importHead">导入</button>
+        </div>
+        <div class="row">
+          <button id="openRunSettingsInline">本次设置</button>
+        </div>
+        <div id="runSettingsSummary" class="hint"></div>
         <div class="row">
           <button id="generate">生成</button>
           <button id="dryRun">dry-run</button>
@@ -1006,8 +1011,10 @@
       $("appShell").classList.toggle("admin-route", state.route === "admin");
       $("labelRoute").classList.toggle("active", state.route === "label");
       $("adminRoute").classList.toggle("active", state.route === "admin");
-      $("openSettings").style.display = state.route === "admin" ? "" : "none";
+      $("openSettings").title = state.route === "admin" ? "后台管理员设置" : "本次生成设置";
+      $("openSettings").setAttribute("aria-label", $("openSettings").title);
       $("settingsOverlay").classList.add("hidden");
+      $("runSettingsOverlay").classList.add("hidden");
     }
 
     function log(message, data) {
@@ -1087,8 +1094,17 @@
 
     function syncRunFormFromDefaults() {
       $("runPrompt").value = state.settings.default_prompt || "";
-      renderReferenceImageSelectors("runReferenceImageOrder", state.settings.reference_images || [], "run");
+      renderReferenceImageSelectors("runReferenceImageOrder", state.settings.reference_images || [], "run", updateRunSettingsSummary);
       state.runDefaultsInitialized = true;
+      updateRunSettingsSummary();
+    }
+
+    function updateRunSettingsSummary() {
+      const prompt = $("runPrompt").value.trim();
+      const defaultPrompt = state.settings.default_prompt || "";
+      const promptLabel = prompt === defaultPrompt ? "默认 Prompt" : "本次 Prompt 已调整";
+      const refCount = selectedReferenceImages("run").length;
+      $("runSettingsSummary").textContent = `${$("generationMode").value || "mock"} · ${promptLabel} · ${refCount} 张 ref 图`;
     }
 
     function shortUuid(uuid) {
@@ -2078,6 +2094,8 @@
 
     $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
+    $("generationMode").addEventListener("change", updateRunSettingsSummary);
+    $("runPrompt").addEventListener("input", updateRunSettingsSummary);
     $("resetRunDefaults").addEventListener("click", () => {
       state.runDefaultsInitialized = false;
       syncRunFormFromDefaults();
@@ -2099,16 +2117,35 @@
 
     $("refresh").addEventListener("click", () => refresh().catch((err) => log(formatApiError(err))));
     $("openSettings").addEventListener("click", () => {
-      $("settingsOverlay").classList.remove("hidden");
-      $("dm3NedfRoot").focus();
-      loadSeedanceUsage().catch((err) => log(formatApiError(err)));
+      if (state.route === "admin") {
+        $("settingsOverlay").classList.remove("hidden");
+        $("dm3NedfRoot").focus();
+        loadSeedanceUsage().catch((err) => log(formatApiError(err)));
+      } else {
+        $("runSettingsOverlay").classList.remove("hidden");
+        $("runPrompt").focus();
+      }
+    });
+    $("openRunSettingsInline").addEventListener("click", () => {
+      $("runSettingsOverlay").classList.remove("hidden");
+      $("runPrompt").focus();
     });
     $("closeSettings").addEventListener("click", () => {
       $("settingsOverlay").classList.add("hidden");
     });
+    $("closeRunSettings").addEventListener("click", () => {
+      $("runSettingsOverlay").classList.add("hidden");
+      updateRunSettingsSummary();
+    });
     $("settingsOverlay").addEventListener("click", (event) => {
       if (event.target === $("settingsOverlay")) {
         $("settingsOverlay").classList.add("hidden");
+      }
+    });
+    $("runSettingsOverlay").addEventListener("click", (event) => {
+      if (event.target === $("runSettingsOverlay")) {
+        $("runSettingsOverlay").classList.add("hidden");
+        updateRunSettingsSummary();
       }
     });
     $("saveSettings").addEventListener("click", async () => {
