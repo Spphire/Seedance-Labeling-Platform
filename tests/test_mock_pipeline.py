@@ -208,10 +208,10 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(
             settings["reference_images"],
             [
-                "app/reference_images/l-far.png",
-                "app/reference_images/r-far.png",
                 "app/reference_images/l-near.png",
                 "app/reference_images/r-near.png",
+                "app/reference_images/l-far.png",
+                "app/reference_images/r-far.png",
             ],
         )
 
@@ -341,6 +341,31 @@ class MockPipelineTest(unittest.TestCase):
         job = db.one("SELECT * FROM generation_jobs WHERE id=?", (res.json()["job_id"],))
         self.assertEqual(job["mode"], "mock")
 
+    def test_generation_api_defaults_to_mock_even_when_saved_mode_is_seedance(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000017"
+        now = db.now()
+        save_settings({"generation_mode": "seedance", "mock_async": True})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+
+        with patch("app.backend.services._GENERATION_EXECUTOR.submit") as submit:
+            res = self.client.post("/api/generation/run", json={})
+
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()[0]["status"], "queued")
+        submit.assert_called_once()
+        job = db.one("SELECT * FROM generation_jobs WHERE clip_id=?", (clips[0]["id"],))
+        self.assertEqual(job["mode"], "mock")
+
     def test_retry_api_mock_mode_uses_async_timing_when_enabled(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000015"
         now = db.now()
@@ -424,18 +449,28 @@ class MockPipelineTest(unittest.TestCase):
 
     def test_legacy_reference_order_is_repaired_and_persisted(self) -> None:
         REFERENCE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-        legacy = [
-            "app/reference_images/l-far.png",
-            "app/reference_images/l-near.png",
-            "app/reference_images/r-far.png",
-            "app/reference_images/r-near.png",
+        legacy_orders = [
+            [
+                "app/reference_images/l-far.png",
+                "app/reference_images/l-near.png",
+                "app/reference_images/r-far.png",
+                "app/reference_images/r-near.png",
+            ],
+            [
+                "app/reference_images/l-far.png",
+                "app/reference_images/r-far.png",
+                "app/reference_images/l-near.png",
+                "app/reference_images/r-near.png",
+            ],
         ]
-        save_settings({"reference_images": legacy})
-        settings = load_settings()
-        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
 
-        self.assertEqual(settings["reference_images"], DEFAULT_SETTINGS["reference_images"])
-        self.assertEqual(persisted["reference_images"], DEFAULT_SETTINGS["reference_images"])
+        for legacy in legacy_orders:
+            save_settings({"reference_images": legacy})
+            settings = load_settings()
+            persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+            self.assertEqual(settings["reference_images"], DEFAULT_SETTINGS["reference_images"])
+            self.assertEqual(persisted["reference_images"], DEFAULT_SETTINGS["reference_images"])
 
     def test_seedance_output_url_prefers_task_content_video_url(self) -> None:
         input_url = "http://106.14.2.243:18080/clips/episode/clip_0000.mp4"

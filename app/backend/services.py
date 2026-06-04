@@ -29,6 +29,7 @@ _GENERATION_CONDITION = threading.Condition()
 _GENERATION_ACTIVE = 0
 GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
 GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
+DEFAULT_REQUEST_MODE = "mock"
 
 
 def submit_episodes(text: str) -> list[dict[str, Any]]:
@@ -514,7 +515,7 @@ def run_generation(
     force: bool = False,
 ) -> list[dict[str, Any]]:
     settings = load_settings()
-    mode = mode or settings["generation_mode"]
+    mode = mode or DEFAULT_REQUEST_MODE
     if mode not in {"mock", "seedance"}:
         raise ValueError("mode must be mock or seedance")
     if clip_ids is not None and len(clip_ids) == 0:
@@ -549,7 +550,7 @@ def queue_generation(
     force: bool = False,
 ) -> list[dict[str, Any]]:
     settings = load_settings()
-    mode = mode or settings["generation_mode"]
+    mode = mode or DEFAULT_REQUEST_MODE
     if dry_run:
         return run_generation(mode, clip_ids, dry_run, lock_tokens, force)
     if mode == "mock" and not settings.get("mock_async"):

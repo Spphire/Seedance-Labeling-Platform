@@ -23,16 +23,22 @@ BROKEN_DEFAULT_PROMPTS = {
     "?@??1???????@??1@??2??????@??1???????@??3@??4???????????????????????",
 }
 DEFAULT_REFERENCE_IMAGES = [
-    "app/reference_images/l-far.png",
-    "app/reference_images/r-far.png",
     "app/reference_images/l-near.png",
     "app/reference_images/r-near.png",
+    "app/reference_images/l-far.png",
+    "app/reference_images/r-far.png",
 ]
 LEGACY_REFERENCE_IMAGE_ORDERS = {
     (
         "app/reference_images/l-far.png",
         "app/reference_images/l-near.png",
         "app/reference_images/r-far.png",
+        "app/reference_images/r-near.png",
+    ),
+    (
+        "app/reference_images/l-far.png",
+        "app/reference_images/r-far.png",
+        "app/reference_images/l-near.png",
         "app/reference_images/r-near.png",
     ),
 }
