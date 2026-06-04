@@ -275,12 +275,30 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(
             settings["reference_images"],
             [
-                "app/reference_images/l-near.png",
-                "app/reference_images/r-near.png",
-                "app/reference_images/l-far.png",
-                "app/reference_images/r-far.png",
+                "app/reference_images/l-near-iphone.png",
+                "app/reference_images/r-near-iphone.png",
+                "app/reference_images/l-far-iphone.png",
+                "app/reference_images/r-far-iphone.png",
             ],
         )
+
+    def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
+        save_settings(
+            {
+                "reference_images": [
+                    "app/reference_images/l-near.png",
+                    "app/reference_images/r-near.png",
+                    "app/reference_images/l-far.png",
+                    "app/reference_images/r-far.png",
+                ]
+            }
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["reference_images"], DEFAULT_SETTINGS["reference_images"])
+        self.assertEqual(persisted["reference_images"], DEFAULT_SETTINGS["reference_images"])
 
     def test_seedance_queue_marks_running_and_blocks_duplicate(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000011"

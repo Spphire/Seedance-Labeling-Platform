@@ -23,11 +23,17 @@ BROKEN_DEFAULT_PROMPTS = {
     "?@??1???????@??1@??2??????@??1???????@??3@??4???????????????????????",
 }
 DEFAULT_REFERENCE_IMAGES = [
-    "app/reference_images/l-near.png",
-    "app/reference_images/r-near.png",
-    "app/reference_images/l-far.png",
-    "app/reference_images/r-far.png",
+    "app/reference_images/l-near-iphone.png",
+    "app/reference_images/r-near-iphone.png",
+    "app/reference_images/l-far-iphone.png",
+    "app/reference_images/r-far-iphone.png",
 ]
+REFERENCE_IMAGE_RENAMES = {
+    "app/reference_images/l-near.png": "app/reference_images/l-near-iphone.png",
+    "app/reference_images/r-near.png": "app/reference_images/r-near-iphone.png",
+    "app/reference_images/l-far.png": "app/reference_images/l-far-iphone.png",
+    "app/reference_images/r-far.png": "app/reference_images/r-far-iphone.png",
+}
 LEGACY_REFERENCE_IMAGE_ORDERS = {
     (
         "app/reference_images/l-far.png",
@@ -76,6 +82,10 @@ def _prompt_needs_repair(value: Any) -> bool:
     return value in LEGACY_DEFAULT_PROMPTS or value in BROKEN_DEFAULT_PROMPTS
 
 
+def _renamed_reference_images(values: tuple[Any, ...]) -> list[str]:
+    return [REFERENCE_IMAGE_RENAMES.get(str(item), str(item)) for item in values]
+
+
 def _settings_from_disk() -> dict[str, Any]:
     if not SETTINGS_PATH.exists():
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -90,6 +100,11 @@ def _settings_from_disk() -> dict[str, Any]:
     if (not refs or refs in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
         data["reference_images"] = DEFAULT_REFERENCE_IMAGES
         changed = True
+    elif refs:
+        renamed_refs = _renamed_reference_images(refs)
+        if renamed_refs != list(refs):
+            data["reference_images"] = renamed_refs
+            changed = True
     if changed:
         SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     merged = dict(DEFAULT_SETTINGS)
