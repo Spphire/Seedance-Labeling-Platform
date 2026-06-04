@@ -33,11 +33,11 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/r-far-iphone.png",
 ]
 IPHONE2DEPLOY_REFERENCE_IMAGES = [
-    "app/reference_images/iphone2deploy-left.jpg",
-    "app/reference_images/iphone2deploy-right.jpg",
+    "app/reference_images/iphone2deploy-left.png",
+    "app/reference_images/iphone2deploy-right.png",
 ]
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
-GENERATION_PRESETS_VERSION = 3
+GENERATION_PRESETS_VERSION = 4
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -189,7 +189,7 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
             presets.append(copied)
             seen_ids.add(copied["id"])
             changed = True
-        if presets_version < 3:
+        if presets_version < 4:
             for preset in presets:
                 if preset["id"] != "iphone2deploy":
                     continue

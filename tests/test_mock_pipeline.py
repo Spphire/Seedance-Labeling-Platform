@@ -338,10 +338,10 @@ class MockPipelineTest(unittest.TestCase):
         settings = load_settings()
         self.assertNotIn("iphone2deploy", {item["id"] for item in settings["generation_presets"]})
 
-    def test_iphone2deploy_refs_are_migrated_to_clear_images(self) -> None:
+    def test_iphone2deploy_refs_are_migrated_to_current_png_images(self) -> None:
         old_refs = [
-            "app/reference_images/l-near-iphone.png",
-            "app/reference_images/r-near-iphone.png",
+            "app/reference_images/iphone2deploy-left.jpg",
+            "app/reference_images/iphone2deploy-right.jpg",
         ]
         SETTINGS_PATH.write_text(
             json.dumps(
@@ -349,7 +349,7 @@ class MockPipelineTest(unittest.TestCase):
                     "default_prompt": DEFAULT_PROMPT,
                     "reference_images": DEFAULT_SETTINGS["reference_images"],
                     "default_generation_preset_id": "iphone-default",
-                    "generation_presets_version": 2,
+                    "generation_presets_version": 3,
                     "generation_presets": [
                         {
                             "id": "iphone-default",
