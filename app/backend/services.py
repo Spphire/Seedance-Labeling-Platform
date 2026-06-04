@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import shutil
 import threading
 import time
@@ -20,6 +21,9 @@ from ..seedance.client import SeedanceClient
 _STITCH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="seedance-stitch")
 _STITCH_LOCK = threading.Lock()
 _STITCHING_EPISODES: set[str] = set()
+STITCH_LOCK_OWNER_ID = "system-stitcher"
+STITCH_LOCK_OWNER_NAME = "系统合成"
+STITCH_LOCK_TTL_SEC = 60 * 60 * 24
 _GENERATION_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="seedance-generation")
 _GENERATION_CONDITION = threading.Condition()
 _GENERATION_ACTIVE = 0
@@ -44,6 +48,18 @@ def submit_episodes(text: str) -> list[dict[str, Any]]:
                 (uuid, remote_path, local_path, now, now),
             )
     return list_episodes()
+
+
+def submit_and_preprocess_episodes(
+    text: str,
+    fetch_remote: bool = True,
+    lock_tokens: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    episodes = submit_episodes(text)
+    uuids = parse_uuids(text)
+    if not uuids:
+        return {"episodes": episodes, "preprocess": []}
+    return {"episodes": episodes, "preprocess": preprocess(uuids, fetch_remote, lock_tokens)}
 
 
 def list_episodes() -> list[dict[str, Any]]:
@@ -257,6 +273,44 @@ def active_clip_lock_for_episode(uuid: str) -> dict[str, Any] | None:
     return None
 
 
+def acquire_stitch_locks(uuid: str, clips: list[dict[str, Any]]) -> list[str]:
+    now = db.now()
+    expires_at = now + STITCH_LOCK_TTL_SEC
+    resources = [("episode", uuid), *[("clip", str(clip["id"])) for clip in clips]]
+    tokens: list[str] = []
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for resource_type, resource_id in resources:
+            existing = conn.execute(
+                "SELECT * FROM resource_locks WHERE resource_type=? AND resource_id=? AND expires_at > ?",
+                (resource_type, resource_id, now),
+            ).fetchone()
+            if existing and existing["owner_id"] != STITCH_LOCK_OWNER_ID:
+                raise LockError(409, "resource is locked by another reviewer", dict(existing))
+        for resource_type, resource_id in resources:
+            conn.execute("DELETE FROM resource_locks WHERE resource_type=? AND resource_id=?", (resource_type, resource_id))
+            token = secrets.token_urlsafe(24)
+            tokens.append(token)
+            conn.execute(
+                """
+                INSERT INTO resource_locks(resource_type, resource_id, owner_id, owner_name, token, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (resource_type, resource_id, STITCH_LOCK_OWNER_ID, STITCH_LOCK_OWNER_NAME, token, expires_at, now, now),
+            )
+    return tokens
+
+
+def release_stitch_locks(tokens: list[str]) -> None:
+    if not tokens:
+        return
+    with db.connect() as conn:
+        conn.execute(
+            "DELETE FROM resource_locks WHERE owner_id=? AND token IN (%s)" % ",".join("?" for _ in tokens),
+            [STITCH_LOCK_OWNER_ID, *tokens],
+        )
+
+
 def preprocess(
     uuids: list[str] | None = None,
     fetch_remote: bool = True,
@@ -281,10 +335,63 @@ def preprocess(
     return results
 
 
+def episode_preprocess_integrity(uuid: str) -> dict[str, Any]:
+    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    if not episode:
+        return {"complete": False, "reason": "episode is not submitted"}
+    head_value = episode.get("head_video_path")
+    if episode.get("status") != "preprocessed":
+        return {"complete": False, "reason": f"episode status is {episode.get('status') or 'missing'}"}
+    if not head_value:
+        return {"complete": False, "reason": "head video path is missing"}
+    head_path = Path(head_value)
+    if not head_path.exists():
+        return {"complete": False, "reason": "head video file is missing"}
+    try:
+        duration = video_duration(head_path)
+        expected = clip_plan(duration)
+    except Exception as exc:
+        return {"complete": False, "reason": f"head video is invalid: {exc}"}
+
+    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    if len(clips) != len(expected):
+        return {
+            "complete": False,
+            "reason": f"clip count mismatch: expected {len(expected)}, found {len(clips)}",
+            "duration_sec": duration,
+        }
+    for index, ((start_sec, duration_sec), clip) in enumerate(zip(expected, clips)):
+        if int(clip["clip_index"]) != index:
+            return {"complete": False, "reason": f"clip index mismatch at {index}", "duration_sec": duration}
+        if abs(float(clip["start_sec"]) - float(start_sec)) > 0.05:
+            return {"complete": False, "reason": f"clip {index} start mismatch", "duration_sec": duration}
+        if abs(float(clip["duration_sec"]) - float(duration_sec)) > 0.05:
+            return {"complete": False, "reason": f"clip {index} duration mismatch", "duration_sec": duration}
+        clip_path = Path(clip["local_path"])
+        if not clip_path.exists():
+            return {"complete": False, "reason": f"clip {index} file is missing", "duration_sec": duration}
+        try:
+            actual_duration = video_duration(clip_path)
+        except Exception as exc:
+            return {"complete": False, "reason": f"clip {index} file is invalid: {exc}", "duration_sec": duration}
+        if abs(float(actual_duration) - float(duration_sec)) > 0.25:
+            return {"complete": False, "reason": f"clip {index} file duration mismatch", "duration_sec": duration}
+    return {"complete": True, "reason": "already complete", "duration_sec": duration, "clip_count": len(clips)}
+
+
 def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock_token: str | None = None) -> dict[str, Any]:
     now = db.now()
     local_dir = EPISODES_DIR / uuid
     require_episode_mutation_lock(uuid, lock_token)
+    integrity = episode_preprocess_integrity(uuid)
+    if integrity["complete"]:
+        return {
+            "uuid": uuid,
+            "status": "skipped",
+            "reason": integrity["reason"],
+            "duration_sec": integrity.get("duration_sec"),
+            "clip_count": integrity.get("clip_count"),
+        }
     with db.connect() as conn:
         conn.execute("UPDATE episodes SET status='preprocessing', error=NULL, updated_at=? WHERE uuid=?", (now, uuid))
     try:
@@ -306,7 +413,7 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
                 """,
                 (str(head_path.resolve()), str(episode_dir.resolve()), db.now(), uuid),
             )
-        return {"uuid": uuid, "head": meta, "clips": clips}
+        return {"uuid": uuid, "status": "preprocessed", "reason": integrity["reason"], "head": meta, "clips": clips}
     except Exception as exc:
         with db.connect() as conn:
             conn.execute("UPDATE episodes SET status='failed', error=?, updated_at=? WHERE uuid=?", (str(exc), db.now(), uuid))
@@ -564,7 +671,7 @@ def seedance_job_worker(job_id: int) -> None:
             job["task_id"] = task["task_id"]
             with db.connect() as conn:
                 conn.execute("UPDATE generation_jobs SET task_id=?, updated_at=? WHERE id=?", (job["task_id"], db.now(), job_id))
-        data = client.wait_for_task(job["task_id"], out_path)
+        data = client.wait_for_task(job["task_id"], out_path, input_url=job["public_url"])
         with db.connect() as conn:
             now = db.now()
             conn.execute(

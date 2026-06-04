@@ -17,8 +17,9 @@ from app.backend.main import app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import create_clips, list_clips, queue_generation, refresh_clip_public_urls, review_clip, run_generation
-from app.backend.settings import DEFAULT_PROMPT, DEFAULT_SETTINGS, SETTINGS_PATH, load_settings, save_settings
+from app.backend.settings import DEFAULT_PROMPT, DEFAULT_SETTINGS, SETTINGS_PATH, load_settings, public_settings, save_settings
 from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
+from app.seedance.client import SeedanceClient, resolve_image_value
 
 
 class MockPipelineTest(unittest.TestCase):
@@ -86,7 +87,7 @@ class MockPipelineTest(unittest.TestCase):
         result = []
         for index in range(4):
             path = REFERENCE_IMAGES_DIR / f"ref-{index + 1}.png"
-            path.write_bytes(b"fake-png")
+            path.write_bytes(f"fake-png-{index + 1}".encode("ascii"))
             result.append(path)
         return [str(path) for path in result]
 
@@ -186,7 +187,23 @@ class MockPipelineTest(unittest.TestCase):
         image_items = [item for item in payload["content"] if item["type"] == "image_url"]
         self.assertEqual(len(image_items), 4)
         self.assertTrue(payload["content"][0]["text"].startswith("把@视频1"))
+        self.assertEqual(
+            [item["image_url"]["url"] for item in image_items],
+            [resolve_image_value(item) for item in [refs[2], refs[0], refs[3], refs[1]]],
+        )
         self.assertEqual(payload["content"][-1]["type"], "video_url")
+
+    def test_default_reference_images_are_seedance_prompt_order(self) -> None:
+        settings = load_settings()
+        self.assertEqual(
+            settings["reference_images"],
+            [
+                "app/reference_images/l-far.png",
+                "app/reference_images/r-far.png",
+                "app/reference_images/l-near.png",
+                "app/reference_images/r-near.png",
+            ],
+        )
 
     def test_seedance_queue_marks_running_and_blocks_duplicate(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000011"
@@ -368,6 +385,16 @@ class MockPipelineTest(unittest.TestCase):
         self.assertNotIn("seedance_api_key", data)
         self.assertTrue(data["seedance_api_key_set"])
 
+    def test_env_api_key_sets_public_flag_without_persisting_secret(self) -> None:
+        save_settings({"seedance_api_key": ""})
+        with patch.dict(os.environ, {"SEEDANCE_API_KEY": "env-secret"}):
+            data = public_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertNotIn("seedance_api_key", data)
+        self.assertTrue(data["seedance_api_key_set"])
+        self.assertEqual(persisted["seedance_api_key"], "")
+
     def test_broken_prompt_is_repaired_and_persisted(self) -> None:
         broken = "?@??1???????@??1@??2??????@??1???????@??3@??4???????????????????????"
         save_settings({"default_prompt": broken})
@@ -376,6 +403,40 @@ class MockPipelineTest(unittest.TestCase):
 
         self.assertEqual(settings["default_prompt"], DEFAULT_PROMPT)
         self.assertEqual(persisted["default_prompt"], DEFAULT_PROMPT)
+
+    def test_replacement_char_prompt_is_repaired_and_persisted(self) -> None:
+        save_settings({"default_prompt": "\ufffd\ufffd@\ufffd\ufffd1 broken"})
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["default_prompt"], DEFAULT_PROMPT)
+        self.assertEqual(persisted["default_prompt"], DEFAULT_PROMPT)
+
+    def test_legacy_reference_order_is_repaired_and_persisted(self) -> None:
+        REFERENCE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        legacy = [
+            "app/reference_images/l-far.png",
+            "app/reference_images/l-near.png",
+            "app/reference_images/r-far.png",
+            "app/reference_images/r-near.png",
+        ]
+        save_settings({"reference_images": legacy})
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["reference_images"], DEFAULT_SETTINGS["reference_images"])
+        self.assertEqual(persisted["reference_images"], DEFAULT_SETTINGS["reference_images"])
+
+    def test_seedance_output_url_prefers_task_content_video_url(self) -> None:
+        input_url = "http://106.14.2.243:18080/clips/episode/clip_0000.mp4"
+        output_url = "https://ark-acg-cn-beijing.tos-cn-beijing.volces.com/result.mp4?signature=ok"
+        task = {
+            "status": "succeeded",
+            "content": {"video_url": output_url, "file_url": None},
+            "request": {"content": [{"type": "video_url", "video_url": {"url": input_url}}]},
+        }
+
+        self.assertEqual(SeedanceClient._find_output_url(task, {input_url}), output_url)
 
     def test_mock_async_marks_running_then_completes(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000013"

@@ -65,7 +65,7 @@ class SeedanceClient:
         client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
         result = client.content_generation.tasks.create(**payload)
         task_id = result.id
-        return self.wait_and_download(client, task_id, output_path)
+        return self.wait_and_download(client, task_id, output_path, input_url=public_url)
 
     def create_task(self, prompt: str, public_url: str, duration_sec: float) -> dict[str, Any]:
         api_key = self.settings.get("seedance_api_key")
@@ -76,34 +76,79 @@ class SeedanceClient:
         result = client.content_generation.tasks.create(**payload)
         return {"task_id": result.id}
 
-    def wait_for_task(self, task_id: str, output_path: Path) -> dict[str, Any]:
+    def wait_for_task(self, task_id: str, output_path: Path, input_url: str | None = None) -> dict[str, Any]:
         api_key = self.settings.get("seedance_api_key")
         if not api_key:
             raise RuntimeError("seedance_api_key is required for seedance mode")
         client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
-        return self.wait_and_download(client, task_id, output_path)
+        return self.wait_and_download(client, task_id, output_path, input_url=input_url)
 
-    def wait_and_download(self, client: Ark, task_id: str, output_path: Path) -> dict[str, Any]:
+    def wait_and_download(
+        self,
+        client: Ark,
+        task_id: str,
+        output_path: Path,
+        input_url: str | None = None,
+    ) -> dict[str, Any]:
         while True:
             task = client.content_generation.tasks.get(task_id=task_id)
             if task.status == "succeeded":
-                data = task.model_dump() if hasattr(task, "model_dump") else task.dict()
-                output_url = self._find_output_url(data)
+                data = self._model_dump(task)
+                output_url = self._find_output_url(data, input_urls={input_url} if input_url else set())
                 if not output_url:
                     raise RuntimeError(f"Seedance succeeded but no output URL found: {data}")
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 urllib.request.urlretrieve(output_url, output_path)
                 return {"task_id": task_id, "output_url": output_url, "output_path": str(output_path)}
             if task.status == "failed":
-                raise RuntimeError(str(getattr(task, "error", "Seedance task failed")))
+                data = self._model_dump(task)
+                raise RuntimeError(str(data.get("error") or "Seedance task failed"))
             time.sleep(10)
 
     @staticmethod
-    def _find_output_url(data: dict[str, Any]) -> str:
-        text = json.dumps(data, ensure_ascii=False)
-        for marker in ["http://", "https://"]:
-            idx = text.find(marker)
-            if idx >= 0:
-                end = min([p for p in [text.find('"', idx), text.find("\\", idx)] if p >= 0] or [len(text)])
-                return text[idx:end]
+    def _model_dump(value: Any) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        if hasattr(value, "dict"):
+            return value.dict()
+        if isinstance(value, dict):
+            return value
+        return json.loads(json.dumps(value, default=str))
+
+    @classmethod
+    def _find_output_url(cls, data: dict[str, Any], input_urls: set[str] | None = None) -> str:
+        input_urls = input_urls or set()
+        candidates: list[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, str):
+                candidates.append(value)
+
+        content = data.get("content")
+        if isinstance(content, dict):
+            for key in ["video_url", "file_url", "output_url", "url"]:
+                add(content.get(key))
+        for key in ["output_video_url", "video_url", "file_url", "output_url", "url"]:
+            add(data.get(key))
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+            else:
+                add(value)
+
+        walk(data)
+        for url in candidates:
+            if cls._is_output_url(url, input_urls):
+                return url
         return ""
+
+    @staticmethod
+    def _is_output_url(value: str, input_urls: set[str]) -> bool:
+        if not value.startswith(("http://", "https://")):
+            return False
+        return value not in input_urls

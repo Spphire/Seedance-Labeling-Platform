@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +24,18 @@ BROKEN_DEFAULT_PROMPTS = {
 }
 DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/l-far.png",
-    "app/reference_images/l-near.png",
     "app/reference_images/r-far.png",
+    "app/reference_images/l-near.png",
     "app/reference_images/r-near.png",
 ]
+LEGACY_REFERENCE_IMAGE_ORDERS = {
+    (
+        "app/reference_images/l-far.png",
+        "app/reference_images/l-near.png",
+        "app/reference_images/r-far.png",
+        "app/reference_images/r-near.png",
+    ),
+}
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -49,17 +58,30 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
-def load_settings() -> dict[str, Any]:
+def _env_api_key() -> str:
+    return os.environ.get("SEEDANCE_API_KEY") or os.environ.get("ARK_API_KEY") or ""
+
+
+def _prompt_needs_repair(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return True
+    if "\ufffd" in value:
+        return True
+    return value in LEGACY_DEFAULT_PROMPTS or value in BROKEN_DEFAULT_PROMPTS
+
+
+def _settings_from_disk() -> dict[str, Any]:
     if not SETTINGS_PATH.exists():
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2), encoding="utf-8")
         return dict(DEFAULT_SETTINGS)
     data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     changed = False
-    if data.get("default_prompt") in LEGACY_DEFAULT_PROMPTS or data.get("default_prompt") in BROKEN_DEFAULT_PROMPTS:
+    if _prompt_needs_repair(data.get("default_prompt")):
         data["default_prompt"] = DEFAULT_PROMPT
         changed = True
-    if not data.get("reference_images") and REFERENCE_IMAGES_DIR.exists():
+    refs = tuple(data.get("reference_images") or [])
+    if (not refs or refs in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
         data["reference_images"] = DEFAULT_REFERENCE_IMAGES
         changed = True
     if changed:
@@ -69,11 +91,19 @@ def load_settings() -> dict[str, Any]:
     return merged
 
 
+def load_settings() -> dict[str, Any]:
+    settings = _settings_from_disk()
+    env_key = _env_api_key()
+    if env_key and not settings.get("seedance_api_key"):
+        settings["seedance_api_key"] = env_key
+    return settings
+
+
 def save_settings(data: dict[str, Any]) -> dict[str, Any]:
-    merged = load_settings()
+    merged = _settings_from_disk()
     merged.update(data)
     SETTINGS_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    return merged
+    return load_settings()
 
 
 def public_settings() -> dict[str, Any]:
@@ -87,14 +117,17 @@ def public_settings() -> dict[str, Any]:
 def available_reference_images() -> list[dict[str, str]]:
     if not REFERENCE_IMAGES_DIR.exists():
         return []
+    paths = {path.resolve().relative_to(ROOT).as_posix(): path for path in REFERENCE_IMAGES_DIR.iterdir()}
+    ordered_keys = [key for key in DEFAULT_REFERENCE_IMAGES if key in paths]
+    ordered_keys.extend(sorted(key for key in paths if key not in ordered_keys))
     result = []
-    for path in sorted(REFERENCE_IMAGES_DIR.iterdir()):
+    for key in ordered_keys:
+        path = paths[key]
         if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
             continue
-        rel = path.resolve().relative_to(ROOT).as_posix()
         result.append(
             {
-                "id": rel,
+                "id": key,
                 "name": path.stem,
                 "url": f"/reference_images/{path.name}",
             }
