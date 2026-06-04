@@ -912,9 +912,6 @@
           <input id="headVideoPath" placeholder="已有 head MP4 路径">
           <button id="importHead">导入</button>
         </div>
-        <div class="row">
-          <button id="openRunSettingsInline">本次设置</button>
-        </div>
         <div id="runSettingsSummary" class="hint"></div>
         <div class="row">
           <button id="generate">生成</button>
@@ -2125,10 +2122,6 @@
         $("runSettingsOverlay").classList.remove("hidden");
         $("runPrompt").focus();
       }
-    });
-    $("openRunSettingsInline").addEventListener("click", () => {
-      $("runSettingsOverlay").classList.remove("hidden");
-      $("runPrompt").focus();
     });
     $("closeSettings").addEventListener("click", () => {
       $("settingsOverlay").classList.add("hidden");
