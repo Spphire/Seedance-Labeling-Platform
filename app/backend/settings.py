@@ -33,11 +33,11 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/r-far-iphone.png",
 ]
 IPHONE2DEPLOY_REFERENCE_IMAGES = [
-    "app/reference_images/l-near-iphone.png",
-    "app/reference_images/r-near-iphone.png",
+    "app/reference_images/iphone2deploy-left.jpg",
+    "app/reference_images/iphone2deploy-right.jpg",
 ]
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
-GENERATION_PRESETS_VERSION = 2
+GENERATION_PRESETS_VERSION = 3
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -129,6 +129,10 @@ def _preset_copy(preset: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _default_preset_by_id(preset_id: str) -> dict[str, Any] | None:
+    return next((preset for preset in DEFAULT_GENERATION_PRESETS if str(preset["id"]) == preset_id), None)
+
+
 def _normalize_generation_presets(data: dict[str, Any]) -> bool:
     changed = False
     default_prompt_present = "default_prompt" in data
@@ -185,6 +189,14 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
             presets.append(copied)
             seen_ids.add(copied["id"])
             changed = True
+        if presets_version < 3:
+            for preset in presets:
+                if preset["id"] != "iphone2deploy":
+                    continue
+                default_preset = _default_preset_by_id("iphone2deploy")
+                if default_preset and preset["reference_images"] != default_preset["reference_images"]:
+                    preset["reference_images"] = list(default_preset["reference_images"])
+                    changed = True
         data["generation_presets_version"] = GENERATION_PRESETS_VERSION
         changed = True
     elif data.get("generation_presets_version") != GENERATION_PRESETS_VERSION:

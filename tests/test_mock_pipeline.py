@@ -338,6 +338,50 @@ class MockPipelineTest(unittest.TestCase):
         settings = load_settings()
         self.assertNotIn("iphone2deploy", {item["id"] for item in settings["generation_presets"]})
 
+    def test_iphone2deploy_refs_are_migrated_to_clear_images(self) -> None:
+        old_refs = [
+            "app/reference_images/l-near-iphone.png",
+            "app/reference_images/r-near-iphone.png",
+        ]
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "default_prompt": DEFAULT_PROMPT,
+                    "reference_images": DEFAULT_SETTINGS["reference_images"],
+                    "default_generation_preset_id": "iphone-default",
+                    "generation_presets_version": 2,
+                    "generation_presets": [
+                        {
+                            "id": "iphone-default",
+                            "name": "iPhone 默认组合",
+                            "prompt": DEFAULT_PROMPT,
+                            "reference_images": DEFAULT_SETTINGS["reference_images"],
+                        },
+                        {
+                            "id": "iphone2deploy",
+                            "name": "iphone2deploy",
+                            "prompt": IPHONE2DEPLOY_PROMPT,
+                            "reference_images": old_refs,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+
+        self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(
+            next(item for item in persisted["generation_presets"] if item["id"] == "iphone2deploy")["reference_images"],
+            IPHONE2DEPLOY_REFERENCE_IMAGES,
+        )
+
     def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
         save_settings(
             {
