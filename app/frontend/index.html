@@ -925,7 +925,7 @@
         <h2>批量 episode</h2>
         <textarea id="episodeText" spellcheck="false" placeholder="c412f233-549f-43cd-89c3-af0b496ae742"></textarea>
         <div class="row">
-          <button id="submitPreprocess" class="primary">提交并预处理</button>
+          <button id="submitPreprocess" class="primary">导入并准备 head</button>
         </div>
         <div class="row">
           <input id="headVideoPath" placeholder="已有 head MP4 路径">
@@ -933,7 +933,7 @@
         </div>
         <div id="runSettingsSummary" class="hint"></div>
         <div class="row">
-          <button id="generate">生成</button>
+          <button id="generate">滚动生成</button>
           <button id="dryRun">dry-run</button>
         </div>
         <div class="row">
@@ -1698,6 +1698,7 @@
       if (episode.generated_failed_clip_count) facts.push(`${episode.generated_failed_clip_count} 失败`);
       if (episode.flagged_clip_count) facts.push(`${episode.flagged_clip_count} 标记问题`);
       if (episode.rejected_clip_count) facts.push(`${episode.rejected_clip_count} 已丢弃`);
+      if (episode.rolling_planned_sec) facts.push(`rolling ${formatDuration(episode.rolling_accepted_sec || 0)}/${formatDuration(episode.rolling_planned_sec)}`);
       if (episode.preprocess_health === "damaged") facts.push(`损坏：${episode.preprocess_health_reason || "需要重新预处理"}`);
       return facts;
     }
@@ -1763,6 +1764,13 @@
       });
     }
 
+    function clipTimingText(clip) {
+      if (clip.input_kind === "rolling") {
+        return `rolling · source ${Number(clip.source_start_sec || clip.start_sec).toFixed(2)}s + ${Number(clip.source_duration_sec || 0).toFixed(2)}s · overlap ${Number(clip.overlap_sec || 0).toFixed(2)}s · input ${Number(clip.duration_sec).toFixed(2)}s`;
+      }
+      return `${Number(clip.start_sec).toFixed(2)}s + ${Number(clip.duration_sec).toFixed(2)}s`;
+    }
+
     function renderClips() {
       const target = $("clipList");
       target.innerHTML = "";
@@ -1780,7 +1788,7 @@
             <span>${shortUuid(clip.episode_uuid)} #${String(clip.clip_index).padStart(4, "0")}</span>
             ${badge(clip.status)}
           </div>
-          <div class="meta">${Number(clip.start_sec).toFixed(2)}s + ${Number(clip.duration_sec).toFixed(2)}s</div>
+          <div class="meta">${clipTimingText(clip)}</div>
           ${job ? `<div class="meta">${jobSummary(job)}</div>` : ""}
           ${job && job.status === "running" ? `<div class="progress running" title="${job.progress_pct}%"><span style="width: ${job.progress_pct}%"></span></div>` : ""}
           ${lock ? `<div class="meta">${lockBadge} ${lockText(lock)}</div>` : ""}
@@ -1993,7 +2001,7 @@
         <div class="review-head">
           <div class="review-title">
             <h2>${shortUuid(clip.episode_uuid)} · clip #${String(clip.clip_index).padStart(4, "0")}</h2>
-            <div class="meta" data-live="workspace-meta">start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
+            <div class="meta" data-live="workspace-meta">${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
           </div>
           <div class="actions">
             <button class="good" data-action="accept" ${generated && canEdit && !isGenerating ? "" : "disabled"}>保留</button>
@@ -2064,7 +2072,7 @@
     function updateWorkspaceLiveFields(clip, episode, job) {
       const meta = document.querySelector("[data-live='workspace-meta']");
       if (meta) {
-        meta.textContent = `start ${Number(clip.start_sec).toFixed(3)}s · duration ${Number(clip.duration_sec).toFixed(3)}s · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}`;
+        meta.textContent = `${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}`;
       }
       const progress = document.querySelector("[data-live='job-progress']");
       if (progress && job && job.status === "running") {
@@ -2396,7 +2404,7 @@
         const textUuids = uuidsFromText($("episodeText").value);
         let uuids = textUuids.length ? textUuids : (state.selectedEpisode ? [state.selectedEpisode] : []);
         if (!uuids.length) throw new Error("需要在文本框中填写 episode UUID，或先选择一个 episode");
-        log("submit + preprocess running");
+        log("import + head prepare running");
         for (const uuid of uuids) {
           const lock = await api("/api/locks/acquire", {
             method: "POST",
@@ -2408,7 +2416,7 @@
           method: "POST",
           body: { episodes_text: uuids.join("\n"), fetch_remote: true, lock_tokens: lockTokens },
         });
-        log("submit + preprocess finished", result);
+        log("import + head prepare finished", result);
         await refresh();
       } catch (err) {
         log(formatApiError(err));
@@ -2439,9 +2447,9 @@
     });
     $("generate").addEventListener("click", async () => {
       try {
-        const mode = $("generationMode").value;
-        const result = await api("/api/generation/run", { method: "POST", body: { mode, dry_run: false, ...generationContentPayload() } });
-        log(`${mode} generation finished`, result);
+        const mode = $("generationMode").value || "mock";
+        const result = await api("/api/generation/rolling_run", { method: "POST", body: { mode, dry_run: false, ...generationContentPayload() } });
+        log(`${mode} rolling generation submitted`, result);
         await refresh();
       } catch (err) {
         log(err.message);
@@ -2457,8 +2465,8 @@
     });
     $("dryRun").addEventListener("click", async () => {
       try {
-        const result = await api("/api/generation/run", { method: "POST", body: { mode: "seedance", dry_run: true, ...generationContentPayload() } });
-        log("seedance dry-run payloads written", result);
+        const result = await api("/api/generation/rolling_run", { method: "POST", body: { mode: "seedance", dry_run: true, ...generationContentPayload() } });
+        log("seedance rolling dry-run payloads written", result);
         await refresh();
       } catch (err) {
         log(err.message);

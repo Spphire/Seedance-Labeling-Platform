@@ -18,10 +18,12 @@ from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import (
     create_clips,
+    import_head_video,
     list_episodes,
     list_clips,
     preprocess_one,
     queue_generation,
+    queue_rolling_generation,
     queue_stitch_episode,
     refresh_clip_public_urls,
     review_clip,
@@ -127,6 +129,20 @@ class MockPipelineTest(unittest.TestCase):
         results = run_generation(mode="mock")
         return clips, results
 
+    def make_head_ready_episode(self, uuid: str, duration: float) -> Path:
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, duration)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, head_video_path, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, ?)
+                """,
+                (uuid, "mock", "mock", str(head.resolve()), now, now),
+            )
+        return head
+
     def test_mock_generation_accept_and_stitch(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000001"
         now = db.now()
@@ -163,6 +179,101 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(stream["height"], 570)
         self.assertEqual(stream["avg_frame_rate"], "30/1")
         self.assertAlmostEqual(float(info["format"]["duration"]), 8.0, delta=0.25)
+
+    def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000022"
+        source = DATA_DIR / "manual_head.mp4"
+        self.make_video(source, 8)
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+
+        result = import_head_video(uuid, str(source), lock.json()["token"])
+
+        self.assertEqual(result["clips"], [])
+        self.assertEqual(db.rows("SELECT * FROM clips WHERE episode_uuid=?", (uuid,)), [])
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertEqual(episode["status"], "preprocessed")
+        self.assertTrue(Path(episode["head_video_path"]).exists())
+
+    def test_rolling_generation_advances_after_accept_and_reject_reruns_same_clip(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000023"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 32)
+
+        first = queue_rolling_generation(mode="mock")
+        self.assertEqual(first[0]["status"], "succeeded")
+        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
+        self.assertEqual(clip_0["input_kind"], "rolling")
+        self.assertEqual(clip_0["status"], "generated")
+        self.assertEqual(clip_0["duration_sec"], 15.0)
+        self.assertEqual(clip_0["source_duration_sec"], 15.0)
+        self.assertEqual(clip_0["overlap_sec"], 0.0)
+
+        accepted = review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
+        self.assertIsNone(accepted["final"])
+        second = queue_rolling_generation(mode="mock")
+        self.assertEqual(second[0]["status"], "succeeded")
+        clip_1 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
+        self.assertEqual(clip_1["id"], second[0]["clip_id"])
+        self.assertEqual(clip_1["source_start_sec"], 15.0)
+        self.assertEqual(clip_1["source_duration_sec"], 14.0)
+        self.assertEqual(clip_1["overlap_sec"], 1.0)
+        self.assertEqual(clip_1["duration_sec"], 15.0)
+
+        review_clip(clip_1["id"], "reject", second[0]["job_id"], require_lock_token=False)
+        before_count = db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=?", (uuid,))["count"]
+        rerun = queue_rolling_generation(mode="mock")
+        after_count = db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=?", (uuid,))["count"]
+        self.assertEqual(rerun[0]["clip_id"], clip_1["id"])
+        self.assertEqual(before_count, after_count)
+
+    def test_rolling_generation_api_endpoint_creates_next_clip(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000026"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 8)
+
+        res = self.client.post("/api/generation/rolling_run", json={"mode": "mock", "operator_id": "client-a"})
+
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()[0]["status"], "succeeded")
+        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
+        self.assertEqual(clip["input_kind"], "rolling")
+        self.assertEqual(clip["duration_sec"], 8.0)
+
+    def test_rolling_dry_run_keeps_clip_pending(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000024"
+        save_settings({"reference_images": ["data:image/png;base64,AA=="]})
+        self.make_head_ready_episode(uuid, 32)
+
+        result = queue_rolling_generation(mode="seedance", dry_run=True)
+        payload_path = Path(result[0]["output_path"])
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        clip = db.one("SELECT * FROM clips WHERE id=?", (result[0]["clip_id"],))
+
+        self.assertEqual(payload["duration"], 15)
+        self.assertEqual(clip["status"], "pending")
+        self.assertEqual(clip["input_kind"], "rolling")
+
+    def test_rolling_stitch_trims_overlap_from_final(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000025"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 18)
+
+        first = queue_rolling_generation(mode="mock")
+        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
+        review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
+        second = queue_rolling_generation(mode="mock")
+        clip_1 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
+        self.assertEqual(clip_1["duration_sec"], 4.0)
+        self.assertEqual(clip_1["timeline_duration_sec"], 3.0)
+        review_clip(clip_1["id"], "accept", second[0]["job_id"], require_lock_token=False)
+
+        episode = self.wait_for_final_ready(uuid)
+        info = ffprobe_json(Path(episode["final_video_path"])) or ffmpeg_probe_fallback(Path(episode["final_video_path"]))
+        self.assertAlmostEqual(float(info["format"]["duration"]), 18.0, delta=0.35)
 
     def test_frontend_label_and_admin_routes_are_served(self) -> None:
         FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
@@ -829,7 +940,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(resolved, source_root / uuid)
         self.assertFalse(local_dir.exists())
 
-    def test_preprocess_skips_complete_episode_and_recovers_missing_clip_file(self) -> None:
+    def test_preprocess_skips_head_ready_episode_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000017"
         now = db.now()
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
@@ -842,8 +953,6 @@ class MockPipelineTest(unittest.TestCase):
                 """,
                 (uuid, "mock", str((EPISODES_DIR / uuid).resolve()), str(head.resolve()), now, now),
             )
-        clips = create_clips(uuid, head, 16)
-        before_ids = [clip["id"] for clip in clips]
         lock = self.client.post(
             "/api/locks/acquire",
             json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
@@ -854,19 +963,8 @@ class MockPipelineTest(unittest.TestCase):
         skipped = preprocess_one(uuid, load_settings(), fetch_remote=False, lock_token=token)
 
         self.assertEqual(skipped["status"], "skipped")
-        self.assertEqual(skipped["clip_count"], len(clips))
-        self.assertEqual([row["id"] for row in db.rows("SELECT id FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))], before_ids)
-
-        Path(clips[0]["path"]).unlink()
-        rebuilt = preprocess_one(uuid, load_settings(), fetch_remote=False, lock_token=token)
-
-        self.assertEqual(rebuilt["status"], "preprocessed")
-        self.assertIn("clip 0 file is missing", rebuilt["reason"])
-        self.assertNotEqual(
-            [row["id"] for row in db.rows("SELECT id FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))],
-            before_ids,
-        )
-        self.assertTrue(Path(rebuilt["clips"][0]["path"]).exists())
+        self.assertEqual(skipped["clip_count"], 0)
+        self.assertEqual(db.rows("SELECT * FROM clips WHERE episode_uuid=?", (uuid,)), [])
 
     def test_submit_and_preprocess_combined_endpoint_submits_before_preprocess(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000018"

@@ -33,6 +33,7 @@ from .services import (
     list_seedance_usage,
     preprocess,
     queue_generation,
+    queue_rolling_generation,
     queue_stitch_episode,
     refresh_clip_public_urls,
     retry_clip,
@@ -164,6 +165,21 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
             payload.clip_ids,
             payload.dry_run,
             lock_tokens,
+            operator_id=payload.operator_id,
+            operator_name=payload.operator_name,
+            prompt=payload.prompt,
+            reference_images=payload.reference_images,
+        )
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/generation/rolling_run")
+def post_generation_rolling_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
+    try:
+        return queue_rolling_generation(
+            payload.mode,
+            payload.dry_run,
             operator_id=payload.operator_id,
             operator_name=payload.operator_name,
             prompt=payload.prompt,

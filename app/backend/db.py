@@ -59,6 +59,11 @@ def init_db() -> None:
                 clip_index INTEGER NOT NULL,
                 start_sec REAL NOT NULL,
                 duration_sec REAL NOT NULL,
+                source_start_sec REAL,
+                source_duration_sec REAL,
+                overlap_sec REAL NOT NULL DEFAULT 0,
+                timeline_duration_sec REAL,
+                input_kind TEXT NOT NULL DEFAULT 'split',
                 local_path TEXT NOT NULL,
                 public_url TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -155,6 +160,15 @@ def init_db() -> None:
         _ensure_column(conn, "generation_jobs", "operator_name", "TEXT")
         _ensure_column(conn, "generation_jobs", "prompt", "TEXT")
         _ensure_column(conn, "generation_jobs", "reference_images_json", "TEXT")
+        _ensure_column(conn, "clips", "source_start_sec", "REAL")
+        _ensure_column(conn, "clips", "source_duration_sec", "REAL")
+        _ensure_column(conn, "clips", "overlap_sec", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "clips", "timeline_duration_sec", "REAL")
+        _ensure_column(conn, "clips", "input_kind", "TEXT NOT NULL DEFAULT 'split'")
+        conn.execute("UPDATE clips SET source_start_sec=start_sec WHERE source_start_sec IS NULL")
+        conn.execute("UPDATE clips SET source_duration_sec=duration_sec WHERE source_duration_sec IS NULL")
+        conn.execute("UPDATE clips SET timeline_duration_sec=duration_sec WHERE timeline_duration_sec IS NULL")
+        conn.execute("UPDATE clips SET input_kind='split' WHERE input_kind IS NULL OR input_kind=''")
         _ensure_column(conn, "reviews", "operator_id", "TEXT")
         _ensure_column(conn, "reviews", "operator_name", "TEXT")
         conn.execute(

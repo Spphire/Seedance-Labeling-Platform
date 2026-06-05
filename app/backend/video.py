@@ -189,6 +189,155 @@ def stitch_videos(inputs: list[Path], dst: Path) -> None:
         list_path.unlink(missing_ok=True)
 
 
+def concat_videos_precise(inputs: list[Path], dst: Path) -> None:
+    if not inputs:
+        raise ValueError("inputs must not be empty")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    args: list[str] = []
+    for path in inputs:
+        args.extend(["-i", str(path)])
+    filter_parts = [
+        f"[{index}:v]scale=760:570,setsar=1,setpts=PTS-STARTPTS[v{index}]"
+        for index in range(len(inputs))
+    ]
+    filter_parts.append(
+        "".join(f"[v{index}]" for index in range(len(inputs)))
+        + f"concat=n={len(inputs)}:v=1:a=0,fps=30,format=yuv420p[v]"
+    )
+    run_ffmpeg(
+        [
+            *args,
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[v]",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+    )
+
+
+def trim_video(src: Path, dst: Path, start_sec: float, duration_sec: float) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        [
+            "-i",
+            str(src),
+            "-ss",
+            f"{start_sec:.6f}",
+            "-t",
+            f"{duration_sec:.6f}",
+            "-vf",
+            "scale=760:570,setsar=1",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+    )
+
+
+def compose_rolling_input(
+    head_src: Path,
+    dst: Path,
+    source_start_sec: float,
+    source_duration_sec: float,
+    anchor_src: Path | None = None,
+    overlap_sec: float = 0.0,
+) -> None:
+    if source_duration_sec <= 0:
+        raise ValueError("source_duration_sec must be positive")
+    if overlap_sec <= 0:
+        cut_clip(head_src, dst, source_start_sec, source_duration_sec)
+        return
+    if anchor_src is None:
+        raise ValueError("anchor_src is required when overlap_sec is positive")
+    anchor_duration = video_duration(anchor_src)
+    if anchor_duration + 0.05 < overlap_sec:
+        raise ValueError(f"anchor video is shorter than overlap: {anchor_duration:.3f}s < {overlap_sec:.3f}s")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        tail_path = tmp / "anchor_tail.mp4"
+        source_path = tmp / "source_window.mp4"
+        trim_video(anchor_src, tail_path, max(0.0, anchor_duration - overlap_sec), overlap_sec)
+        cut_clip(head_src, source_path, source_start_sec, source_duration_sec)
+        concat_videos_precise([tail_path, source_path], dst)
+
+
+def rolling_clip_plan(
+    total_duration: float,
+    overlap_sec: int = 1,
+    min_input_sec: int = 4,
+    max_input_sec: int = 15,
+) -> list[dict[str, float | int]]:
+    planned_total = int(math.floor(total_duration + 1e-6))
+    if planned_total <= 0:
+        return []
+    if planned_total < min_input_sec:
+        raise ValueError(f"Cannot make rolling clips for {total_duration:.3f}s within [{min_input_sec}, {max_input_sec}]")
+    if overlap_sec < 0:
+        raise ValueError("overlap_sec must be non-negative")
+    first_max = max_input_sec
+    next_max = max_input_sec - overlap_sec
+    next_min = max(1, min_input_sec - overlap_sec)
+    if next_max < next_min:
+        raise ValueError("overlap_sec leaves no room for source video")
+
+    timeline_durations: list[int] = []
+    remaining = planned_total
+    first = min(first_max, remaining)
+    timeline_durations.append(first)
+    remaining -= first
+    while remaining > 0:
+        chunk = min(next_max, remaining)
+        timeline_durations.append(chunk)
+        remaining -= chunk
+
+    if len(timeline_durations) >= 2 and timeline_durations[-1] < next_min:
+        borrow = next_min - timeline_durations[-1]
+        timeline_durations[-2] -= borrow
+        timeline_durations[-1] += borrow
+
+    for index, timeline_duration in enumerate(timeline_durations):
+        if index == 0:
+            min_timeline = min_input_sec
+            max_timeline = first_max
+        else:
+            min_timeline = next_min
+            max_timeline = next_max
+        if timeline_duration < min_timeline or timeline_duration > max_timeline:
+            raise ValueError(f"Cannot make rolling clips for {total_duration:.3f}s within [{min_input_sec}, {max_input_sec}]")
+
+    plan: list[dict[str, float | int]] = []
+    source_start = 0
+    for index, timeline_duration in enumerate(timeline_durations):
+        overlap = 0 if index == 0 else overlap_sec
+        duration = timeline_duration + overlap
+        plan.append(
+            {
+                "clip_index": index,
+                "start_sec": float(source_start),
+                "duration_sec": float(duration),
+                "source_start_sec": float(source_start),
+                "source_duration_sec": float(timeline_duration),
+                "overlap_sec": float(overlap),
+                "timeline_duration_sec": float(timeline_duration),
+            }
+        )
+        source_start += timeline_duration
+    return plan
+
+
 def clip_plan(total_duration: float, min_sec: float = 4.0, max_sec: float = 15.0) -> list[tuple[float, float]]:
     if total_duration <= 0:
         return []

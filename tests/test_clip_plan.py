@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import unittest
 
-from app.backend.video import clip_plan, requested_seedance_duration
+from app.backend.video import clip_plan, requested_seedance_duration, rolling_clip_plan
 
 
 class ClipPlanTest(unittest.TestCase):
@@ -41,6 +41,23 @@ class ClipPlanTest(unittest.TestCase):
     def test_too_short_episode_fails_clearly(self) -> None:
         with self.assertRaises(ValueError):
             clip_plan(3.9)
+
+    def test_rolling_plan_first_clip_and_overlap(self) -> None:
+        plan = rolling_clip_plan(32)
+        self.assertEqual([item["duration_sec"] for item in plan], [15.0, 15.0, 4.0])
+        self.assertEqual([item["source_start_sec"] for item in plan], [0.0, 15.0, 29.0])
+        self.assertEqual([item["source_duration_sec"] for item in plan], [15.0, 14.0, 3.0])
+        self.assertEqual([item["overlap_sec"] for item in plan], [0.0, 1.0, 1.0])
+        self.assertEqual(sum(item["timeline_duration_sec"] for item in plan), 32.0)
+
+    def test_rolling_plan_short_tail_borrows_before_last_clip(self) -> None:
+        plan = rolling_clip_plan(16)
+        self.assertEqual([item["duration_sec"] for item in plan], [13.0, 4.0])
+        self.assertEqual([item["source_duration_sec"] for item in plan], [13.0, 3.0])
+        for item in plan:
+            self.assertEqual(item["duration_sec"], int(item["duration_sec"]))
+            self.assertGreaterEqual(item["duration_sec"], 4)
+            self.assertLessEqual(item["duration_sec"], 15)
 
 
 if __name__ == "__main__":
