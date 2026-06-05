@@ -1473,6 +1473,44 @@
       return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
     }
 
+    function startButtonProgress(button, label) {
+      const originalText = button.textContent;
+      const originalDisabled = button.disabled;
+      const startedAt = Date.now();
+      let detail = "";
+      const render = () => {
+        const elapsed = formatDuration((Date.now() - startedAt) / 1000);
+        button.textContent = `${label}${detail ? ` · ${detail}` : ""} · ${elapsed}`;
+      };
+      button.disabled = true;
+      render();
+      const timer = window.setInterval(render, 1000);
+      return {
+        update(nextDetail) {
+          detail = nextDetail || "";
+          render();
+        },
+        stop() {
+          window.clearInterval(timer);
+          button.disabled = originalDisabled;
+          button.textContent = originalText;
+        },
+      };
+    }
+
+    async function updateHeadPrepareButtonProgress(uuids, progress) {
+      const data = await api("/api/state");
+      const byUuid = new Map((data.episodes || []).map((episode) => [episode.uuid, episode]));
+      const targetEpisodes = uuids.map((uuid) => byUuid.get(uuid)).filter(Boolean);
+      const done = targetEpisodes.filter((episode) => ["preprocessed", "failed"].includes(episode.status)).length;
+      const running = targetEpisodes.filter((episode) => episode.status === "preprocessing").length;
+      const missing = uuids.length - targetEpisodes.length;
+      const pieces = [`${done}/${uuids.length}`];
+      if (running) pieces.push(`${running} 处理中`);
+      if (missing) pieces.push(`${missing} 等待提交`);
+      progress.update(pieces.join(" · "));
+    }
+
     function formatTimestamp(seconds) {
       if (!seconds) return "-";
       return new Date(Number(seconds) * 1000).toLocaleString();
@@ -2400,27 +2438,43 @@
     });
     $("submitPreprocess").addEventListener("click", async () => {
       const lockTokens = {};
+      let progress = null;
+      let progressTimer = null;
       try {
         const textUuids = uuidsFromText($("episodeText").value);
-        let uuids = textUuids.length ? textUuids : (state.selectedEpisode ? [state.selectedEpisode] : []);
+        const uuids = textUuids.length ? textUuids : (state.selectedEpisode ? [state.selectedEpisode] : []);
         if (!uuids.length) throw new Error("需要在文本框中填写 episode UUID，或先选择一个 episode");
+        progress = startButtonProgress($("submitPreprocess"), "准备 head");
+        progress.update(`锁定 0/${uuids.length}`);
         log("import + head prepare running");
-        for (const uuid of uuids) {
+        for (const [index, uuid] of uuids.entries()) {
           const lock = await api("/api/locks/acquire", {
             method: "POST",
             body: lockPayload("episode", uuid),
           });
           lockTokens[uuid] = lock.token;
+          progress.update(`锁定 ${index + 1}/${uuids.length}`);
         }
+        progress.update(`0/${uuids.length}`);
+        progressTimer = window.setInterval(() => {
+          updateHeadPrepareButtonProgress(uuids, progress).catch(() => {});
+        }, 1500);
         const result = await api("/api/pipeline/submit_preprocess", {
           method: "POST",
           body: { episodes_text: uuids.join("\n"), fetch_remote: true, lock_tokens: lockTokens },
         });
+        progress.update(`${uuids.length}/${uuids.length}`);
         log("import + head prepare finished", result);
         await refresh();
       } catch (err) {
         log(formatApiError(err));
       } finally {
+        if (progressTimer) {
+          window.clearInterval(progressTimer);
+        }
+        if (progress) {
+          progress.stop();
+        }
         await Promise.all(Object.values(lockTokens).map((token) => api("/api/locks/release", {
           method: "POST",
           body: { token, owner_id: state.clientId },
