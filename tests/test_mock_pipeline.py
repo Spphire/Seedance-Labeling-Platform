@@ -203,6 +203,26 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(episode["status"], "preprocessed")
         self.assertTrue(Path(episode["head_video_path"]).exists())
 
+    def test_rolling_generation_runs_imported_pending_clip_with_episode_lock(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000028"
+        source = DATA_DIR / "manual_head_locked.mp4"
+        save_settings({"mock_async": False})
+        self.make_video(source, 8)
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        import_head_video(uuid, str(source), lock.json()["token"])
+        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
+        self.assertEqual(clip["status"], "pending")
+
+        result = queue_rolling_generation(mode="mock")
+
+        self.assertEqual(result[0]["status"], "succeeded")
+        self.assertEqual(result[0]["clip_id"], clip["id"])
+        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clip["id"],))["status"], "generated")
+
     def test_rolling_generation_advances_after_accept_and_reject_reruns_same_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000023"
         save_settings({"mock_async": False})
@@ -1185,7 +1205,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(second.status_code, 200, second.text)
         self.assertEqual(second.json()["owner_name"], "Bob")
 
-    def test_bulk_generation_skips_locked_episode(self) -> None:
+    def test_bulk_generation_ignores_review_episode_lock(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000007"
         now = db.now()
         with db.connect() as conn:
@@ -1212,10 +1232,10 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(locked.status_code, 200, locked.text)
 
         generated = run_generation(mode="mock")
-        self.assertEqual(generated, [])
+        self.assertEqual({item["clip_id"] for item in generated}, {clip["id"] for clip in clips})
         statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips")}
-        self.assertEqual(statuses[clips[0]["id"]], "pending")
-        self.assertEqual(statuses[clips[1]["id"]], "pending")
+        self.assertEqual(statuses[clips[0]["id"]], "generated")
+        self.assertEqual(statuses[clips[1]["id"]], "generated")
 
     def test_episode_lock_blocks_other_operator(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000008"

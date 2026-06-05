@@ -1284,19 +1284,9 @@ def filter_generation_clips(
     strict: bool,
 ) -> list[dict[str, Any]]:
     active_clip_locks = locks_by_resource("clip")
-    active_episode_locks = locks_by_resource("episode")
     available = []
     for clip in clips:
         clip_id = str(clip["id"])
-        episode_uuid = str(clip["episode_uuid"])
-        episode_token = lock_tokens.get(episode_uuid)
-        if episode_uuid in active_episode_locks:
-            if episode_token:
-                require_lock("episode", episode_uuid, episode_token)
-            elif strict:
-                require_lock("episode", episode_uuid, None)
-            else:
-                continue
         clip_token = lock_tokens.get(clip_id)
         if clip_id in active_clip_locks:
             if clip_token:
