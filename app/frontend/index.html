@@ -978,7 +978,7 @@
       renewTimer: null,
       clientId: "",
       reviewerName: "",
-      clipLocks: {},
+      episodeLocks: {},
       workspaceSignature: "",
       settingsDirty: false,
       runDefaultsInitialized: false,
@@ -1322,8 +1322,17 @@
       return escapeHtml(value);
     }
 
+    function clipById(clipId) {
+      return state.clips.find((item) => item.id === clipId) || null;
+    }
+
+    function myEpisodeLock(uuid) {
+      return state.episodeLocks[String(uuid)] || null;
+    }
+
     function myClipLock(clipId) {
-      return state.clipLocks[String(clipId)] || null;
+      const clip = clipById(clipId);
+      return clip ? myEpisodeLock(clip.episode_uuid) : null;
     }
 
     function isMine(lock) {
@@ -1343,17 +1352,17 @@
     function reconcileLocks() {
       const serverLocks = new Map(
         (state.locks || [])
-          .filter((lock) => lock.resource_type === "clip")
+          .filter((lock) => lock.resource_type === "episode")
           .map((lock) => [String(lock.resource_id), lock])
       );
-      Object.keys(state.clipLocks).forEach((clipId) => {
-        const serverLock = serverLocks.get(clipId);
+      Object.keys(state.episodeLocks).forEach((uuid) => {
+        const serverLock = serverLocks.get(uuid);
         if (!serverLock || !isMine(serverLock)) {
-          delete state.clipLocks[clipId];
+          delete state.episodeLocks[uuid];
         }
       });
       state.clips.forEach((clip) => {
-        const serverLock = serverLocks.get(String(clip.id));
+        const serverLock = serverLocks.get(String(clip.episode_uuid));
         if (serverLock) {
           clip.lock = serverLock;
         }
@@ -1372,13 +1381,15 @@
     }
 
     async function acquireClipLock(clipId, force = false) {
+      const clip = clipById(clipId);
+      if (!clip) return null;
       try {
         const lock = await api("/api/locks/acquire", {
           method: "POST",
-          body: lockPayload("clip", clipId, force),
+          body: lockPayload("episode", clip.episode_uuid, force),
         });
-        state.clipLocks[String(clipId)] = lock;
-        log(`clip ${clipId} locked by ${state.reviewerName}`);
+        state.episodeLocks[String(clip.episode_uuid)] = lock;
+        log(`episode ${shortUuid(clip.episode_uuid)} locked by ${state.reviewerName}`);
         await refresh();
         return lock;
       } catch (err) {
@@ -1389,6 +1400,8 @@
     }
 
     async function renewClipLock(clipId) {
+      const clip = clipById(clipId);
+      if (!clip) return null;
       const lock = myClipLock(clipId);
       if (!lock) return null;
       try {
@@ -1396,10 +1409,10 @@
           method: "POST",
           body: { token: lock.token, owner_id: state.clientId, ttl_sec: 90 },
         });
-        state.clipLocks[String(clipId)] = renewed;
+        state.episodeLocks[String(clip.episode_uuid)] = renewed;
         return renewed;
       } catch (err) {
-        delete state.clipLocks[String(clipId)];
+        delete state.episodeLocks[String(clip.episode_uuid)];
         log(formatApiError(err));
         await refresh();
         return null;
@@ -1407,8 +1420,16 @@
     }
 
     async function releaseClipLock(clipId) {
+      const clip = clipById(clipId);
+      if (!clip) return;
       const lock = myClipLock(clipId);
-      delete state.clipLocks[String(clipId)];
+      const hasOtherOpenClipInEpisode = state.tabs.some((tabClipId) => {
+        if (tabClipId === clipId) return false;
+        const tabClip = clipById(tabClipId);
+        return tabClip && tabClip.episode_uuid === clip.episode_uuid;
+      });
+      if (hasOtherOpenClipInEpisode) return;
+      delete state.episodeLocks[String(clip.episode_uuid)];
       if (!lock) return;
       try {
         await api("/api/locks/release", {
@@ -1440,9 +1461,12 @@
         clearTimeout(state.renewTimer);
         state.renewTimer = null;
       }
-      if (!Object.keys(state.clipLocks).length) return;
+      if (!Object.keys(state.episodeLocks).length) return;
       state.renewTimer = setTimeout(async () => {
-        await Promise.all(Object.keys(state.clipLocks).map((clipId) => renewClipLock(clipId)));
+        await Promise.all(Object.keys(state.episodeLocks).map(async (uuid) => {
+          const clip = state.clips.find((item) => item.episode_uuid === uuid);
+          if (clip) await renewClipLock(clip.id);
+        }));
         scheduleRenewals();
       }, 30000);
     }
@@ -2128,17 +2152,17 @@
       }
       const lock = myClipLock(clip.id) || clip.lock;
       if (canEdit) {
-        return `<div class="notice">你正在锁定这个 clip，可以安全审核。锁会自动续租，关闭标签页会释放。</div>`;
+        return `<div class="notice">你正在锁定这个 episode，可以安全审核其中的 clips。锁会自动续租，关闭这个 episode 的最后一个标签页会释放。</div>`;
       }
       if (lock) {
         return `
           <div class="notice locked">
-            这个 clip 正在被 ${lock.owner_name || "其他人"} 审核，当前为只读模式。
+            这个 episode 正在被 ${lock.owner_name || "其他人"} 审核，当前为只读模式。
             <button data-action="takeover-lock">接管锁</button>
           </div>
         `;
       }
-      return `<div class="notice locked">这个 clip 尚未拿到编辑锁，正在尝试锁定。若一直不可编辑，请刷新或重新打开标签页。</div>`;
+      return `<div class="notice locked">这个 episode 尚未拿到编辑锁，正在尝试锁定。若一直不可编辑，请刷新或重新打开标签页。</div>`;
     }
 
     function renderJobNotice(job) {
@@ -2272,7 +2296,7 @@
           try {
             const lock = myClipLock(clip.id);
             if (!lock) {
-              throw new Error("这个 clip 没有编辑锁，不能提交审核操作");
+              throw new Error("这个 episode 没有编辑锁，不能提交审核操作");
             }
             if (action === "rerun") {
               const mode = $("generationMode").value || "mock";
@@ -2362,8 +2386,8 @@
     });
 
     window.addEventListener("beforeunload", () => {
-      Object.keys(state.clipLocks).forEach((clipId) => {
-        const lock = state.clipLocks[clipId];
+      Object.keys(state.episodeLocks).forEach((uuid) => {
+        const lock = state.episodeLocks[uuid];
         if (!lock) return;
         const body = JSON.stringify({ token: lock.token, owner_id: state.clientId });
         navigator.sendBeacon?.("/api/locks/release", new Blob([body], { type: "application/json" }));

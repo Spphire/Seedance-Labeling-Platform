@@ -181,7 +181,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(stream["avg_frame_rate"], "30/1")
         self.assertAlmostEqual(float(info["format"]["duration"]), 8.0, delta=0.25)
 
-    def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
+    def test_import_head_video_prepares_first_pending_rolling_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"
         source = DATA_DIR / "manual_head.mp4"
         self.make_video(source, 8)
@@ -193,8 +193,12 @@ class MockPipelineTest(unittest.TestCase):
 
         result = import_head_video(uuid, str(source), lock.json()["token"])
 
-        self.assertEqual(result["clips"], [])
-        self.assertEqual(db.rows("SELECT * FROM clips WHERE episode_uuid=?", (uuid,)), [])
+        self.assertEqual(len(result["clips"]), 1)
+        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
+        self.assertEqual(clip["input_kind"], "rolling")
+        self.assertEqual(clip["status"], "pending")
+        self.assertEqual(clip["duration_sec"], 8.0)
+        self.assertTrue(Path(clip["local_path"]).exists())
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertEqual(episode["status"], "preprocessed")
         self.assertTrue(Path(episode["head_video_path"]).exists())
@@ -215,6 +219,9 @@ class MockPipelineTest(unittest.TestCase):
 
         accepted = review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
         self.assertIsNone(accepted["final"])
+        self.assertIsNotNone(accepted["next_clip"])
+        self.assertEqual(accepted["next_clip"]["status"], "pending")
+        self.assertEqual(accepted["next_clip"]["clip_index"], 1)
         second = queue_rolling_generation(mode="mock")
         self.assertEqual(second[0]["status"], "succeeded")
         clip_1 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
@@ -230,6 +237,23 @@ class MockPipelineTest(unittest.TestCase):
         after_count = db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=?", (uuid,))["count"]
         self.assertEqual(rerun[0]["clip_id"], clip_1["id"])
         self.assertEqual(before_count, after_count)
+
+    def test_rejecting_accepted_rolling_clip_deletes_future_pending_clip(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000027"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 32)
+        first = queue_rolling_generation(mode="mock")
+        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
+        review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
+        pending_next = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
+        self.assertIsNotNone(pending_next)
+        self.assertEqual(pending_next["status"], "pending")
+
+        rejected = review_clip(clip_0["id"], "reject", first[0]["job_id"], require_lock_token=False)
+
+        self.assertEqual(rejected["deleted_future_clip_count"], 1)
+        self.assertIsNone(db.one("SELECT * FROM clips WHERE id=?", (pending_next["id"],)))
+        self.assertFalse(Path(pending_next["local_path"]).exists())
 
     def test_rolling_generation_api_endpoint_creates_next_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000026"
@@ -649,7 +673,7 @@ class MockPipelineTest(unittest.TestCase):
         clip_id = clips[0]["id"]
         lock = self.client.post(
             "/api/locks/acquire",
-            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "alice", "owner_name": "Alice"},
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
         )
         self.assertEqual(lock.status_code, 200, lock.text)
         with db.connect() as conn:
@@ -752,7 +776,7 @@ class MockPipelineTest(unittest.TestCase):
         clip_id = clips[0]["id"]
         lock = self.client.post(
             "/api/locks/acquire",
-            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "client-a", "owner_name": "Alice"},
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "client-a", "owner_name": "Alice"},
         )
         self.assertEqual(lock.status_code, 200, lock.text)
 
@@ -796,7 +820,7 @@ class MockPipelineTest(unittest.TestCase):
         clip_id = clips[0]["id"]
         lock = self.client.post(
             "/api/locks/acquire",
-            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "alice", "owner_name": "Alice"},
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
         )
         self.assertEqual(lock.status_code, 200, lock.text)
         with db.connect() as conn:
@@ -953,7 +977,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(resolved, source_root / uuid)
         self.assertFalse(local_dir.exists())
 
-    def test_preprocess_skips_head_ready_episode_without_creating_clips(self) -> None:
+    def test_preprocess_skips_head_ready_episode_and_ensures_first_pending_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000017"
         now = db.now()
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
@@ -976,8 +1000,12 @@ class MockPipelineTest(unittest.TestCase):
         skipped = preprocess_one(uuid, load_settings(), fetch_remote=False, lock_token=token)
 
         self.assertEqual(skipped["status"], "skipped")
-        self.assertEqual(skipped["clip_count"], 0)
-        self.assertEqual(db.rows("SELECT * FROM clips WHERE episode_uuid=?", (uuid,)), [])
+        self.assertEqual(skipped["clip_count"], 1)
+        self.assertEqual(len(skipped["clips"]), 1)
+        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
+        self.assertEqual(clip["input_kind"], "rolling")
+        self.assertEqual(clip["status"], "pending")
+        self.assertTrue(Path(clip["local_path"]).exists())
 
     def test_submit_and_preprocess_combined_endpoint_submits_before_preprocess(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000018"
@@ -1089,7 +1117,7 @@ class MockPipelineTest(unittest.TestCase):
         for clip in clips:
             self.assertIn(("clip", str(clip["id"])), resources)
 
-    def test_clip_lock_required_for_review_api(self) -> None:
+    def test_episode_lock_required_for_review_api(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000005"
         clips, results = self.make_episode_with_generated_clip(uuid)
         clip_id = clips[0]["id"]
@@ -1101,8 +1129,8 @@ class MockPipelineTest(unittest.TestCase):
         lock = self.client.post(
             "/api/locks/acquire",
             json={
-                "resource_type": "clip",
-                "resource_id": str(clip_id),
+                "resource_type": "episode",
+                "resource_id": uuid,
                 "owner_id": "alice",
                 "owner_name": "Alice",
             },
@@ -1127,19 +1155,18 @@ class MockPipelineTest(unittest.TestCase):
 
     def test_lock_renew_release_and_reacquire(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000006"
-        clips, _ = self.make_episode_with_generated_clip(uuid)
-        clip_id = clips[0]["id"]
+        self.make_episode_with_generated_clip(uuid)
 
         first = self.client.post(
             "/api/locks/acquire",
-            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "alice", "owner_name": "Alice"},
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
         )
         self.assertEqual(first.status_code, 200, first.text)
         token = first.json()["token"]
 
         blocked = self.client.post(
             "/api/locks/acquire",
-            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "bob", "owner_name": "Bob"},
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "bob", "owner_name": "Bob"},
         )
         self.assertEqual(blocked.status_code, 409, blocked.text)
 
@@ -1153,12 +1180,12 @@ class MockPipelineTest(unittest.TestCase):
 
         second = self.client.post(
             "/api/locks/acquire",
-            json={"resource_type": "clip", "resource_id": str(clip_id), "owner_id": "bob", "owner_name": "Bob"},
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "bob", "owner_name": "Bob"},
         )
         self.assertEqual(second.status_code, 200, second.text)
         self.assertEqual(second.json()["owner_name"], "Bob")
 
-    def test_bulk_generation_skips_locked_clip(self) -> None:
+    def test_bulk_generation_skips_locked_episode(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000007"
         now = db.now()
         with db.connect() as conn:
@@ -1176,8 +1203,8 @@ class MockPipelineTest(unittest.TestCase):
         locked = self.client.post(
             "/api/locks/acquire",
             json={
-                "resource_type": "clip",
-                "resource_id": str(clips[0]["id"]),
+                "resource_type": "episode",
+                "resource_id": uuid,
                 "owner_id": "alice",
                 "owner_name": "Alice",
             },
@@ -1185,13 +1212,12 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(locked.status_code, 200, locked.text)
 
         generated = run_generation(mode="mock")
-        self.assertEqual(len(generated), 1)
-        self.assertEqual(generated[0]["clip_id"], clips[1]["id"])
+        self.assertEqual(generated, [])
         statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips")}
         self.assertEqual(statuses[clips[0]["id"]], "pending")
-        self.assertEqual(statuses[clips[1]["id"]], "generated")
+        self.assertEqual(statuses[clips[1]["id"]], "pending")
 
-    def test_episode_mutation_blocked_by_active_clip_lock(self) -> None:
+    def test_episode_lock_blocks_other_operator(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000008"
         now = db.now()
         with db.connect() as conn:
@@ -1204,25 +1230,26 @@ class MockPipelineTest(unittest.TestCase):
             )
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
         self.make_video(head, 5)
-        clips = create_clips(uuid, head, 5)
-        clip_lock = self.client.post(
+        create_clips(uuid, head, 5)
+        episode_lock = self.client.post(
             "/api/locks/acquire",
             json={
-                "resource_type": "clip",
-                "resource_id": str(clips[0]["id"]),
+                "resource_type": "episode",
+                "resource_id": uuid,
                 "owner_id": "alice",
                 "owner_name": "Alice",
             },
         )
-        self.assertEqual(clip_lock.status_code, 200, clip_lock.text)
-        episode_lock = self.client.post(
+        self.assertEqual(episode_lock.status_code, 200, episode_lock.text)
+        blocked = self.client.post(
             "/api/locks/acquire",
             json={"resource_type": "episode", "resource_id": uuid, "owner_id": "bob", "owner_name": "Bob"},
         )
-        self.assertEqual(episode_lock.status_code, 200, episode_lock.text)
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertEqual(blocked.json()["detail"]["lock"]["owner_name"], "Alice")
         res = self.client.post(
             "/api/pipeline/preprocess",
-            json={"uuids": [uuid], "fetch_remote": False, "lock_tokens": {uuid: episode_lock.json()["token"]}},
+            json={"uuids": [uuid], "fetch_remote": False, "lock_tokens": {uuid: "wrong-token"}},
         )
         self.assertEqual(res.status_code, 409, res.text)
         self.assertEqual(res.json()["detail"]["lock"]["owner_name"], "Alice")

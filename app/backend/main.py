@@ -160,6 +160,9 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
         lock_tokens = {}
         if payload.clip_ids and payload.lock_token:
             lock_tokens = {str(clip_id): payload.lock_token for clip_id in payload.clip_ids}
+            placeholders = ",".join("?" for _ in payload.clip_ids)
+            rows = db.rows(f"SELECT id, episode_uuid FROM clips WHERE id IN ({placeholders})", payload.clip_ids)
+            lock_tokens.update({str(row["episode_uuid"]): payload.lock_token for row in rows})
         return queue_generation(
             payload.mode,
             payload.clip_ids,
