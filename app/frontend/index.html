@@ -2298,6 +2298,17 @@
             if (!lock) {
               throw new Error("这个 episode 没有编辑锁，不能提交审核操作");
             }
+            if (action === "reject") {
+              const futureCount = state.clips.filter((item) =>
+                item.episode_uuid === clip.episode_uuid
+                && item.input_kind === "rolling"
+                && Number(item.clip_index) > Number(clip.clip_index)
+              ).length;
+              const message = futureCount
+                ? `确认 Reject 这个 clip？\n\n这是 rolling 流程，后续 ${futureCount} 个 clip 会被删除，需要从当前 clip 重新生成。`
+                : "确认 Reject 这个 clip？";
+              if (!window.confirm(message)) return;
+            }
             if (action === "rerun") {
               const mode = $("generationMode").value || "mock";
               const result = await api(`/api/clips/${clip.id}/retry`, {
