@@ -11,6 +11,7 @@ from .paths import CONFIG_DIR, REFERENCE_IMAGES_DIR, ROOT
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 SECRET_KEYS = {"seedance_api_key"}
 DEFAULT_PUBLIC_BASE_URL = "http://106.14.2.243:18080"
+DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND = 0.2
 DEFAULT_PROMPT = (
     "把@视频1中的真人手换成@图片1@图片2的机械臂，"
     "把@视频1中真人手臂换成@图片3@图片4中的机械臂，"
@@ -81,7 +82,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "generation_mode": "mock",
     "mock_concurrency": 8,
     "mock_async": True,
-    "mock_seconds_per_video_second": 24,
+    "mock_seconds_per_video_second": DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND,
     "seedance_concurrency": 3,
     "seedance_model": "doubao-seedance-2-0-fast-260128",
     "seedance_base_url": "https://ark.cn-beijing.volces.com/api/v3",
@@ -238,6 +239,13 @@ def _settings_from_disk() -> dict[str, Any]:
         return dict(DEFAULT_SETTINGS)
     data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     changed = False
+    try:
+        mock_seconds = float(data.get("mock_seconds_per_video_second", DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND))
+    except (TypeError, ValueError):
+        mock_seconds = DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND
+    if mock_seconds > DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND:
+        data["mock_seconds_per_video_second"] = DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND
+        changed = True
     if _normalize_generation_presets(data):
         changed = True
     if changed:

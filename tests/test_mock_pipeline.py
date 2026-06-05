@@ -31,6 +31,7 @@ from app.backend.services import (
 )
 from app.backend.settings import (
     DEFAULT_PROMPT,
+    DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND,
     DEFAULT_SETTINGS,
     GENERATION_PRESETS_VERSION,
     IPHONE2DEPLOY_PROMPT,
@@ -830,6 +831,18 @@ class MockPipelineTest(unittest.TestCase):
         data = res.json()
         self.assertNotIn("seedance_api_key", data)
         self.assertTrue(data["seedance_api_key_set"])
+
+    def test_old_mock_timing_is_migrated_to_fast_default(self) -> None:
+        SETTINGS_PATH.write_text(json.dumps({"mock_seconds_per_video_second": 24}, ensure_ascii=False), encoding="utf-8")
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["mock_seconds_per_video_second"], DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND)
+        self.assertEqual(persisted["mock_seconds_per_video_second"], DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND)
+
+        save_settings({"mock_seconds_per_video_second": 0.02})
+        self.assertEqual(load_settings()["mock_seconds_per_video_second"], 0.02)
 
     def test_env_api_key_sets_public_flag_without_persisting_secret(self) -> None:
         save_settings({"seedance_api_key": ""})
