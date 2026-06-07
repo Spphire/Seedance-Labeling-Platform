@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import imageio_ffmpeg
 
@@ -28,6 +28,45 @@ def run_ffmpeg(args: list[str]) -> None:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {' '.join(cmd)}\n{proc.stderr}")
+
+
+def run_ffmpeg_cancellable(args: list[str], should_cancel: Callable[[], bool] | None = None) -> None:
+    if should_cancel is None:
+        run_ffmpeg(args)
+        return
+    cmd = [ffmpeg_path(), "-hide_banner", "-y", *args]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stdout = ""
+    stderr = ""
+    try:
+        while True:
+            if should_cancel():
+                proc.terminate()
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                raise RuntimeError("ffmpeg cancelled")
+            try:
+                stdout, stderr = proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {' '.join(cmd)}\n{stderr}")
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        raise
 
 
 def ffprobe_json(path: Path) -> dict[str, Any]:
@@ -189,7 +228,7 @@ def stitch_videos(inputs: list[Path], dst: Path) -> None:
         list_path.unlink(missing_ok=True)
 
 
-def concat_videos_precise(inputs: list[Path], dst: Path) -> None:
+def concat_videos_precise(inputs: list[Path], dst: Path, should_cancel: Callable[[], bool] | None = None) -> None:
     if not inputs:
         raise ValueError("inputs must not be empty")
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -204,7 +243,7 @@ def concat_videos_precise(inputs: list[Path], dst: Path) -> None:
         "".join(f"[v{index}]" for index in range(len(inputs)))
         + f"concat=n={len(inputs)}:v=1:a=0,fps=30,format=yuv420p[v]"
     )
-    run_ffmpeg(
+    run_ffmpeg_cancellable(
         [
             *args,
             "-filter_complex",
@@ -219,13 +258,20 @@ def concat_videos_precise(inputs: list[Path], dst: Path) -> None:
             "-movflags",
             "+faststart",
             str(dst),
-        ]
+        ],
+        should_cancel,
     )
 
 
-def trim_video(src: Path, dst: Path, start_sec: float, duration_sec: float) -> None:
+def trim_video(
+    src: Path,
+    dst: Path,
+    start_sec: float,
+    duration_sec: float,
+    should_cancel: Callable[[], bool] | None = None,
+) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    run_ffmpeg(
+    run_ffmpeg_cancellable(
         [
             "-i",
             str(src),
@@ -243,15 +289,23 @@ def trim_video(src: Path, dst: Path, start_sec: float, duration_sec: float) -> N
             "-movflags",
             "+faststart",
             str(dst),
-        ]
+        ],
+        should_cancel,
     )
 
 
-def black_video(dst: Path, duration_sec: float, width: int = 760, height: int = 570, fps: int = 30) -> None:
+def black_video(
+    dst: Path,
+    duration_sec: float,
+    width: int = 760,
+    height: int = 570,
+    fps: int = 30,
+    should_cancel: Callable[[], bool] | None = None,
+) -> None:
     if duration_sec <= 0:
         raise ValueError("duration_sec must be positive")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    run_ffmpeg(
+    run_ffmpeg_cancellable(
         [
             "-f",
             "lavfi",
@@ -267,7 +321,8 @@ def black_video(dst: Path, duration_sec: float, width: int = 760, height: int = 
             "-movflags",
             "+faststart",
             str(dst),
-        ]
+        ],
+        should_cancel,
     )
 
 

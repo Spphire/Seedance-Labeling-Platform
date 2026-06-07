@@ -43,7 +43,7 @@ from app.backend.settings import (
     public_settings,
     save_settings,
 )
-from app.backend.video import ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
+from app.backend.video import black_video, ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
 from app.seedance.client import SeedanceClient, resolve_image_value
 
 
@@ -394,6 +394,10 @@ class MockPipelineTest(unittest.TestCase):
         self.assertIsNone(episode["preview_video_path"])
         self.assertEqual(episode["preview_status"], "missing")
         self.assertEqual(episode["preview_version"], 4)
+
+    def test_preview_video_work_can_cancel_ffmpeg(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ffmpeg cancelled"):
+            black_video(DATA_DIR / "cancelled_preview.mp4", 5, should_cancel=lambda: True)
 
     def test_frontend_label_and_admin_routes_are_served(self) -> None:
         FRONTEND_DIR.mkdir(parents=True, exist_ok=True)

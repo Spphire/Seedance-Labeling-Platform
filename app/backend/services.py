@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import db
 from .ids import parse_uuids
@@ -1846,6 +1846,11 @@ def _preview_episode_worker(uuid: str, version: int) -> None:
                 _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, latest_version)
 
 
+def _preview_is_stale(uuid: str, version: int) -> bool:
+    episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
+    return not episode or int(episode.get("preview_version") or 0) != version
+
+
 def preview_episode(uuid: str, version: int) -> dict[str, Any]:
     uuid = uuid.lower()
     clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
@@ -1863,6 +1868,8 @@ def preview_episode(uuid: str, version: int) -> dict[str, Any]:
             path = Path(review["accepted_path"])
             if path.exists():
                 accepted_by_id[int(clip["id"])] = path
+    if _preview_is_stale(uuid, version):
+        return {"uuid": uuid, "preview_status": "stitching", "stale": True}
     if not accepted_by_id:
         with db.connect() as conn:
             conn.execute(
@@ -1876,11 +1883,12 @@ def preview_episode(uuid: str, version: int) -> dict[str, Any]:
         return {"uuid": uuid, "preview_status": "missing", "reason": "no accepted clips"}
     out = FINAL_DIR / f"{uuid}_preview_accepted_with_black.mp4"
     tmp = FINAL_DIR / f".{uuid}_preview-{version}-{int(time.time() * 1000)}.mp4"
+    should_cancel = lambda: _preview_is_stale(uuid, version)
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
-            stitch_inputs = preview_stitch_inputs(uuid, clips, accepted_by_id, tmp_root)
-            concat_videos_precise(stitch_inputs, tmp)
+            stitch_inputs = preview_stitch_inputs(uuid, clips, accepted_by_id, tmp_root, should_cancel)
+            concat_videos_precise(stitch_inputs, tmp, should_cancel=should_cancel)
         episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
         if not episode or int(episode.get("preview_version") or 0) != version:
             tmp.unlink(missing_ok=True)
@@ -1906,7 +1914,12 @@ def preview_stitch_inputs(
     clips: list[dict[str, Any]],
     accepted_by_id: dict[int, Path],
     tmp_root: Path,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[Path]:
+    def check_cancelled() -> None:
+        if should_cancel and should_cancel():
+            raise RuntimeError("preview cancelled")
+
     rolling = [clip for clip in clips if clip.get("input_kind") == "rolling"]
     if rolling and len(rolling) == len(clips):
         episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
@@ -1914,6 +1927,7 @@ def preview_stitch_inputs(
         by_index = {int(clip["clip_index"]): clip for clip in rolling}
         items: list[Path] = []
         for plan_item in plan:
+            check_cancelled()
             index = int(plan_item["clip_index"])
             clip = by_index.get(index)
             timeline = float(plan_item["timeline_duration_sec"])
@@ -1922,18 +1936,19 @@ def preview_stitch_inputs(
                 accepted_path = accepted_by_id[int(clip["id"])]
                 if overlap > 0:
                     trimmed = tmp_root / f"preview_clip_{index:04d}_trimmed.mp4"
-                    trim_video(accepted_path, trimmed, overlap, timeline)
+                    trim_video(accepted_path, trimmed, overlap, timeline, should_cancel=should_cancel)
                     items.append(trimmed)
                 else:
                     items.append(accepted_path)
             else:
                 black = tmp_root / f"preview_clip_{index:04d}_black.mp4"
-                black_video(black, timeline)
+                black_video(black, timeline, should_cancel=should_cancel)
                 items.append(black)
         return items
 
     items = []
     for clip in clips:
+        check_cancelled()
         timeline = float(clip.get("timeline_duration_sec") or clip.get("duration_sec") or 0)
         if timeline <= 0:
             continue
@@ -1941,7 +1956,7 @@ def preview_stitch_inputs(
             items.append(accepted_by_id[int(clip["id"])])
         else:
             black = tmp_root / f"preview_clip_{int(clip['clip_index']):04d}_black.mp4"
-            black_video(black, timeline)
+            black_video(black, timeline, should_cancel=should_cancel)
             items.append(black)
     return items
 
