@@ -13,6 +13,7 @@ os.environ["SEEDANCE_PLATFORM_ROOT"] = str(Path(__file__).resolve().parent / "_t
 from fastapi.testclient import TestClient
 
 from app.backend import db
+from app.backend import services as backend_services
 from app.backend.main import FRONTEND_DIR, app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
@@ -23,6 +24,7 @@ from app.backend.services import (
     list_clips,
     preprocess_one,
     queue_generation,
+    queue_preview_episode,
     queue_rolling_generation,
     queue_stitch_episode,
     refresh_clip_public_urls,
@@ -47,6 +49,10 @@ from app.seedance.client import SeedanceClient, resolve_image_value
 
 class MockPipelineTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.wait_for_background_idle()
+        with backend_services._PREVIEW_LOCK, backend_services._STITCH_LOCK:
+            backend_services._PREVIEWING_EPISODES.clear()
+            backend_services._STITCHING_EPISODES.clear()
         save_settings(dict(DEFAULT_SETTINGS))
         self.unlink_with_retry(DB_PATH)
         for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR]:
@@ -54,6 +60,19 @@ class MockPipelineTest(unittest.TestCase):
             directory.mkdir(parents=True, exist_ok=True)
         db.init_db()
         self.client = TestClient(app)
+
+    def wait_for_background_idle(self, timeout_sec: float = 10.0) -> None:
+        deadline = time.time() + timeout_sec
+        previewing: set[str] = set()
+        stitching: set[str] = set()
+        while time.time() < deadline:
+            with backend_services._PREVIEW_LOCK, backend_services._STITCH_LOCK:
+                previewing = set(backend_services._PREVIEWING_EPISODES)
+                stitching = set(backend_services._STITCHING_EPISODES)
+            if not previewing and not stitching:
+                return
+            time.sleep(0.1)
+        self.fail(f"background workers did not become idle: preview={previewing}, stitch={stitching}")
 
     def unlink_with_retry(self, path: Path) -> None:
         for attempt in range(20):
@@ -86,6 +105,18 @@ class MockPipelineTest(unittest.TestCase):
                 return last
             time.sleep(0.1)
         self.fail(f"final did not become ready, last episode state: {last}")
+
+    def wait_for_preview_ready(self, uuid: str, timeout_sec: float = 10.0) -> dict:
+        deadline = time.time() + timeout_sec
+        last = None
+        while time.time() < deadline:
+            last = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+            if last and last["preview_status"] == "ready":
+                return last
+            if last and last["preview_status"] == "failed":
+                self.fail(f"preview failed: {last}")
+            time.sleep(0.1)
+        self.fail(f"preview did not become ready, last episode state: {last}")
 
     def make_video(self, path: Path, duration: float) -> None:
         run_ffmpeg(
@@ -319,6 +350,50 @@ class MockPipelineTest(unittest.TestCase):
         episode = self.wait_for_final_ready(uuid)
         info = ffprobe_json(Path(episode["final_video_path"])) or ffmpeg_probe_fallback(Path(episode["final_video_path"]))
         self.assertAlmostEqual(float(info["format"]["duration"]), 18.0, delta=0.35)
+
+    def test_partial_rolling_preview_uses_black_for_unaccepted_timeline(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000029"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 18)
+
+        first = queue_rolling_generation(mode="mock")
+        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
+        result = review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
+
+        self.assertIsNone(result["final"])
+        self.assertEqual(result["preview"]["preview_status"], "stitching")
+        episode = self.wait_for_preview_ready(uuid)
+        self.assertNotEqual(episode["final_status"], "ready")
+        preview = Path(episode["preview_video_path"])
+        self.assertTrue(preview.exists())
+        info = ffprobe_json(preview) or ffmpeg_probe_fallback(preview)
+        self.assertAlmostEqual(float(info["format"]["duration"]), 18.0, delta=0.4)
+
+        clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+        self.assertEqual([clip["status"] for clip in clips], ["accepted", "pending"])
+        self.assertEqual(clips[1]["timeline_duration_sec"], 3.0)
+
+    def test_preview_path_clears_when_no_clips_are_accepted(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000030"
+        self.make_head_ready_episode(uuid, 18)
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET preview_video_path=?, preview_status='ready', preview_version=3, updated_at=?
+                WHERE uuid=?
+                """,
+                (str((FINAL_DIR / "stale-preview.mp4").resolve()), now, uuid),
+            )
+
+        result = queue_preview_episode(uuid)
+
+        self.assertFalse(result["queued"])
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertIsNone(episode["preview_video_path"])
+        self.assertEqual(episode["preview_status"], "missing")
+        self.assertEqual(episode["preview_version"], 4)
 
     def test_frontend_label_and_admin_routes_are_served(self) -> None:
         FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
@@ -1129,13 +1204,19 @@ class MockPipelineTest(unittest.TestCase):
         with patch("app.backend.services._STITCH_EXECUTOR.submit") as submit:
             result = queue_stitch_episode(uuid, check_episode_lock=False)
 
-        self.assertTrue(result["queued"])
-        submit.assert_called_once()
-        locks = db.rows("SELECT * FROM resource_locks WHERE owner_id='system-stitcher'")
-        resources = {(row["resource_type"], row["resource_id"]) for row in locks}
-        self.assertIn(("episode", uuid), resources)
-        for clip in clips:
-            self.assertIn(("clip", str(clip["id"])), resources)
+        try:
+            self.assertTrue(result["queued"])
+            submit.assert_called_once()
+            locks = db.rows("SELECT * FROM resource_locks WHERE owner_id='system-stitcher'")
+            resources = {(row["resource_type"], row["resource_id"]) for row in locks}
+            self.assertIn(("episode", uuid), resources)
+            for clip in clips:
+                self.assertIn(("clip", str(clip["id"])), resources)
+        finally:
+            with backend_services._STITCH_LOCK:
+                backend_services._STITCHING_EPISODES.discard(uuid)
+            with db.connect() as conn:
+                conn.execute("DELETE FROM resource_locks WHERE owner_id='system-stitcher'")
 
     def test_episode_lock_required_for_review_api(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000005"

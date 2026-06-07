@@ -48,6 +48,10 @@ def init_db() -> None:
                 head_video_path TEXT,
                 final_video_path TEXT,
                 final_status TEXT NOT NULL DEFAULT 'missing',
+                preview_video_path TEXT,
+                preview_status TEXT NOT NULL DEFAULT 'missing',
+                preview_version INTEGER NOT NULL DEFAULT 0,
+                preview_error TEXT,
                 error TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -169,6 +173,12 @@ def init_db() -> None:
         conn.execute("UPDATE clips SET source_duration_sec=duration_sec WHERE source_duration_sec IS NULL")
         conn.execute("UPDATE clips SET timeline_duration_sec=duration_sec WHERE timeline_duration_sec IS NULL")
         conn.execute("UPDATE clips SET input_kind='split' WHERE input_kind IS NULL OR input_kind=''")
+        _ensure_column(conn, "episodes", "preview_video_path", "TEXT")
+        _ensure_column(conn, "episodes", "preview_status", "TEXT NOT NULL DEFAULT 'missing'")
+        _ensure_column(conn, "episodes", "preview_version", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "episodes", "preview_error", "TEXT")
+        conn.execute("UPDATE episodes SET preview_status='missing' WHERE preview_status IS NULL OR preview_status=''")
+        conn.execute("UPDATE episodes SET preview_version=0 WHERE preview_version IS NULL")
         _ensure_column(conn, "reviews", "operator_id", "TEXT")
         _ensure_column(conn, "reviews", "operator_name", "TEXT")
         conn.execute(

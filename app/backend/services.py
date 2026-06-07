@@ -17,6 +17,7 @@ from .nedf import extract_head_video, fetch_episode
 from .paths import ACCEPTED_DIR, CLIPS_DIR, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
 from .settings import load_settings, public_url_for
 from .video import (
+    black_video,
     clip_plan,
     concat_videos_precise,
     compose_rolling_input,
@@ -35,6 +36,9 @@ from ..seedance.client import SeedanceClient
 _STITCH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="seedance-stitch")
 _STITCH_LOCK = threading.Lock()
 _STITCHING_EPISODES: set[str] = set()
+_PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="seedance-preview")
+_PREVIEW_LOCK = threading.Lock()
+_PREVIEWING_EPISODES: set[str] = set()
 STITCH_LOCK_OWNER_ID = "system-stitcher"
 STITCH_LOCK_OWNER_NAME = "系统合成"
 STITCH_LOCK_TTL_SEC = 60 * 60 * 24
@@ -134,6 +138,8 @@ def list_episodes() -> list[dict[str, Any]]:
         episode["head_video_url"] = static_url_from_path(head_path, HEAD_VIDEOS_DIR, "head_videos") if head_path else None
         final_path = episode.get("final_video_path")
         episode["final_url"] = static_url_from_path(final_path, FINAL_DIR, "final") if final_path else None
+        preview_path = episode.get("preview_video_path")
+        episode["preview_url"] = static_url_from_path(preview_path, FINAL_DIR, "final") if preview_path else None
     return episodes
 
 
@@ -1743,6 +1749,7 @@ def review_clip(
         if decision == "accept"
         else None
     )
+    preview = queue_preview_episode(clip["episode_uuid"])
     final = maybe_stitch_episode(clip["episode_uuid"])
     return {
         "clip_id": clip_id,
@@ -1750,6 +1757,7 @@ def review_clip(
         "accepted_path": accepted_path,
         "next_clip": next_clip,
         "deleted_future_clip_count": deleted_future_clip_count,
+        "preview": preview,
         "final": final,
     }
 
@@ -1761,6 +1769,181 @@ def maybe_stitch_episode(uuid: str) -> dict[str, Any] | None:
     if not episode_clips_ready_for_stitch(uuid, clips):
         return None
     return queue_stitch_episode(uuid, check_episode_lock=False)
+
+
+def queue_preview_episode(uuid: str) -> dict[str, Any]:
+    uuid = uuid.lower()
+    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    if not episode:
+        return {"uuid": uuid, "queued": False, "preview_status": "missing", "reason": "episode not found"}
+    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    if not clips:
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET preview_video_path=NULL, preview_status='missing', preview_error=NULL,
+                    preview_version=preview_version+1, updated_at=?
+                WHERE uuid=?
+                """,
+                (db.now(), uuid),
+            )
+        return {"uuid": uuid, "queued": False, "preview_status": "missing", "reason": "no clips"}
+    accepted_count = sum(1 for clip in clips if clip.get("status") == "accepted")
+    if accepted_count <= 0:
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET preview_video_path=NULL, preview_status='missing', preview_error=NULL,
+                    preview_version=preview_version+1, updated_at=?
+                WHERE uuid=?
+                """,
+                (db.now(), uuid),
+            )
+        return {"uuid": uuid, "queued": False, "preview_status": "missing", "reason": "no accepted clips"}
+    with db.connect() as conn:
+        row = conn.execute("SELECT COALESCE(preview_version, 0) AS version FROM episodes WHERE uuid=?", (uuid,)).fetchone()
+        version = int(row["version"] if row else 0) + 1
+        conn.execute(
+            """
+            UPDATE episodes
+            SET preview_status='stitching', preview_error=NULL, preview_version=?, updated_at=?
+            WHERE uuid=?
+            """,
+            (version, db.now(), uuid),
+        )
+    with _PREVIEW_LOCK:
+        if uuid not in _PREVIEWING_EPISODES:
+            _PREVIEWING_EPISODES.add(uuid)
+            _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, version)
+    return {"uuid": uuid, "queued": True, "preview_status": "stitching", "preview_version": version}
+
+
+def _preview_episode_worker(uuid: str, version: int) -> None:
+    rerun = False
+    try:
+        result = preview_episode(uuid, version)
+        rerun = bool(result.get("stale"))
+    except Exception as exc:
+        episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
+        if episode and int(episode.get("preview_version") or 0) != version:
+            rerun = True
+        else:
+            with db.connect() as conn:
+                conn.execute(
+                    "UPDATE episodes SET preview_status='failed', preview_error=?, updated_at=? WHERE uuid=?",
+                    (str(exc), db.now(), uuid),
+                )
+    finally:
+        with _PREVIEW_LOCK:
+            _PREVIEWING_EPISODES.discard(uuid)
+            latest = db.one("SELECT preview_status, preview_version FROM episodes WHERE uuid=?", (uuid,))
+            latest_still_wants_preview = latest and latest.get("preview_status") == "stitching"
+            if latest_still_wants_preview and (rerun or int(latest.get("preview_version") or 0) != version):
+                latest_version = int(latest.get("preview_version") or 0) if latest else version + 1
+                _PREVIEWING_EPISODES.add(uuid)
+                _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, latest_version)
+
+
+def preview_episode(uuid: str, version: int) -> dict[str, Any]:
+    uuid = uuid.lower()
+    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    if not clips:
+        return {"uuid": uuid, "preview_status": "missing", "reason": "no clips"}
+    accepted_by_id: dict[int, Path] = {}
+    for clip in clips:
+        if clip.get("status") != "accepted":
+            continue
+        review = db.one(
+            "SELECT * FROM reviews WHERE clip_id=? AND decision='accept' ORDER BY reviewed_at DESC LIMIT 1",
+            (clip["id"],),
+        )
+        if review and review.get("accepted_path"):
+            path = Path(review["accepted_path"])
+            if path.exists():
+                accepted_by_id[int(clip["id"])] = path
+    if not accepted_by_id:
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET preview_video_path=NULL, preview_status='missing', preview_error=NULL, updated_at=?
+                WHERE uuid=? AND preview_version=?
+                """,
+                (db.now(), uuid, version),
+            )
+        return {"uuid": uuid, "preview_status": "missing", "reason": "no accepted clips"}
+    out = FINAL_DIR / f"{uuid}_preview_accepted_with_black.mp4"
+    tmp = FINAL_DIR / f".{uuid}_preview-{version}-{int(time.time() * 1000)}.mp4"
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            stitch_inputs = preview_stitch_inputs(uuid, clips, accepted_by_id, tmp_root)
+            concat_videos_precise(stitch_inputs, tmp)
+        episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
+        if not episode or int(episode.get("preview_version") or 0) != version:
+            tmp.unlink(missing_ok=True)
+            return {"uuid": uuid, "preview_status": "stitching", "stale": True}
+        tmp.replace(out)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET preview_video_path=?, preview_status='ready', preview_error=NULL, updated_at=?
+                WHERE uuid=? AND preview_version=?
+                """,
+                (str(out.resolve()), db.now(), uuid, version),
+            )
+        return {"uuid": uuid, "preview_video_path": str(out.resolve()), "preview_status": "ready"}
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def preview_stitch_inputs(
+    uuid: str,
+    clips: list[dict[str, Any]],
+    accepted_by_id: dict[int, Path],
+    tmp_root: Path,
+) -> list[Path]:
+    rolling = [clip for clip in clips if clip.get("input_kind") == "rolling"]
+    if rolling and len(rolling) == len(clips):
+        episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
+        plan = rolling_clip_plan(video_duration(Path(episode["head_video_path"]))) if episode and episode.get("head_video_path") else []
+        by_index = {int(clip["clip_index"]): clip for clip in rolling}
+        items: list[Path] = []
+        for plan_item in plan:
+            index = int(plan_item["clip_index"])
+            clip = by_index.get(index)
+            timeline = float(plan_item["timeline_duration_sec"])
+            overlap = float(plan_item["overlap_sec"])
+            if clip and int(clip["id"]) in accepted_by_id:
+                accepted_path = accepted_by_id[int(clip["id"])]
+                if overlap > 0:
+                    trimmed = tmp_root / f"preview_clip_{index:04d}_trimmed.mp4"
+                    trim_video(accepted_path, trimmed, overlap, timeline)
+                    items.append(trimmed)
+                else:
+                    items.append(accepted_path)
+            else:
+                black = tmp_root / f"preview_clip_{index:04d}_black.mp4"
+                black_video(black, timeline)
+                items.append(black)
+        return items
+
+    items = []
+    for clip in clips:
+        timeline = float(clip.get("timeline_duration_sec") or clip.get("duration_sec") or 0)
+        if timeline <= 0:
+            continue
+        if int(clip["id"]) in accepted_by_id:
+            items.append(accepted_by_id[int(clip["id"])])
+        else:
+            black = tmp_root / f"preview_clip_{int(clip['clip_index']):04d}_black.mp4"
+            black_video(black, timeline)
+            items.append(black)
+    return items
 
 
 def episode_clips_ready_for_stitch(uuid: str, clips: list[dict[str, Any]]) -> bool:

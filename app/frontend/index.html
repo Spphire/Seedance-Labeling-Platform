@@ -1221,6 +1221,10 @@
       if (finalStatus && finalStatus !== "missing") {
         values.push(badge(finalStatus));
       }
+      const previewStatus = episode.preview_status || "";
+      if (previewStatus && previewStatus !== "missing" && finalStatus !== "ready") {
+        values.push(badge(previewStatus, `preview ${previewStatus}`));
+      }
       return values.join("");
     }
 
@@ -1738,7 +1742,7 @@
     function episodeClass(episode) {
       const classes = ["item"];
       if (state.selectedEpisode === episode.uuid) classes.push("active");
-      if (episode.final_status === "stitching") classes.push("stitching");
+      if (episode.final_status === "stitching" || episode.preview_status === "stitching") classes.push("stitching");
       if (episode.final_status === "ready") classes.push("final-ready");
       if (episode.generated_failed_clip_count || episode.flagged_clip_count || episode.rejected_clip_count || episode.preprocess_health === "damaged") {
         classes.push("needs-attention");
@@ -1761,6 +1765,9 @@
       if (episode.flagged_clip_count) facts.push(`${episode.flagged_clip_count} 标记问题`);
       if (episode.rejected_clip_count) facts.push(`${episode.rejected_clip_count} 已丢弃`);
       if (episode.rolling_planned_sec) facts.push(`rolling ${formatDuration(episode.rolling_accepted_sec || 0)}/${formatDuration(episode.rolling_planned_sec)}`);
+      if (episode.preview_status === "stitching") facts.push("preview 合成中");
+      if (episode.preview_status === "ready" && episode.final_status !== "ready") facts.push("preview 可看");
+      if (episode.preview_status === "failed") facts.push("preview 失败");
       if (episode.preprocess_health === "damaged") facts.push(`损坏：${episode.preprocess_health_reason || "需要重新预处理"}`);
       return facts;
     }
@@ -1770,7 +1777,7 @@
         clearTimeout(state.pollTimer);
         state.pollTimer = null;
       }
-      const hasActiveWork = state.episodes.some((episode) => episode.final_status === "stitching")
+      const hasActiveWork = state.episodes.some((episode) => episode.final_status === "stitching" || episode.preview_status === "stitching")
         || state.clips.some((clip) => clip.status === "generating");
       if (hasActiveWork) {
         state.pollTimer = setTimeout(() => {
@@ -1796,6 +1803,7 @@
           <div class="meta">${episode.uuid}</div>
           <div class="episode-actions">
             ${episode.final_url ? `<a href="${episode.final_url}" target="_blank" rel="noreferrer">打开 final</a>` : ""}
+            ${episode.preview_status === "ready" && episode.preview_url && episode.final_status !== "ready" ? `<a href="${episode.preview_url}" target="_blank" rel="noreferrer">打开 preview</a>` : ""}
             ${total && accepted === total && episode.final_status !== "stitching" ? `<button data-episode-stitch="${episode.uuid}">重新合成</button>` : ""}
           </div>
         `;
@@ -2046,6 +2054,9 @@
         job ? job.status : "",
         job ? job.output_path || "" : "",
         episode.final_status || "",
+        episode.preview_status || "",
+        episode.preview_version || "",
+        episode.preview_url || "",
         clipCanEdit(clip) ? "edit" : "readonly",
       ].join("|");
       if (target.dataset.signature === signature) {
@@ -2099,8 +2110,11 @@
         episode.uuid,
         episode.status || "",
         episode.final_status || "",
+        episode.preview_status || "",
+        episode.preview_version || "",
         episode.head_video_url || "",
         episode.final_url || "",
+        episode.preview_url || "",
         episode.clip_count || 0,
         episode.accepted_clip_count || 0,
       ].join("|");
@@ -2108,6 +2122,10 @@
         return;
       }
       const finalReady = episode.final_status === "ready" && episode.final_url;
+      const previewReady = !finalReady && episode.preview_status === "ready" && episode.preview_url;
+      const outputUrl = finalReady ? episode.final_url : previewReady ? episode.preview_url : "";
+      const outputTitle = finalReady ? "合成 final" : "accepted preview";
+      const outputStatus = finalReady ? episode.final_status : episode.preview_status || "missing";
       target.innerHTML = `
         ${renderEpisodeNotice(episode)}
         <div class="review-head">
@@ -2122,8 +2140,8 @@
             <video id="originalVideo" src="${episode.head_video_url || ""}" controls playsinline></video>
           </div>
           <div class="video-pane">
-            <h3><span>合成 final</span><span>${badge(episode.final_status || "missing")}</span></h3>
-            <video id="generatedVideo" src="${finalReady ? episode.final_url : ""}" controls playsinline></video>
+            <h3><span>${outputTitle}</span><span>${badge(outputStatus)}</span></h3>
+            <video id="generatedVideo" src="${outputUrl}" controls playsinline></video>
           </div>
         </div>
       `;
@@ -2191,6 +2209,15 @@
       }
       if (episode.final_status === "failed") {
         return `<div class="notice failed">这个 episode 的 final 合成失败，可以在左侧 episode 卡片点“重新合成”。${episode.error ? `错误：${episode.error}` : ""}</div>`;
+      }
+      if (episode.preview_status === "stitching") {
+        return `<div class="notice stitching">正在后台合成当前 accepted preview，未保留的时间段会用黑帧占位；这不会锁定审核。</div>`;
+      }
+      if (episode.preview_status === "ready" && episode.preview_url) {
+        return `<div class="notice">当前 accepted preview 已更新，未保留的时间段为黑帧。<a href="${episode.preview_url}" target="_blank" rel="noreferrer">打开 preview</a></div>`;
+      }
+      if (episode.preview_status === "failed") {
+        return `<div class="notice failed">当前 accepted preview 合成失败，不影响继续审核。${episode.preview_error ? `错误：${episode.preview_error}` : ""}</div>`;
       }
       if ((episode.generated_failed_clip_count || 0) > 0) {
         return `<div class="notice failed">这个 episode 有 ${episode.generated_failed_clip_count} 个 clip 生成失败，建议先重跑失败 clip。</div>`;

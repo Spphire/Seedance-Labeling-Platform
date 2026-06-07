@@ -247,6 +247,30 @@ def trim_video(src: Path, dst: Path, start_sec: float, duration_sec: float) -> N
     )
 
 
+def black_video(dst: Path, duration_sec: float, width: int = 760, height: int = 570, fps: int = 30) -> None:
+    if duration_sec <= 0:
+        raise ValueError("duration_sec must be positive")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:size={width}x{height}:rate={fps}",
+            "-t",
+            f"{duration_sec:.6f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+    )
+
+
 def compose_rolling_input(
     head_src: Path,
     dst: Path,
