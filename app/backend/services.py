@@ -254,7 +254,9 @@ def list_clips() -> list[dict[str, Any]]:
         SELECT c.*, e.final_status
         FROM clips c
         JOIN episodes e ON e.uuid = c.episode_uuid
-        ORDER BY c.episode_uuid, c.clip_index
+        ORDER BY c.episode_uuid,
+                 COALESCE(c.timeline_start_sec, c.source_start_sec, c.start_sec, 0),
+                 c.clip_index
         """
     )
     clip_locks = locks_by_resource("clip")

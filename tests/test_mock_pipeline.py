@@ -324,6 +324,24 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(rerun[0]["clip_id"], forward["id"])
         self.assertEqual(before_count, after_count)
 
+    def test_list_clips_returns_bidirectional_clips_in_timeline_order(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000032"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [14])
+        anchor_result = queue_rolling_generation(mode="mock")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+
+        clips = [clip for clip in list_clips() if clip["episode_uuid"] == uuid]
+
+        self.assertEqual([clip["direction"] for clip in clips], ["backward", "anchor", "forward"])
+        self.assertEqual([clip["input_kind"] for clip in clips], ["rolling", "anchor", "rolling"])
+        self.assertEqual(
+            [clip["timeline_start_sec"] for clip in clips],
+            sorted(clip["timeline_start_sec"] for clip in clips),
+        )
+
     def test_rejecting_accepted_rolling_clip_deletes_future_pending_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000027"
         save_settings({"mock_async": False})
