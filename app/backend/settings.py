@@ -21,6 +21,10 @@ IPHONE2DEPLOY_PROMPT = (
     "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2的机械臂和摄像头，"
     "爪夹形态、动作、画面、背景保持不变"
 )
+LEGACY_IPHONE2DEPLOY_PROMPTS = {
+    "把@视频1中的真人手臂和手机换成@图片1@图片2的机械臂和上面安装的相机，"
+    "爪夹形态、动作、画面、背景保持不变",
+}
 LEGACY_DEFAULT_PROMPTS = {
     "保持参考视频中的视角方向、背景、动作和时序连续性，生成与输入 clip 时长一致的视频。",
 }
@@ -37,6 +41,16 @@ IPHONE2DEPLOY_REFERENCE_IMAGES = [
     "app/reference_images/l-near-deploy.png",
     "app/reference_images/r-near-deploy.png",
 ]
+LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
+    (
+        "app/reference_images/iphone2deploy-left.jpg",
+        "app/reference_images/iphone2deploy-right.jpg",
+    ),
+    (
+        "app/reference_images/iphone2deploy-left.png",
+        "app/reference_images/iphone2deploy-right.png",
+    ),
+}
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
 GENERATION_PRESETS_VERSION = 5
 DEFAULT_GENERATION_PRESETS = [
@@ -248,6 +262,27 @@ def _default_preset_by_id(preset_id: str) -> dict[str, Any] | None:
     return next((preset for preset in DEFAULT_GENERATION_PRESETS if str(preset["id"]) == preset_id), None)
 
 
+def _migrate_iphone2deploy_preset(preset: dict[str, Any]) -> bool:
+    if preset.get("id") != "iphone2deploy":
+        return False
+    default_preset = _default_preset_by_id("iphone2deploy")
+    if not default_preset:
+        return False
+    refs = tuple(str(item) for item in preset.get("reference_images") or [])
+    legacy_prompt = str(preset.get("prompt") or "") in LEGACY_IPHONE2DEPLOY_PROMPTS
+    legacy_refs = refs in LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS
+    if not legacy_prompt and not legacy_refs:
+        return False
+    changed = False
+    if preset.get("prompt") != default_preset["prompt"]:
+        preset["prompt"] = str(default_preset["prompt"])
+        changed = True
+    if preset.get("reference_images") != default_preset["reference_images"]:
+        preset["reference_images"] = list(default_preset["reference_images"])
+        changed = True
+    return changed
+
+
 def _normalize_generation_presets(data: dict[str, Any]) -> bool:
     changed = False
     default_prompt_present = "default_prompt" in data
@@ -289,6 +324,8 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
             "reference_images": refs,
         }
         if normalized != item:
+            changed = True
+        if _migrate_iphone2deploy_preset(normalized):
             changed = True
         presets.append(normalized)
 
@@ -336,6 +373,17 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
         default_id = presets[0]["id"]
         changed = True
     default_preset = next((item for item in presets if item["id"] == default_id), presets[0])
+    if default_preset["id"] == "iphone2deploy":
+        if normalized_default_prompt in LEGACY_IPHONE2DEPLOY_PROMPTS:
+            normalized_default_prompt = default_preset["prompt"]
+            changed = True
+        if (
+            reference_images_present
+            and normalized_reference_images is not None
+            and tuple(normalized_reference_images) in LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS
+        ):
+            normalized_reference_images = list(default_preset["reference_images"])
+            changed = True
     if default_prompt_present and default_preset["prompt"] != normalized_default_prompt:
         default_preset["prompt"] = str(normalized_default_prompt)
         changed = True

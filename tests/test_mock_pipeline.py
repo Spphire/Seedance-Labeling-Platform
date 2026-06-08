@@ -664,6 +664,51 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(persisted_preset["prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(persisted_preset["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
 
+    def test_stale_iphone2deploy_default_is_repaired_even_at_current_version(self) -> None:
+        old_prompt = "把@视频1中的真人手臂和手机换成@图片1@图片2的机械臂和上面安装的相机，爪夹形态、动作、画面、背景保持不变"
+        old_refs = [
+            "app/reference_images/iphone2deploy-left.png",
+            "app/reference_images/iphone2deploy-right.png",
+        ]
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "default_prompt": old_prompt,
+                    "reference_images": old_refs,
+                    "default_generation_preset_id": "iphone2deploy",
+                    "generation_presets_version": GENERATION_PRESETS_VERSION,
+                    "generation_presets": [
+                        {
+                            "id": "iphone-default",
+                            "name": "iPhone 默认组合",
+                            "prompt": DEFAULT_PROMPT,
+                            "reference_images": DEFAULT_SETTINGS["reference_images"],
+                        },
+                        {
+                            "id": "iphone2deploy",
+                            "name": "iphone2deploy",
+                            "prompt": old_prompt,
+                            "reference_images": old_refs,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+
+        self.assertEqual(settings["default_prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(settings["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(persisted["default_prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(persisted["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+
     def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
         save_settings(
             {
