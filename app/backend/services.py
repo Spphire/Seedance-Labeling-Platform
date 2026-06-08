@@ -925,7 +925,13 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
     total = continuity_total_duration(head_path)
     if total < ANCHOR_CLIP_DURATION_SEC:
         raise ValueError(f"episode is too short for a {ANCHOR_CLIP_DURATION_SEC}s anchor")
-    starts, skipped = normalize_anchor_start_candidates(start_secs, total, continuity_overlap())
+    settings = load_settings()
+    starts, skipped = normalize_anchor_start_candidates(
+        start_secs,
+        total,
+        continuity_overlap(settings),
+        continuity_prefer_input(settings),
+    )
     existing_keys = {
         int(round(float(row.get("timeline_start_sec") or row.get("start_sec") or 0.0) * 1000))
         for row in db.rows("SELECT timeline_start_sec, start_sec FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
@@ -976,7 +982,12 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
     return {"uuid": uuid, "created": created, "skipped": skipped, "continuity_state": state}
 
 
-def normalize_anchor_starts(start_secs: list[float], total_duration: float, overlap: float | None = None) -> list[float]:
+def normalize_anchor_starts(
+    start_secs: list[float],
+    total_duration: float,
+    overlap: float | None = None,
+    prefer_input: float | None = None,
+) -> list[float]:
     if not start_secs:
         raise ValueError("at least one anchor start is required")
     max_start = max(0.0, total_duration - ANCHOR_CLIP_DURATION_SEC)
@@ -988,7 +999,7 @@ def normalize_anchor_starts(start_secs: list[float], total_duration: float, over
         key = int(round(start * 1000))
         if key in seen:
             continue
-        validate_anchor_start(start, total_duration, overlap)
+        validate_anchor_start(start, total_duration, overlap, prefer_input)
         seen.add(key)
         result.append(start)
     if not result:
@@ -1000,8 +1011,10 @@ def normalize_anchor_start_candidates(
     start_secs: list[float],
     total_duration: float,
     overlap: float | None = None,
+    prefer_input: float | None = None,
 ) -> tuple[list[float], list[dict[str, Any]]]:
     overlap = continuity_overlap() if overlap is None else float(overlap)
+    prefer_input = continuity_prefer_input() if prefer_input is None else float(prefer_input)
     max_start = max(0.0, total_duration - ANCHOR_CLIP_DURATION_SEC)
     result: list[float] = []
     skipped: list[dict[str, Any]] = []
@@ -1021,7 +1034,7 @@ def normalize_anchor_start_candidates(
             skipped.append({"start_sec": start, "reason": "重复起点"})
             continue
         try:
-            validate_anchor_start(start, total_duration, overlap)
+            validate_anchor_start(start, total_duration, overlap, prefer_input)
         except ValueError as exc:
             skipped.append({"start_sec": start, "reason": f"起点不合法：{exc}"})
             continue
@@ -1052,36 +1065,53 @@ def continuity_overlap(settings: dict[str, Any] | None = None) -> float:
     return float(max(0, min(overlap, MAX_SEEDANCE_INPUT_SEC - MIN_SEEDANCE_INPUT_SEC)))
 
 
-def choose_timeline_duration(remaining: float, overlap: float) -> float:
+def continuity_prefer_input(settings: dict[str, Any] | None = None) -> float:
+    settings = settings or load_settings()
+    try:
+        prefer = int(round(float(settings.get("continuity_prefer_input_sec", MAX_SEEDANCE_INPUT_SEC))))
+    except (TypeError, ValueError):
+        prefer = MAX_SEEDANCE_INPUT_SEC
+    return float(max(MIN_SEEDANCE_INPUT_SEC, min(prefer, MAX_SEEDANCE_INPUT_SEC)))
+
+
+def choose_timeline_duration(remaining: float, overlap: float, prefer_input: float | None = None) -> float:
     remaining = float(remaining)
     if remaining <= TIME_EPSILON:
         return 0.0
+    prefer_input = continuity_prefer_input() if prefer_input is None else float(prefer_input)
+    prefer_input = max(MIN_SEEDANCE_INPUT_SEC, min(prefer_input, MAX_SEEDANCE_INPUT_SEC))
     max_timeline = MAX_SEEDANCE_INPUT_SEC - overlap
     min_timeline = max(0.001, MIN_SEEDANCE_INPUT_SEC - overlap)
     if max_timeline <= 0:
         raise ValueError("overlap leaves no room for source video")
-    if remaining <= max_timeline + TIME_EPSILON:
+    if remaining + overlap <= prefer_input + TIME_EPSILON:
         if remaining + overlap + TIME_EPSILON < MIN_SEEDANCE_INPUT_SEC:
             raise ValueError(f"remaining timeline {remaining:.3f}s cannot make a legal Seedance input")
         return remaining
-    duration = min(max_timeline, remaining)
+    target_timeline = max(min_timeline, min(max_timeline, prefer_input - overlap))
+    duration = min(target_timeline, remaining)
     tail = remaining - duration
     if 0 < tail < min_timeline:
         borrow = min_timeline - tail
-        duration -= borrow
+        if duration - borrow >= min_timeline - TIME_EPSILON:
+            duration -= borrow
+        elif remaining <= max_timeline + TIME_EPSILON:
+            duration = remaining
+        else:
+            raise ValueError(f"cannot split remaining timeline {remaining:.3f}s around preferred input {prefer_input:.3f}s")
     if duration + overlap + TIME_EPSILON < MIN_SEEDANCE_INPUT_SEC or duration + overlap > MAX_SEEDANCE_INPUT_SEC + TIME_EPSILON:
         raise ValueError(f"cannot choose legal continuity duration from remaining {remaining:.3f}s")
     return duration
 
 
-def validate_anchor_start(start: float, total_duration: float, overlap: float) -> None:
+def validate_anchor_start(start: float, total_duration: float, overlap: float, prefer_input: float | None = None) -> None:
     left_remaining = float(start)
     right_remaining = float(total_duration) - float(start) - ANCHOR_CLIP_DURATION_SEC
     for label, remaining in [("left", left_remaining), ("right", right_remaining)]:
         if remaining <= TIME_EPSILON:
             continue
         try:
-            choose_timeline_duration(remaining, overlap)
+            choose_timeline_duration(remaining, overlap, prefer_input)
         except ValueError as exc:
             raise ValueError(
                 f"anchor start {start:.0f}s leaves an illegal {label} side of {remaining:.3f}s"
@@ -1323,13 +1353,15 @@ def maybe_prepare_direction_clip(uuid: str, direction: str) -> dict[str, Any] | 
         """,
         (uuid,),
     )
-    overlap = continuity_overlap()
+    settings = load_settings()
+    overlap = continuity_overlap(settings)
+    prefer_input = continuity_prefer_input(settings)
     if direction == "forward":
         boundary = max(float(clip.get("timeline_end_sec") or 0) for clip in accepted)
         remaining = total - boundary
         if remaining <= TIME_EPSILON:
             return None
-        timeline_duration = choose_timeline_duration(remaining, overlap)
+        timeline_duration = choose_timeline_duration(remaining, overlap, prefer_input)
         timeline_start = boundary
         timeline_end = boundary + timeline_duration
         source_start = timeline_start
@@ -1340,7 +1372,7 @@ def maybe_prepare_direction_clip(uuid: str, direction: str) -> dict[str, Any] | 
         remaining = boundary
         if remaining <= TIME_EPSILON:
             return None
-        timeline_duration = choose_timeline_duration(remaining, overlap)
+        timeline_duration = choose_timeline_duration(remaining, overlap, prefer_input)
         timeline_start = boundary - timeline_duration
         timeline_end = boundary
         source_start = timeline_start

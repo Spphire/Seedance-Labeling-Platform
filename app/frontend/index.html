@@ -963,6 +963,11 @@
           <div class="hint">新建 rolling clip 时写入；已生成 clip 会继续按自己的时间戳合成。</div>
         </div>
         <div class="field">
+          <label for="continuityPreferInputSec">Rolling prefer input 秒数</label>
+          <input id="continuityPreferInputSec" type="number" min="4" max="15" step="1" placeholder="15">
+          <div class="hint">只影响非锚点 rolling clip；锚点候选固定 4s。实际切分仍会保证 Seedance 输入在 4-15s。</div>
+        </div>
+        <div class="field">
           <label>Seedance 用量监控</label>
           <button id="refreshUsage">刷新用量</button>
           <div id="seedanceUsageSummary" class="usage-panel"></div>
@@ -1204,6 +1209,7 @@
       $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
       $("continuityOverlapSec").value = state.settings.continuity_overlap_sec ?? 1;
+      $("continuityPreferInputSec").value = state.settings.continuity_prefer_input_sec ?? 15;
     }
 
     function normalizedSeedanceApiKeyPool() {
@@ -2839,7 +2845,7 @@
       log("本次 prompt/ref 已恢复管理员默认值");
     });
     $("addSeedanceApiKey").addEventListener("click", addSeedanceApiKeyRow);
-    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond", "continuityOverlapSec"].forEach((id) => {
+    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond", "continuityOverlapSec", "continuityPreferInputSec"].forEach((id) => {
       $(id).addEventListener("input", markSettingsDirty);
       $(id).addEventListener("change", markSettingsDirty);
     });
@@ -2906,6 +2912,7 @@
           seedance_concurrency: Math.max(1, Number.parseInt($("seedanceConcurrency").value, 10) || 3),
           seedance_seconds_per_video_second: Math.max(1, Number.parseFloat($("seedanceSecondsPerVideoSecond").value) || 24),
           continuity_overlap_sec: Math.max(0, Math.min(11, Number.parseInt($("continuityOverlapSec").value, 10) || 1)),
+          continuity_prefer_input_sec: Math.max(4, Math.min(15, Number.parseInt($("continuityPreferInputSec").value, 10) || 15)),
           seedance_api_key_pool: seedanceApiKeyPoolValues(),
         };
         const result = await api("/api/settings", { method: "POST", body: { values } });

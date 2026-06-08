@@ -324,6 +324,24 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(rerun[0]["clip_id"], forward["id"])
         self.assertEqual(before_count, after_count)
 
+    def test_rolling_prefer_input_length_controls_non_anchor_clip_size(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000033"
+        save_settings({"mock_async": False, "continuity_prefer_input_sec": 10})
+        self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [14])
+
+        anchor_result = queue_rolling_generation(mode="mock")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        self.assertEqual(anchor["duration_sec"], 4.0)
+        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+
+        rolling = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
+
+        self.assertEqual(len(rolling), 2)
+        self.assertEqual({clip["duration_sec"] for clip in rolling}, {10.0})
+        self.assertEqual({clip["source_duration_sec"] for clip in rolling}, {9.0})
+        self.assertEqual({clip["overlap_sec"] for clip in rolling}, {1.0})
+
     def test_list_clips_returns_bidirectional_clips_in_timeline_order(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000032"
         save_settings({"mock_async": False})
