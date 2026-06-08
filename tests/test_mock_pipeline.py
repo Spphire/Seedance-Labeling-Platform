@@ -18,6 +18,7 @@ from app.backend.main import FRONTEND_DIR, app
 from app.backend.nedf import fetch_episode
 from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
 from app.backend.services import (
+    create_anchor_candidates,
     create_clips,
     import_head_video,
     list_episodes,
@@ -178,6 +179,18 @@ class MockPipelineTest(unittest.TestCase):
             )
         return head
 
+    def create_anchor_candidates_with_lock(self, uuid: str, starts: list[float]) -> dict:
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        token = lock.json()["token"]
+        try:
+            return create_anchor_candidates(uuid, starts, token)
+        finally:
+            self.client.post("/api/locks/release", json={"token": token, "owner_id": "alice"})
+
     def test_mock_generation_accept_and_stitch(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000001"
         now = db.now()
@@ -215,7 +228,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(stream["avg_frame_rate"], "30/1")
         self.assertAlmostEqual(float(info["format"]["duration"]), 8.0, delta=0.25)
 
-    def test_import_head_video_prepares_first_pending_rolling_clip(self) -> None:
+    def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"
         source = DATA_DIR / "manual_head.mp4"
         self.make_video(source, 8)
@@ -227,17 +240,15 @@ class MockPipelineTest(unittest.TestCase):
 
         result = import_head_video(uuid, str(source), lock.json()["token"])
 
-        self.assertEqual(len(result["clips"]), 1)
-        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
-        self.assertEqual(clip["input_kind"], "rolling")
-        self.assertEqual(clip["status"], "pending")
-        self.assertEqual(clip["duration_sec"], 8.0)
-        self.assertTrue(Path(clip["local_path"]).exists())
+        self.assertEqual(result["clips"], [])
+        self.assertIsNone(db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,)))
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertEqual(episode["status"], "preprocessed")
+        self.assertEqual(episode["continuity_state"], "select_anchor")
+        self.assertIsNone(episode["anchor_clip_id"])
         self.assertTrue(Path(episode["head_video_path"]).exists())
 
-    def test_rolling_generation_runs_imported_pending_clip_with_episode_lock(self) -> None:
+    def test_rolling_generation_runs_anchor_candidates(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000028"
         source = DATA_DIR / "manual_head_locked.mp4"
         save_settings({"mock_async": False})
@@ -248,120 +259,142 @@ class MockPipelineTest(unittest.TestCase):
         )
         self.assertEqual(lock.status_code, 200, lock.text)
         import_head_video(uuid, str(source), lock.json()["token"])
-        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
-        self.assertEqual(clip["status"], "pending")
+        self.client.post("/api/locks/release", json={"token": lock.json()["token"], "owner_id": "alice"})
+        created = self.create_anchor_candidates_with_lock(uuid, [0, 4])
+        self.assertEqual(len(created["created"]), 2)
+        clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+        self.assertEqual([clip["input_kind"] for clip in clips], ["anchor", "anchor"])
+        self.assertEqual([clip["status"] for clip in clips], ["pending", "pending"])
 
         result = queue_rolling_generation(mode="mock")
 
-        self.assertEqual(result[0]["status"], "succeeded")
-        self.assertEqual(result[0]["clip_id"], clip["id"])
-        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clip["id"],))["status"], "generated")
+        succeeded_ids = {item["clip_id"] for item in result if item.get("status") == "succeeded"}
+        self.assertEqual(succeeded_ids, {clip["id"] for clip in clips})
+        statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips WHERE episode_uuid=?", (uuid,))}
+        self.assertEqual(set(statuses.values()), {"generated"})
 
     def test_rolling_generation_advances_after_accept_and_reject_reruns_same_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000023"
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [14])
 
-        first = queue_rolling_generation(mode="mock")
-        self.assertEqual(first[0]["status"], "succeeded")
-        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
-        self.assertEqual(clip_0["input_kind"], "rolling")
-        self.assertEqual(clip_0["status"], "generated")
-        self.assertEqual(clip_0["duration_sec"], 15.0)
-        self.assertEqual(clip_0["source_duration_sec"], 15.0)
-        self.assertEqual(clip_0["overlap_sec"], 0.0)
-
-        accepted = review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
+        anchor_result = queue_rolling_generation(mode="mock")
+        self.assertEqual(anchor_result[0]["status"], "succeeded")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        self.assertEqual(anchor["status"], "generated")
+        accepted = review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
         self.assertIsNone(accepted["final"])
-        self.assertIsNotNone(accepted["next_clip"])
-        self.assertEqual(accepted["next_clip"]["status"], "pending")
-        self.assertEqual(accepted["next_clip"]["clip_index"], 1)
-        second = queue_rolling_generation(mode="mock")
-        self.assertEqual(second[0]["status"], "succeeded")
-        clip_1 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
-        self.assertEqual(clip_1["id"], second[0]["clip_id"])
-        self.assertEqual(clip_1["source_start_sec"], 15.0)
-        self.assertEqual(clip_1["source_duration_sec"], 14.0)
-        self.assertEqual(clip_1["overlap_sec"], 1.0)
-        self.assertEqual(clip_1["duration_sec"], 15.0)
+        self.assertEqual({clip["direction"] for clip in accepted["next_clips"]}, {"backward", "forward"})
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertEqual(episode["anchor_clip_id"], anchor["id"])
+        self.assertEqual(episode["continuity_state"], "bidirectional")
 
-        review_clip(clip_1["id"], "reject", second[0]["job_id"], require_lock_token=False)
+        rolling = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
+        self.assertEqual(len(rolling), 2)
+        for clip in rolling:
+            self.assertEqual(clip["status"], "pending")
+            self.assertEqual(clip["source_duration_sec"], 14.0)
+            self.assertEqual(clip["overlap_sec"], 1.0)
+            self.assertEqual(clip["duration_sec"], 15.0)
+            self.assertTrue(Path(clip["local_path"]).exists())
+
+        second = queue_rolling_generation(mode="mock")
+        succeeded_ids = {item["clip_id"] for item in second if item.get("status") == "succeeded"}
+        self.assertEqual(succeeded_ids, {clip["id"] for clip in rolling})
+        forward = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward'", (uuid,))
+        forward_job = next(item["job_id"] for item in second if item.get("clip_id") == forward["id"])
+        review_clip(forward["id"], "reject", forward_job, require_lock_token=False)
         before_count = db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=?", (uuid,))["count"]
         rerun = queue_rolling_generation(mode="mock")
         after_count = db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=?", (uuid,))["count"]
-        self.assertEqual(rerun[0]["clip_id"], clip_1["id"])
+        self.assertEqual(rerun[0]["clip_id"], forward["id"])
         self.assertEqual(before_count, after_count)
 
     def test_rejecting_accepted_rolling_clip_deletes_future_pending_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000027"
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 32)
-        first = queue_rolling_generation(mode="mock")
-        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
-        review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
-        pending_next = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
+        self.create_anchor_candidates_with_lock(uuid, [4])
+        anchor_result = queue_rolling_generation(mode="mock")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+        first_forward = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward'", (uuid,))
+        first_forward_result = queue_rolling_generation(mode="mock")
+        first_forward_job = next(item["job_id"] for item in first_forward_result if item.get("clip_id") == first_forward["id"])
+        review_clip(first_forward["id"], "accept", first_forward_job, require_lock_token=False)
+        pending_next = db.one(
+            """
+            SELECT * FROM clips
+            WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward' AND status='pending'
+            """,
+            (uuid,),
+        )
         self.assertIsNotNone(pending_next)
-        self.assertEqual(pending_next["status"], "pending")
 
-        rejected = review_clip(clip_0["id"], "reject", first[0]["job_id"], require_lock_token=False)
+        rejected = review_clip(first_forward["id"], "reject", first_forward_job, require_lock_token=False)
 
         self.assertEqual(rejected["deleted_future_clip_count"], 1)
         self.assertIsNone(db.one("SELECT * FROM clips WHERE id=?", (pending_next["id"],)))
         self.assertFalse(Path(pending_next["local_path"]).exists())
 
-    def test_rolling_generation_api_endpoint_creates_next_clip(self) -> None:
+    def test_rolling_generation_api_endpoint_runs_pending_anchor(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000026"
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 8)
+        self.create_anchor_candidates_with_lock(uuid, [0])
 
         res = self.client.post("/api/generation/rolling_run", json={"mode": "mock", "operator_id": "client-a"})
 
         self.assertEqual(res.status_code, 200, res.text)
         self.assertEqual(res.json()[0]["status"], "succeeded")
         clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
-        self.assertEqual(clip["input_kind"], "rolling")
-        self.assertEqual(clip["duration_sec"], 8.0)
+        self.assertEqual(clip["input_kind"], "anchor")
+        self.assertEqual(clip["duration_sec"], 4.0)
 
-    def test_rolling_dry_run_keeps_clip_pending(self) -> None:
+    def test_rolling_dry_run_keeps_anchor_clip_pending(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000024"
         save_settings({"reference_images": ["data:image/png;base64,AA=="]})
         self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [14])
 
         result = queue_rolling_generation(mode="seedance", dry_run=True)
         payload_path = Path(result[0]["output_path"])
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         clip = db.one("SELECT * FROM clips WHERE id=?", (result[0]["clip_id"],))
 
-        self.assertEqual(payload["duration"], 15)
+        self.assertEqual(payload["duration"], 4)
         self.assertEqual(clip["status"], "pending")
-        self.assertEqual(clip["input_kind"], "rolling")
+        self.assertEqual(clip["input_kind"], "anchor")
 
-    def test_rolling_stitch_trims_overlap_from_final(self) -> None:
+    def test_bidirectional_stitch_trims_overlap_from_final(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000025"
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 18)
+        self.create_anchor_candidates_with_lock(uuid, [7])
 
-        first = queue_rolling_generation(mode="mock")
-        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
-        review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
-        second = queue_rolling_generation(mode="mock")
-        clip_1 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=1", (uuid,))
-        self.assertEqual(clip_1["duration_sec"], 4.0)
-        self.assertEqual(clip_1["timeline_duration_sec"], 3.0)
-        review_clip(clip_1["id"], "accept", second[0]["job_id"], require_lock_token=False)
+        anchor_result = queue_rolling_generation(mode="mock")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+        rolling_result = queue_rolling_generation(mode="mock")
+        for item in rolling_result:
+            if item.get("status") == "succeeded":
+                review_clip(item["clip_id"], "accept", item["job_id"], require_lock_token=False)
 
         episode = self.wait_for_final_ready(uuid)
+        self.assertEqual(episode["continuity_state"], "complete")
         info = ffprobe_json(Path(episode["final_video_path"])) or ffmpeg_probe_fallback(Path(episode["final_video_path"]))
         self.assertAlmostEqual(float(info["format"]["duration"]), 18.0, delta=0.35)
 
-    def test_partial_rolling_preview_uses_black_for_unaccepted_timeline(self) -> None:
+    def test_partial_continuity_preview_uses_black_for_unaccepted_timeline(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000029"
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 18)
+        self.create_anchor_candidates_with_lock(uuid, [7])
 
         first = queue_rolling_generation(mode="mock")
-        clip_0 = db.one("SELECT * FROM clips WHERE episode_uuid=? AND clip_index=0", (uuid,))
-        result = review_clip(clip_0["id"], "accept", first[0]["job_id"], require_lock_token=False)
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        result = review_clip(anchor["id"], "accept", first[0]["job_id"], require_lock_token=False)
 
         self.assertIsNone(result["final"])
         self.assertEqual(result["preview"]["preview_status"], "stitching")
@@ -372,9 +405,9 @@ class MockPipelineTest(unittest.TestCase):
         info = ffprobe_json(preview) or ffmpeg_probe_fallback(preview)
         self.assertAlmostEqual(float(info["format"]["duration"]), 18.0, delta=0.4)
 
-        clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
-        self.assertEqual([clip["status"] for clip in clips], ["accepted", "pending"])
-        self.assertEqual(clips[1]["timeline_duration_sec"], 3.0)
+        clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY timeline_start_sec", (uuid,))
+        self.assertEqual([clip["status"] for clip in clips], ["pending", "accepted", "pending"])
+        self.assertEqual([clip["input_kind"] for clip in clips], ["rolling", "anchor", "rolling"])
 
     def test_preview_path_clears_when_no_clips_are_accepted(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000030"
@@ -1241,7 +1274,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(resolved, source_root / uuid)
         self.assertFalse(local_dir.exists())
 
-    def test_preprocess_skips_head_ready_episode_and_ensures_first_pending_clip(self) -> None:
+    def test_preprocess_skips_head_ready_episode_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000017"
         now = db.now()
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
@@ -1264,12 +1297,11 @@ class MockPipelineTest(unittest.TestCase):
         skipped = preprocess_one(uuid, load_settings(), fetch_remote=False, lock_token=token)
 
         self.assertEqual(skipped["status"], "skipped")
-        self.assertEqual(skipped["clip_count"], 1)
-        self.assertEqual(len(skipped["clips"]), 1)
-        clip = db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
-        self.assertEqual(clip["input_kind"], "rolling")
-        self.assertEqual(clip["status"], "pending")
-        self.assertTrue(Path(clip["local_path"]).exists())
+        self.assertEqual(skipped["clip_count"], 0)
+        self.assertEqual(skipped["clips"], [])
+        self.assertIsNone(db.one("SELECT * FROM clips WHERE episode_uuid=?", (uuid,)))
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertEqual(episode["continuity_state"], "select_anchor")
 
     def test_submit_and_preprocess_combined_endpoint_submits_before_preprocess(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000018"
@@ -1455,7 +1487,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(second.status_code, 200, second.text)
         self.assertEqual(second.json()["owner_name"], "Bob")
 
-    def test_bulk_generation_ignores_review_episode_lock(self) -> None:
+    def test_bulk_generation_respects_episode_lock_owner(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000007"
         now = db.now()
         with db.connect() as conn:
@@ -1482,6 +1514,12 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(locked.status_code, 200, locked.text)
 
         generated = run_generation(mode="mock")
+        self.assertEqual(generated, [])
+        statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips")}
+        self.assertEqual(statuses[clips[0]["id"]], "pending")
+        self.assertEqual(statuses[clips[1]["id"]], "pending")
+
+        generated = run_generation(mode="mock", operator_id="alice", operator_name="Alice")
         self.assertEqual({item["clip_id"] for item in generated}, {clip["id"] for clip in clips})
         statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips")}
         self.assertEqual(statuses[clips[0]["id"]], "generated")

@@ -20,11 +20,10 @@ from .video import (
     black_video,
     clip_plan,
     concat_videos_precise,
-    compose_rolling_input,
+    compose_continuity_input,
     cut_clip,
     normalize_accepted,
     requested_seedance_duration,
-    rolling_clip_plan,
     stitch_videos,
     transcode_760x570,
     trim_video,
@@ -49,6 +48,12 @@ _SEEDANCE_KEY_ACTIVE: dict[str, int] = {}
 GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
 GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
 DEFAULT_REQUEST_MODE = "mock"
+ANCHOR_CLIP_DURATION_SEC = 4
+CONTINUITY_INPUT_KINDS = {"anchor", "rolling"}
+CONTINUITY_DIRECTIONS = {"anchor", "forward", "backward"}
+MIN_SEEDANCE_INPUT_SEC = 4
+MAX_SEEDANCE_INPUT_SEC = 15
+TIME_EPSILON = 1e-3
 
 
 def submit_episodes(text: str) -> list[dict[str, Any]]:
@@ -162,10 +167,39 @@ def describe_episode_stage(episode: dict[str, Any]) -> str:
     clip_count = int(episode.get("clip_count") or 0)
     accepted = int(episode.get("accepted_clip_count") or 0)
     final_status = episode.get("final_status") or "missing"
+    continuity_state = episode.get("continuity_state") or ""
     if episode.get("preprocess_health") == "damaged":
         return "预处理文件疑似损坏，需要重新预处理"
+    if continuity_state == "prepare_head":
+        return "等待导入并准备 head"
+    if continuity_state == "select_anchor":
+        return "head 已就绪，等待选择锚点候选"
+    if continuity_state == "anchor_candidates":
+        if int(episode.get("generating_clip_count") or 0):
+            return "锚点候选生成中"
+        if int(episode.get("generated_failed_clip_count") or 0):
+            return "锚点候选生成失败，建议重跑"
+        if int(episode.get("generated_clip_count") or 0) or int(episode.get("flagged_clip_count") or 0):
+            return "请选择一个锚点候选保留"
+        return "锚点候选待生成"
+    if continuity_state == "bidirectional":
+        if int(episode.get("generating_clip_count") or 0):
+            return "连续生成中"
+        if int(episode.get("generated_failed_clip_count") or 0):
+            return "连续生成失败，建议重跑"
+        if int(episode.get("generated_clip_count") or 0) or int(episode.get("flagged_clip_count") or 0):
+            return "连续片段待审核"
+        if int(episode.get("pending_clip_count") or 0) or int(episode.get("rejected_clip_count") or 0):
+            return "连续片段待生成"
+        return "双向滚动推进中"
+    if continuity_state == "ready_to_stitch":
+        return "时间线已覆盖，等待合成 final"
+    if continuity_state == "stitching":
+        return "时间线已覆盖，正在合成 final"
+    if continuity_state == "complete":
+        return "时间线已覆盖，final 已合成"
     if clip_count == 0 and episode.get("status") == "preprocessed":
-        return "head 已就绪，等待滚动生成"
+        return "head 已就绪，等待选择锚点候选"
     if clip_count == 0:
         return "未切片"
     if accepted == clip_count:
@@ -188,38 +222,28 @@ def describe_episode_stage(episode: dict[str, Any]) -> str:
 
 
 def rolling_episode_progress(episode: dict[str, Any], clips: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = continuity_timeline_summary(episode["uuid"], clips, episode)
     rolling_clips = [clip for clip in clips if clip.get("input_kind") == "rolling"]
-    planned_sec = None
-    planned_clip_count = None
-    plan_error = ""
-    head_value = episode.get("head_video_path")
-    if head_value and Path(head_value).exists():
-        try:
-            plan = rolling_clip_plan(video_duration(Path(head_value)))
-            planned_sec = sum(float(item["timeline_duration_sec"]) for item in plan)
-            planned_clip_count = len(plan)
-        except Exception as exc:
-            plan_error = str(exc)
-    accepted_sec = sum(
-        float(clip.get("timeline_duration_sec") or clip.get("duration_sec") or 0)
-        for clip in rolling_clips
-        if clip.get("status") == "accepted"
-    )
-    complete = bool(
-        rolling_clips
-        and planned_clip_count is not None
-        and len(rolling_clips) == planned_clip_count
-        and all(clip.get("status") == "accepted" for clip in rolling_clips)
-    )
+    accepted_sec = float(summary.get("accepted_sec") or 0.0)
+    planned_sec = summary.get("total_sec")
+    complete = bool(summary.get("complete"))
     return {
+        "continuity_state": summary.get("state") or episode.get("continuity_state") or "select_anchor",
+        "continuity_anchor_clip_id": summary.get("anchor_clip_id"),
+        "continuity_anchor_candidate_count": summary.get("anchor_candidate_count"),
+        "continuity_coverage_start_sec": summary.get("coverage_start_sec"),
+        "continuity_coverage_end_sec": summary.get("coverage_end_sec"),
+        "continuity_accepted_sec": accepted_sec,
+        "continuity_total_sec": planned_sec,
+        "continuity_complete": complete,
         "rolling_clip_count": len(rolling_clips),
-        "legacy_clip_count": len([clip for clip in clips if clip.get("input_kind") != "rolling"]),
+        "legacy_clip_count": len([clip for clip in clips if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS]),
         "rolling_planned_sec": planned_sec,
-        "rolling_planned_clip_count": planned_clip_count,
+        "rolling_planned_clip_count": None,
         "rolling_accepted_sec": accepted_sec,
         "rolling_remaining_sec": max(0.0, float(planned_sec) - accepted_sec) if planned_sec is not None else None,
         "rolling_complete": complete,
-        "rolling_plan_error": plan_error,
+        "rolling_plan_error": summary.get("error") or "",
     }
 
 
@@ -518,19 +542,13 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
     require_episode_mutation_lock(uuid, lock_token)
     integrity = episode_preprocess_integrity(uuid)
     if integrity["complete"]:
-        episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
-        first_clip = (
-            ensure_initial_rolling_clip(uuid, Path(episode["head_video_path"]))
-            if episode and episode.get("head_video_path")
-            else None
-        )
         return {
             "uuid": uuid,
             "status": "skipped",
             "reason": integrity["reason"],
             "duration_sec": integrity.get("duration_sec"),
-            "clip_count": 1 if first_clip else 0,
-            "clips": [first_clip] if first_clip else [],
+            "clip_count": 0,
+            "clips": [],
         }
     with db.connect() as conn:
         conn.execute("UPDATE episodes SET status='preprocessing', error=NULL, updated_at=? WHERE uuid=?", (now, uuid))
@@ -544,21 +562,22 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
         existing_head_path = Path(existing_head["head_video_path"]) if existing_head and existing_head.get("head_video_path") else head_path
         if not (preprocessed_dir / "metadata.json").exists() and existing_head_path.exists():
             duration = video_duration(existing_head_path)
+            clear_episode_clip_state(uuid)
             with db.connect() as conn:
                 conn.execute(
                     """
                     UPDATE episodes SET status='preprocessed', head_video_path=?, final_status='missing',
+                    continuity_state='select_anchor', anchor_clip_id=NULL,
                     error=NULL, updated_at=? WHERE uuid=?
                     """,
                     (str(existing_head_path.resolve()), db.now(), uuid),
                 )
-            first_clip = ensure_initial_rolling_clip(uuid, existing_head_path)
             return {
                 "uuid": uuid,
                 "status": "preprocessed",
                 "reason": integrity["reason"],
                 "head": {"output_path": str(existing_head_path.resolve()), "duration_sec": duration, "reused": True},
-                "clips": [first_clip] if first_clip else [],
+                "clips": [],
             }
         if not (preprocessed_dir / "metadata.json").exists():
             raise RuntimeError(f"Missing preprocessed metadata for {uuid}")
@@ -569,12 +588,12 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
             conn.execute(
                 """
                 UPDATE episodes SET status='preprocessed', head_video_path=?, final_status='missing',
+                continuity_state='select_anchor', anchor_clip_id=NULL,
                 local_path=?, error=NULL, updated_at=? WHERE uuid=?
                 """,
                 (str(head_path.resolve()), str(episode_dir.resolve()), db.now(), uuid),
             )
-        first_clip = ensure_initial_rolling_clip(uuid, head_path)
-        return {"uuid": uuid, "status": "preprocessed", "reason": integrity["reason"], "head": meta, "clips": [first_clip] if first_clip else []}
+        return {"uuid": uuid, "status": "preprocessed", "reason": integrity["reason"], "head": meta, "clips": []}
     except Exception as exc:
         with db.connect() as conn:
             conn.execute("UPDATE episodes SET status='failed', error=?, updated_at=? WHERE uuid=?", (str(exc), db.now(), uuid))
@@ -590,16 +609,22 @@ def clear_episode_clip_state(uuid: str) -> None:
         conn.execute("DELETE FROM reviews WHERE clip_id IN (SELECT id FROM clips WHERE episode_uuid=?)", (uuid,))
         conn.execute("DELETE FROM generation_jobs WHERE clip_id IN (SELECT id FROM clips WHERE episode_uuid=?)", (uuid,))
         conn.execute("DELETE FROM clips WHERE episode_uuid=?", (uuid,))
+        conn.execute(
+            """
+            UPDATE episodes
+            SET anchor_clip_id=NULL, continuity_state='select_anchor',
+                final_status='missing', preview_video_path=NULL, preview_status='missing',
+                preview_error=NULL, updated_at=?
+            WHERE uuid=?
+            """,
+            (db.now(), uuid),
+        )
     for directory in [CLIPS_DIR / uuid, GENERATED_DIR / uuid, ACCEPTED_DIR / uuid]:
         if directory.exists():
             shutil.rmtree(directory)
 
 
-def delete_rolling_clips_after(uuid: str, clip_index: int) -> int:
-    clips = db.rows(
-        "SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' AND clip_index>? ORDER BY clip_index",
-        (uuid, clip_index),
-    )
+def delete_clip_rows(uuid: str, clips: list[dict[str, Any]]) -> int:
     if not clips:
         return 0
     ids = [int(clip["id"]) for clip in clips]
@@ -621,6 +646,73 @@ def delete_rolling_clips_after(uuid: str, clip_index: int) -> int:
             for path in generated_dir.glob(f"clip_{int(clip['clip_index']):04d}_job_*"):
                 path.unlink(missing_ok=True)
     return len(clips)
+
+
+def delete_anchor_candidates_except(uuid: str, keep_clip_id: int) -> int:
+    clips = db.rows(
+        """
+        SELECT * FROM clips
+        WHERE episode_uuid=? AND input_kind='anchor' AND id<>?
+        ORDER BY clip_index
+        """,
+        (uuid, keep_clip_id),
+    )
+    return delete_clip_rows(uuid, clips)
+
+
+def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
+    uuid = clip["episode_uuid"]
+    input_kind = clip.get("input_kind") or ""
+    if input_kind == "anchor":
+        episode = db.one("SELECT anchor_clip_id FROM episodes WHERE uuid=?", (uuid,))
+        is_official_anchor = bool(episode and int(episode.get("anchor_clip_id") or 0) == int(clip["id"]))
+        clips = (
+            db.rows(
+                "SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY clip_index",
+                (uuid,),
+            )
+            if is_official_anchor
+            else []
+        )
+        deleted = delete_clip_rows(uuid, clips)
+        if is_official_anchor:
+            with db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET anchor_clip_id=NULL, continuity_state='anchor_candidates',
+                        final_status='stale', updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (db.now(), uuid),
+                )
+        return deleted
+    if input_kind != "rolling":
+        return 0
+    direction = str(clip.get("direction") or "forward")
+    if direction == "backward":
+        clips = db.rows(
+            """
+            SELECT * FROM clips
+            WHERE episode_uuid=? AND input_kind='rolling' AND direction='backward'
+              AND timeline_end_sec<=?
+              AND id<>?
+            ORDER BY timeline_start_sec
+            """,
+            (uuid, float(clip.get("timeline_start_sec") or 0) + TIME_EPSILON, int(clip["id"])),
+        )
+    else:
+        clips = db.rows(
+            """
+            SELECT * FROM clips
+            WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward'
+              AND timeline_start_sec>=?
+              AND id<>?
+            ORDER BY timeline_start_sec
+            """,
+            (uuid, float(clip.get("timeline_end_sec") or 0) - TIME_EPSILON, int(clip["id"])),
+        )
+    return delete_clip_rows(uuid, clips)
 
 
 def create_clips(uuid: str, head_path: Path, duration: float) -> list[dict[str, Any]]:
@@ -674,6 +766,8 @@ def import_head_video(uuid: str, source_path: str, lock_token: str | None = None
                 status='preprocessed',
                 head_video_path=excluded.head_video_path,
                 final_status='missing',
+                continuity_state='select_anchor',
+                anchor_clip_id=NULL,
                 error=NULL,
                 updated_at=excluded.updated_at
             """,
@@ -686,12 +780,11 @@ def import_head_video(uuid: str, source_path: str, lock_token: str | None = None
                 now,
             ),
         )
-    first_clip = ensure_initial_rolling_clip(uuid, head_path)
     return {
         "uuid": uuid,
         "head_video_path": str(head_path.resolve()),
         "duration_sec": duration,
-        "clips": [first_clip] if first_clip else [],
+        "clips": [],
     }
 
 
@@ -722,131 +815,474 @@ def queue_rolling_generation(
 
 
 def prepare_rolling_generation_clips() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    episodes = db.rows(
-        """
-        SELECT * FROM episodes
-        WHERE status='preprocessed' AND head_video_path IS NOT NULL
-        ORDER BY created_at
-        """
-    )
+    episodes = db.rows("SELECT * FROM episodes WHERE status='preprocessed' AND head_video_path IS NOT NULL ORDER BY created_at")
     prepared: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for episode in episodes:
-        result = prepare_rolling_clip_for_episode(episode)
-        if result.get("clip"):
-            prepared.append(result["clip"])
+        results = prepare_rolling_clips_for_episode(episode)
+        episode_clips = [item["clip"] for item in results if item.get("clip")]
+        if episode_clips:
+            prepared.extend(episode_clips)
         else:
-            skipped.append(result)
+            skipped.extend(results or [rolling_skip(episode["uuid"], "waiting for anchor candidates")])
     return prepared, skipped
 
 
-def prepare_rolling_clip_for_episode(episode: dict[str, Any]) -> dict[str, Any]:
+def prepare_rolling_clips_for_episode(episode: dict[str, Any]) -> list[dict[str, Any]]:
     uuid = episode["uuid"]
     head_value = episode.get("head_video_path")
     if not head_value:
-        return rolling_skip(uuid, "head video path missing")
+        return [rolling_skip(uuid, "head video path missing")]
     head_path = Path(head_value)
     if not head_path.exists():
-        return rolling_skip(uuid, "head video file missing")
+        return [rolling_skip(uuid, "head video file missing")]
     try:
-        plan = rolling_clip_plan(video_duration(head_path))
+        duration = continuity_total_duration(head_path)
     except Exception as exc:
-        return rolling_skip(uuid, str(exc))
-    if not plan:
-        return rolling_skip(uuid, "rolling plan is empty")
-
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
-    legacy = [clip for clip in clips if clip.get("input_kind") != "rolling"]
+        return [rolling_skip(uuid, str(exc))]
+    if duration < MIN_SEEDANCE_INPUT_SEC:
+        return [rolling_skip(uuid, f"episode is too short for seedance continuity: {duration:.3f}s")]
+    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY timeline_start_sec, clip_index", (uuid,))
+    legacy = [clip for clip in clips if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS]
     if legacy:
-        return rolling_skip(uuid, "legacy split clips exist; rolling generation skipped")
-    if clips:
-        last = clips[-1]
-        if last["status"] in GENERATION_CANDIDATE_STATUSES:
-            try:
-                ensure_rolling_clip_input(last)
-            except Exception as exc:
-                return rolling_skip(uuid, f"cannot rebuild rolling input for clip {last['id']}: {exc}")
-            return {"episode_uuid": uuid, "clip": db.one("SELECT * FROM clips WHERE id=?", (last["id"],)) or last}
-        if last["status"] in {"generated", "flagged", "generating", "preparing"}:
-            return rolling_skip(uuid, f"waiting for clip {last['id']} status {last['status']}")
-        if last["status"] != "accepted":
-            return rolling_skip(uuid, f"clip {last['id']} status is {last['status']}")
-        if len(clips) >= len(plan):
-            final = maybe_stitch_episode(uuid)
-            return {
-                "episode_uuid": uuid,
-                "status": "skipped",
-                "reason": "rolling episode complete",
-                "final": final,
-            }
+        return [rolling_skip(uuid, "legacy split clips exist; continuity generation skipped")]
+    if not clips:
+        update_continuity_state(uuid)
+        return [rolling_skip(uuid, "waiting for anchor candidates")]
 
-    next_index = len(clips)
-    plan_item = plan[next_index]
-    previous_clip = clips[-1] if clips else None
-    previous_accepted_path = None
-    if previous_clip:
-        previous_accepted_path = latest_accepted_path(int(previous_clip["id"]))
-        if not previous_accepted_path:
-            return rolling_skip(uuid, f"accepted anchor missing for clip {previous_clip['id']}")
-    clip = insert_rolling_clip(uuid, plan_item)
-    try:
-        build_rolling_clip_input(clip, previous_accepted_path)
-    except Exception as exc:
+    results: list[dict[str, Any]] = []
+    for clip in clips:
+        if clip["status"] not in GENERATION_CANDIDATE_STATUSES:
+            continue
+        if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS:
+            continue
+        try:
+            ensure_continuity_clip_input(clip)
+        except Exception as exc:
+            results.append(rolling_skip(uuid, f"cannot rebuild input for clip {clip['id']}: {exc}"))
+            continue
+        results.append({"episode_uuid": uuid, "clip": db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip})
+    if not results:
+        active = next((clip for clip in clips if clip["status"] in {"generated", "flagged", "generating", "preparing"}), None)
+        reason = f"waiting for clip {active['id']} status {active['status']}" if active else "no pending continuity clips"
+        results.append(rolling_skip(uuid, reason))
+    update_continuity_state(uuid)
+    return results
+
+
+def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str | None = None) -> dict[str, Any]:
+    uuid = uuid.lower()
+    require_episode_mutation_lock(uuid, lock_token)
+    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    if not episode:
+        raise ValueError("episode not found")
+    if episode.get("status") != "preprocessed" or not episode.get("head_video_path"):
+        raise ValueError("episode head video is not ready")
+    if episode.get("anchor_clip_id"):
+        raise ValueError("official anchor already selected")
+    head_path = Path(episode["head_video_path"])
+    if not head_path.exists():
+        raise ValueError("episode head video file missing")
+    total = continuity_total_duration(head_path)
+    if total < ANCHOR_CLIP_DURATION_SEC:
+        raise ValueError(f"episode is too short for a {ANCHOR_CLIP_DURATION_SEC}s anchor")
+    starts = normalize_anchor_starts(start_secs, total, continuity_overlap())
+    existing_keys = {
+        int(round(float(row.get("timeline_start_sec") or row.get("start_sec") or 0.0) * 1000))
+        for row in db.rows("SELECT timeline_start_sec, start_sec FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+    }
+    created = []
+    for start in starts:
+        if int(round(start * 1000)) in existing_keys:
+            continue
+        plan_item = {
+            "start_sec": start,
+            "duration_sec": float(ANCHOR_CLIP_DURATION_SEC),
+            "source_start_sec": start,
+            "source_duration_sec": float(ANCHOR_CLIP_DURATION_SEC),
+            "overlap_sec": 0.0,
+            "timeline_duration_sec": float(ANCHOR_CLIP_DURATION_SEC),
+            "timeline_start_sec": start,
+            "timeline_end_sec": start + ANCHOR_CLIP_DURATION_SEC,
+            "input_timeline_start_sec": start,
+            "input_timeline_end_sec": start + ANCHOR_CLIP_DURATION_SEC,
+            "input_kind": "anchor",
+            "direction": "anchor",
+        }
+        clip = insert_continuity_clip(uuid, plan_item)
+        try:
+            build_continuity_clip_input(clip)
+        except Exception:
+            with db.connect() as conn:
+                conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=?", (db.now(), clip["id"]))
+            raise
         with db.connect() as conn:
-            conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=?", (db.now(), clip["id"]))
-        return rolling_skip(uuid, f"cannot build rolling input for clip {clip['id']}: {exc}")
+            conn.execute("UPDATE clips SET status='pending', updated_at=? WHERE id=?", (db.now(), clip["id"]))
+        created.append(db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip)
+        existing_keys.add(int(round(start * 1000)))
     with db.connect() as conn:
-        conn.execute("UPDATE clips SET status='pending', updated_at=? WHERE id=?", (db.now(), clip["id"]))
-    return {"episode_uuid": uuid, "clip": db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip}
+        conn.execute(
+            """
+            UPDATE episodes
+            SET continuity_state='anchor_candidates', final_status='stale', updated_at=?
+            WHERE uuid=?
+            """,
+            (db.now(), uuid),
+        )
+    return {"uuid": uuid, "created": created, "continuity_state": "anchor_candidates"}
 
 
-def ensure_initial_rolling_clip(uuid: str, head_path: Path) -> dict[str, Any] | None:
-    plan = rolling_clip_plan(video_duration(head_path))
-    if not plan:
-        return None
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
-    if any(clip.get("input_kind") != "rolling" for clip in clips):
-        return None
-    if clips:
-        return clips[0]
-    clip = insert_rolling_clip(uuid, plan[0])
+def normalize_anchor_starts(start_secs: list[float], total_duration: float, overlap: float | None = None) -> list[float]:
+    if not start_secs:
+        raise ValueError("at least one anchor start is required")
+    max_start = max(0.0, total_duration - ANCHOR_CLIP_DURATION_SEC)
+    overlap = continuity_overlap() if overlap is None else float(overlap)
+    result: list[float] = []
+    seen: set[int] = set()
+    for value in start_secs:
+        start = min(max(0.0, float(int(float(value)))), max_start)
+        key = int(round(start * 1000))
+        if key in seen:
+            continue
+        validate_anchor_start(start, total_duration, overlap)
+        seen.add(key)
+        result.append(start)
+    if not result:
+        raise ValueError("no valid anchor starts")
+    return result
+
+
+def math_floor_millis(value: float) -> float:
+    return int(value * 1000) / 1000.0
+
+
+def continuity_total_duration(head_path: Path) -> float:
+    total = int(video_duration(head_path) + TIME_EPSILON)
+    if total <= 0:
+        return 0.0
+    return float(total)
+
+
+def continuity_overlap(settings: dict[str, Any] | None = None) -> float:
+    settings = settings or load_settings()
     try:
-        build_rolling_clip_input(clip, None)
-    except Exception:
-        with db.connect() as conn:
-            conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=?", (db.now(), clip["id"]))
-        raise
-    with db.connect() as conn:
-        conn.execute("UPDATE clips SET status='pending', updated_at=? WHERE id=?", (db.now(), clip["id"]))
-    return db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip
+        overlap = int(round(float(settings.get("continuity_overlap_sec", 1))))
+    except (TypeError, ValueError):
+        overlap = 1
+    return float(max(0, min(overlap, MAX_SEEDANCE_INPUT_SEC - MIN_SEEDANCE_INPUT_SEC)))
 
 
-def maybe_prepare_next_rolling_clip_after_accept(uuid: str, accepted_clip_id: int, accepted_path: str | None) -> dict[str, Any] | None:
-    if not accepted_path:
-        return None
-    accepted_clip = db.one("SELECT * FROM clips WHERE id=?", (accepted_clip_id,))
-    if not accepted_clip or accepted_clip.get("input_kind") != "rolling":
-        return None
-    accepted_index = int(accepted_clip["clip_index"])
-    later = db.one(
-        "SELECT * FROM clips WHERE episode_uuid=? AND clip_index>? ORDER BY clip_index LIMIT 1",
-        (uuid, accepted_index),
+def choose_timeline_duration(remaining: float, overlap: float) -> float:
+    remaining = float(remaining)
+    if remaining <= TIME_EPSILON:
+        return 0.0
+    max_timeline = MAX_SEEDANCE_INPUT_SEC - overlap
+    min_timeline = max(0.001, MIN_SEEDANCE_INPUT_SEC - overlap)
+    if max_timeline <= 0:
+        raise ValueError("overlap leaves no room for source video")
+    if remaining <= max_timeline + TIME_EPSILON:
+        if remaining + overlap + TIME_EPSILON < MIN_SEEDANCE_INPUT_SEC:
+            raise ValueError(f"remaining timeline {remaining:.3f}s cannot make a legal Seedance input")
+        return remaining
+    duration = min(max_timeline, remaining)
+    tail = remaining - duration
+    if 0 < tail < min_timeline:
+        borrow = min_timeline - tail
+        duration -= borrow
+    if duration + overlap + TIME_EPSILON < MIN_SEEDANCE_INPUT_SEC or duration + overlap > MAX_SEEDANCE_INPUT_SEC + TIME_EPSILON:
+        raise ValueError(f"cannot choose legal continuity duration from remaining {remaining:.3f}s")
+    return duration
+
+
+def validate_anchor_start(start: float, total_duration: float, overlap: float) -> None:
+    left_remaining = float(start)
+    right_remaining = float(total_duration) - float(start) - ANCHOR_CLIP_DURATION_SEC
+    for label, remaining in [("left", left_remaining), ("right", right_remaining)]:
+        if remaining <= TIME_EPSILON:
+            continue
+        try:
+            choose_timeline_duration(remaining, overlap)
+        except ValueError as exc:
+            raise ValueError(
+                f"anchor start {start:.0f}s leaves an illegal {label} side of {remaining:.3f}s"
+            ) from exc
+
+
+def clip_timeline_start(clip: dict[str, Any]) -> float:
+    value = clip.get("timeline_start_sec")
+    if value is None:
+        value = clip.get("source_start_sec") if clip.get("source_start_sec") is not None else clip.get("start_sec")
+    return float(value or 0.0)
+
+
+def clip_timeline_end(clip: dict[str, Any]) -> float:
+    value = clip.get("timeline_end_sec")
+    if value is not None:
+        return float(value)
+    return clip_timeline_start(clip) + float(clip.get("timeline_duration_sec") or clip.get("duration_sec") or 0.0)
+
+
+def clip_input_timeline_start(clip: dict[str, Any]) -> float:
+    value = clip.get("input_timeline_start_sec")
+    if value is None:
+        value = clip.get("start_sec")
+    return float(value or 0.0)
+
+
+def continuity_relevant_clips(
+    clips: list[dict[str, Any]],
+    anchor_clip_id: int | None = None,
+) -> list[dict[str, Any]]:
+    result = []
+    for clip in clips:
+        input_kind = clip.get("input_kind")
+        if input_kind not in CONTINUITY_INPUT_KINDS:
+            continue
+        if input_kind == "anchor" and anchor_clip_id and int(clip["id"]) != anchor_clip_id:
+            continue
+        result.append(clip)
+    return sorted(result, key=lambda item: (clip_timeline_start(item), int(item.get("clip_index") or 0)))
+
+
+def continuity_coverage(
+    clips: list[dict[str, Any]],
+) -> dict[str, Any]:
+    accepted = [clip for clip in continuity_relevant_clips(clips) if clip.get("status") == "accepted"]
+    if not accepted:
+        return {"coverage_start_sec": None, "coverage_end_sec": None, "accepted_sec": 0.0, "has_gaps": True}
+    accepted.sort(key=lambda item: (clip_timeline_start(item), clip_timeline_end(item)))
+    coverage_start = clip_timeline_start(accepted[0])
+    coverage_end = clip_timeline_end(accepted[0])
+    accepted_sec = max(0.0, coverage_end - coverage_start)
+    has_gaps = False
+    for clip in accepted[1:]:
+        start = clip_timeline_start(clip)
+        end = clip_timeline_end(clip)
+        accepted_sec += max(0.0, end - start)
+        if start > coverage_end + TIME_EPSILON:
+            has_gaps = True
+        coverage_end = max(coverage_end, end)
+    return {
+        "coverage_start_sec": coverage_start,
+        "coverage_end_sec": coverage_end,
+        "accepted_sec": accepted_sec,
+        "has_gaps": has_gaps,
+    }
+
+
+def continuity_timeline_summary(
+    uuid: str,
+    clips: list[dict[str, Any]] | None = None,
+    episode: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    episode = episode or db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    clips = clips if clips is not None else db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY timeline_start_sec, clip_index", (uuid,))
+    if not episode:
+        return {"state": "prepare_head", "complete": False, "error": "episode not found"}
+    total = None
+    error = ""
+    head_value = episode.get("head_video_path")
+    if head_value and Path(head_value).exists():
+        try:
+            total = continuity_total_duration(Path(head_value))
+        except Exception as exc:
+            error = str(exc)
+    anchor_clip_id = int(episode.get("anchor_clip_id") or 0) or None
+    anchor_candidates = [clip for clip in clips if clip.get("input_kind") == "anchor"]
+    official_anchor = db.one("SELECT * FROM clips WHERE id=?", (anchor_clip_id,)) if anchor_clip_id else None
+    if official_anchor and official_anchor.get("status") != "accepted":
+        official_anchor = None
+        anchor_clip_id = None
+    relevant = continuity_relevant_clips(clips, anchor_clip_id)
+    coverage = continuity_coverage(relevant)
+    complete = bool(
+        total is not None
+        and official_anchor
+        and not coverage["has_gaps"]
+        and coverage["coverage_start_sec"] is not None
+        and float(coverage["coverage_start_sec"]) <= TIME_EPSILON
+        and float(coverage["coverage_end_sec"]) >= float(total) - TIME_EPSILON
+        and all(clip.get("status") == "accepted" for clip in relevant)
     )
-    if later:
+    final_status = episode.get("final_status") or "missing"
+    if episode.get("status") != "preprocessed" or not head_value:
+        state = "prepare_head"
+    elif not official_anchor:
+        state = "anchor_candidates" if anchor_candidates else "select_anchor"
+    elif final_status == "ready" and complete:
+        state = "complete"
+    elif final_status == "stitching" and complete:
+        state = "stitching"
+    elif complete:
+        state = "ready_to_stitch"
+    else:
+        state = "bidirectional"
+    return {
+        "state": state,
+        "complete": complete,
+        "total_sec": total,
+        "anchor_clip_id": anchor_clip_id,
+        "anchor_candidate_count": len(anchor_candidates),
+        "relevant_clip_count": len(relevant),
+        "error": error,
+        **coverage,
+    }
+
+
+def update_continuity_state(uuid: str) -> dict[str, Any]:
+    summary = continuity_timeline_summary(uuid)
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE episodes
+            SET continuity_state=?, anchor_clip_id=?, updated_at=?
+            WHERE uuid=?
+            """,
+            (summary["state"], summary.get("anchor_clip_id"), db.now(), uuid),
+        )
+    return summary
+
+
+def trim_continuity_contribution(
+    clip: dict[str, Any],
+    accepted_path: Path,
+    dst: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    timeline_start = clip_timeline_start(clip)
+    timeline_end = clip_timeline_end(clip)
+    duration = max(0.0, timeline_end - timeline_start)
+    trim_start = max(0.0, timeline_start - clip_input_timeline_start(clip))
+    if duration <= TIME_EPSILON:
+        raise ValueError(f"clip {clip['id']} has empty timeline contribution")
+    if trim_start <= TIME_EPSILON and abs(duration - float(clip.get("duration_sec") or duration)) <= TIME_EPSILON:
+        return accepted_path
+    trim_video(accepted_path, dst, trim_start, duration, should_cancel=should_cancel)
+    return dst
+
+
+def stitchable_clips(uuid: str, clips: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    clips = clips if clips is not None else db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    continuity = [clip for clip in clips if clip.get("input_kind") in CONTINUITY_INPUT_KINDS]
+    if not continuity:
+        return sorted(clips, key=lambda item: int(item.get("clip_index") or 0))
+    summary = continuity_timeline_summary(uuid, clips)
+    return continuity_relevant_clips(clips, int(summary["anchor_clip_id"]) if summary.get("anchor_clip_id") else None)
+
+
+def maybe_prepare_next_continuity_clips_after_accept(
+    uuid: str,
+    accepted_clip_id: int,
+    accepted_path: str | None,
+) -> list[dict[str, Any]]:
+    if not accepted_path:
+        return []
+    accepted_clip = db.one("SELECT * FROM clips WHERE id=?", (accepted_clip_id,))
+    if not accepted_clip or accepted_clip.get("input_kind") not in CONTINUITY_INPUT_KINDS:
+        return []
+    if accepted_clip.get("input_kind") == "anchor":
+        deleted = delete_anchor_candidates_except(uuid, accepted_clip_id)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale', updated_at=?
+                WHERE uuid=?
+                """,
+                (accepted_clip_id, db.now(), uuid),
+            )
+        prepared = []
+        for direction in ["backward", "forward"]:
+            clip = maybe_prepare_direction_clip(uuid, direction)
+            if clip:
+                prepared.append(clip)
+        update_continuity_state(uuid)
+        if deleted:
+            for item in prepared:
+                item["deleted_anchor_candidate_count"] = deleted
+        return prepared
+    if accepted_clip.get("input_kind") == "rolling":
+        direction = str(accepted_clip.get("direction") or "forward")
+        clip = maybe_prepare_direction_clip(uuid, direction)
+        update_continuity_state(uuid)
+        return [clip] if clip else []
+    return []
+
+
+def maybe_prepare_direction_clip(uuid: str, direction: str) -> dict[str, Any] | None:
+    if direction not in {"forward", "backward"}:
         return None
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
-    if not episode or not episode.get("head_video_path"):
+    if not episode or not episode.get("head_video_path") or not episode.get("anchor_clip_id"):
         return None
     head_path = Path(episode["head_video_path"])
     if not head_path.exists():
         return None
-    plan = rolling_clip_plan(video_duration(head_path))
-    next_index = accepted_index + 1
-    if next_index >= len(plan):
+    total = continuity_total_duration(head_path)
+    anchor_id = int(episode["anchor_clip_id"])
+    anchor = db.one("SELECT * FROM clips WHERE id=? AND status='accepted'", (anchor_id,))
+    if not anchor:
         return None
-    clip = insert_rolling_clip(uuid, plan[next_index])
+    existing_open = db.one(
+        """
+        SELECT * FROM clips
+        WHERE episode_uuid=? AND input_kind='rolling' AND direction=?
+          AND status IN ('pending','generated_failed','rejected','generating','generated','flagged','preparing')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (uuid, direction),
+    )
+    if existing_open:
+        return None
+    accepted = db.rows(
+        """
+        SELECT * FROM clips
+        WHERE episode_uuid=? AND input_kind IN ('anchor','rolling') AND status='accepted'
+        ORDER BY timeline_start_sec, clip_index
+        """,
+        (uuid,),
+    )
+    overlap = continuity_overlap()
+    if direction == "forward":
+        boundary = max(float(clip.get("timeline_end_sec") or 0) for clip in accepted)
+        remaining = total - boundary
+        if remaining <= TIME_EPSILON:
+            return None
+        timeline_duration = choose_timeline_duration(remaining, overlap)
+        timeline_start = boundary
+        timeline_end = boundary + timeline_duration
+        source_start = timeline_start
+        input_timeline_start = timeline_start - overlap
+        input_timeline_end = timeline_end
+    else:
+        boundary = min(float(clip.get("timeline_start_sec") or 0) for clip in accepted)
+        remaining = boundary
+        if remaining <= TIME_EPSILON:
+            return None
+        timeline_duration = choose_timeline_duration(remaining, overlap)
+        timeline_start = boundary - timeline_duration
+        timeline_end = boundary
+        source_start = timeline_start
+        input_timeline_start = timeline_start
+        input_timeline_end = timeline_end + overlap
+    plan_item = {
+        "start_sec": input_timeline_start,
+        "duration_sec": timeline_duration + overlap,
+        "source_start_sec": source_start,
+        "source_duration_sec": timeline_duration,
+        "overlap_sec": overlap,
+        "timeline_duration_sec": timeline_duration,
+        "timeline_start_sec": timeline_start,
+        "timeline_end_sec": timeline_end,
+        "input_timeline_start_sec": input_timeline_start,
+        "input_timeline_end_sec": input_timeline_end,
+        "input_kind": "rolling",
+        "direction": direction,
+    }
+    clip = insert_continuity_clip(uuid, plan_item)
     try:
-        build_rolling_clip_input(clip, Path(accepted_path))
+        build_continuity_clip_input(clip)
     except Exception as exc:
         with db.connect() as conn:
             conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=?", (db.now(), clip["id"]))
@@ -862,8 +1298,8 @@ def rolling_skip(uuid: str, reason: str) -> dict[str, Any]:
     return {"episode_uuid": uuid, "status": "skipped", "reason": reason}
 
 
-def insert_rolling_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
-    clip_index = int(plan_item["clip_index"])
+def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
+    clip_index = int(plan_item.get("clip_index") or next_clip_index(uuid))
     path = CLIPS_DIR / uuid / f"clip_{clip_index:04d}.mp4"
     public_url = public_url_for("clips", Path(uuid) / path.name)
     now = db.now()
@@ -879,10 +1315,12 @@ def insert_rolling_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO clips(
                 episode_uuid, clip_index, start_sec, duration_sec,
-                source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec, input_kind,
+                source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec,
+                timeline_start_sec, timeline_end_sec, input_timeline_start_sec, input_timeline_end_sec,
+                direction, input_kind,
                 local_path, public_url, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'rolling', ?, ?, 'preparing', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
             """,
             (
                 uuid,
@@ -893,6 +1331,12 @@ def insert_rolling_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
                 float(plan_item["source_duration_sec"]),
                 float(plan_item["overlap_sec"]),
                 float(plan_item["timeline_duration_sec"]),
+                float(plan_item["timeline_start_sec"]),
+                float(plan_item["timeline_end_sec"]),
+                float(plan_item["input_timeline_start_sec"]),
+                float(plan_item["input_timeline_end_sec"]),
+                str(plan_item.get("direction") or "forward"),
+                str(plan_item.get("input_kind") or "rolling"),
                 str(path.resolve()),
                 public_url,
                 now,
@@ -907,39 +1351,70 @@ def insert_rolling_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
     return db.one("SELECT * FROM clips WHERE id=?", (clip_id,)) or {"id": clip_id, "episode_uuid": uuid}
 
 
-def ensure_rolling_clip_input(clip: dict[str, Any]) -> None:
+def next_clip_index(uuid: str) -> int:
+    row = db.one("SELECT COALESCE(MAX(clip_index), -1) + 1 AS next_index FROM clips WHERE episode_uuid=?", (uuid,))
+    return int(row["next_index"] if row else 0)
+
+
+def ensure_continuity_clip_input(clip: dict[str, Any]) -> None:
     path = Path(clip["local_path"])
     if path.exists():
         return
-    previous_accepted_path = None
-    if float(clip.get("overlap_sec") or 0) > 0:
-        previous = db.one(
-            "SELECT * FROM clips WHERE episode_uuid=? AND clip_index=? AND input_kind='rolling'",
-            (clip["episode_uuid"], int(clip["clip_index"]) - 1),
-        )
-        if not previous:
-            raise RuntimeError("previous rolling clip is missing")
-        previous_accepted_path = latest_accepted_path(int(previous["id"]))
-        if not previous_accepted_path:
-            raise RuntimeError("previous accepted output is missing")
-    build_rolling_clip_input(clip, previous_accepted_path)
+    build_continuity_clip_input(clip)
 
 
-def build_rolling_clip_input(clip: dict[str, Any], previous_accepted_path: Path | None) -> None:
+def build_continuity_clip_input(clip: dict[str, Any]) -> None:
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (clip["episode_uuid"],))
     if not episode or not episode.get("head_video_path"):
         raise RuntimeError("episode head video path missing")
     head_path = Path(episode["head_video_path"])
     if not head_path.exists():
         raise RuntimeError("episode head video file missing")
-    compose_rolling_input(
+    anchor_path = None
+    overlap = float(clip.get("overlap_sec") or 0)
+    direction = str(clip.get("direction") or "forward")
+    if overlap > 0:
+        anchor_path = adjacent_accepted_path(clip)
+        if not anchor_path:
+            raise RuntimeError("adjacent accepted output is missing")
+    if clip.get("input_kind") == "anchor":
+        direction = "forward"
+    compose_continuity_input(
         head_path,
         Path(clip["local_path"]),
         float(clip.get("source_start_sec") if clip.get("source_start_sec") is not None else clip["start_sec"]),
         float(clip.get("source_duration_sec") if clip.get("source_duration_sec") is not None else clip["duration_sec"]),
-        previous_accepted_path,
-        float(clip.get("overlap_sec") or 0),
+        direction,
+        anchor_path,
+        overlap,
     )
+
+
+def adjacent_accepted_path(clip: dict[str, Any]) -> Path | None:
+    direction = str(clip.get("direction") or "forward")
+    if direction == "backward":
+        neighbor = db.one(
+            """
+            SELECT * FROM clips
+            WHERE episode_uuid=? AND input_kind IN ('anchor','rolling') AND status='accepted'
+              AND timeline_start_sec>=?
+            ORDER BY timeline_start_sec ASC
+            LIMIT 1
+            """,
+            (clip["episode_uuid"], float(clip.get("timeline_end_sec") or 0) - TIME_EPSILON),
+        )
+    else:
+        neighbor = db.one(
+            """
+            SELECT * FROM clips
+            WHERE episode_uuid=? AND input_kind IN ('anchor','rolling') AND status='accepted'
+              AND timeline_end_sec<=?
+            ORDER BY timeline_end_sec DESC
+            LIMIT 1
+            """,
+            (clip["episode_uuid"], float(clip.get("timeline_start_sec") or 0) + TIME_EPSILON),
+        )
+    return latest_accepted_path(int(neighbor["id"])) if neighbor else None
 
 
 def latest_accepted_path(clip_id: int) -> Path | None:
@@ -967,10 +1442,10 @@ def queue_generation_for_selected_clips(
     mode = mode or DEFAULT_REQUEST_MODE
     if mode not in {"mock", "seedance"}:
         raise ValueError("mode must be mock or seedance")
-    available = filter_generation_clips(clips, {}, strict=False)
+    operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    available = filter_generation_clips(clips, {}, strict=False, operator_id=operator_id)
     if not available:
         return []
-    operator_id, operator_name = normalize_operator(operator_id, operator_name)
     generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     if dry_run or (mode == "mock" and not settings.get("mock_async")):
         client = SeedanceClient(settings)
@@ -1035,11 +1510,16 @@ def run_generation(
             f"SELECT * FROM clips WHERE status IN ({GENERATION_CANDIDATE_STATUS_PLACEHOLDERS}) ORDER BY episode_uuid, clip_index",
             GENERATION_CANDIDATE_STATUSES,
         )
-    clips = filter_generation_clips(clips, lock_tokens or {}, strict=clip_ids is not None)
+    operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    clips = filter_generation_clips(
+        clips,
+        lock_tokens or {},
+        strict=clip_ids is not None,
+        operator_id=operator_id,
+    )
     if not clips:
         return []
     client = SeedanceClient(settings)
-    operator_id, operator_name = normalize_operator(operator_id, operator_name)
     generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     concurrency_key = "mock_concurrency" if mode == "mock" or dry_run else "seedance_concurrency"
     max_workers = max(1, int(settings.get(concurrency_key, 1)))
@@ -1095,11 +1575,16 @@ def queue_generation(
             f"SELECT * FROM clips WHERE status IN ({GENERATION_CANDIDATE_STATUS_PLACEHOLDERS}) ORDER BY episode_uuid, clip_index",
             GENERATION_CANDIDATE_STATUSES,
         )
-    clips = filter_generation_clips(clips, lock_tokens or {}, strict=clip_ids is not None)
+    operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    clips = filter_generation_clips(
+        clips,
+        lock_tokens or {},
+        strict=clip_ids is not None,
+        operator_id=operator_id,
+    )
     if not clips:
         return []
     claimed = []
-    operator_id, operator_name = normalize_operator(operator_id, operator_name)
     generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     for clip in clips:
         item = claim_async_generation_job(clip, mode, settings, force, operator_id, operator_name, generation_prompt, generation_refs)
@@ -1341,12 +1826,26 @@ def filter_generation_clips(
     clips: list[dict[str, Any]],
     lock_tokens: dict[str, str],
     strict: bool,
+    operator_id: str = "",
 ) -> list[dict[str, Any]]:
     active_clip_locks = locks_by_resource("clip")
+    active_episode_locks = locks_by_resource("episode")
     available = []
     for clip in clips:
         clip_id = str(clip["id"])
+        episode_uuid = str(clip["episode_uuid"])
         clip_token = lock_tokens.get(clip_id)
+        episode_token = lock_tokens.get(episode_uuid)
+        if episode_uuid in active_episode_locks:
+            lock = active_episode_locks[episode_uuid]
+            if episode_token:
+                require_lock("episode", episode_uuid, episode_token)
+            elif operator_id and lock.get("owner_id") == operator_id:
+                pass
+            elif strict:
+                require_lock("episode", episode_uuid, None)
+            else:
+                continue
         if clip_id in active_clip_locks:
             if clip_token:
                 require_lock("clip", clip_id, clip_token)
@@ -1705,11 +2204,16 @@ def retry_clip(
         raise ValueError("clip not found")
     if require_lock_token:
         require_lock("episode", clip["episode_uuid"], lock_token)
+    deleted_future_clip_count = (
+        delete_dependent_continuity_clips(clip)
+        if clip.get("input_kind") in CONTINUITY_INPUT_KINDS
+        else 0
+    )
     tokens = {str(clip["episode_uuid"]): lock_token} if lock_token else {}
     normalized_operator_id, normalized_operator_name = normalize_operator(operator_id, operator_name)
     if not normalized_operator_id:
         normalized_operator_id, normalized_operator_name = operator_from_lock_token(lock_token)
-    return queue_generation(
+    result = queue_generation(
         clip_ids=[clip_id],
         mode=mode,
         lock_tokens=tokens,
@@ -1719,6 +2223,10 @@ def retry_clip(
         prompt=prompt,
         reference_images=reference_images,
     )[0]
+    result["deleted_future_clip_count"] = deleted_future_clip_count
+    if clip.get("input_kind") in CONTINUITY_INPUT_KINDS:
+        update_continuity_state(clip["episode_uuid"])
+    return result
 
 
 def review_clip(
@@ -1805,22 +2313,24 @@ def review_clip(
         conn.execute("UPDATE clips SET status=?, updated_at=? WHERE id=?", (status, now, clip_id))
         conn.execute("UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=?", (now, clip["episode_uuid"]))
     deleted_future_clip_count = (
-        delete_rolling_clips_after(clip["episode_uuid"], int(clip["clip_index"]))
-        if decision in {"reject", "rerun"} and clip.get("input_kind") == "rolling"
+        delete_dependent_continuity_clips(clip)
+        if decision in {"reject", "rerun"} and clip.get("input_kind") in CONTINUITY_INPUT_KINDS
         else 0
     )
-    next_clip = (
-        maybe_prepare_next_rolling_clip_after_accept(clip["episode_uuid"], clip_id, accepted_path)
+    next_clips = (
+        maybe_prepare_next_continuity_clips_after_accept(clip["episode_uuid"], clip_id, accepted_path)
         if decision == "accept"
-        else None
+        else []
     )
+    update_continuity_state(clip["episode_uuid"])
     preview = queue_preview_episode(clip["episode_uuid"])
     final = maybe_stitch_episode(clip["episode_uuid"])
     return {
         "clip_id": clip_id,
         "decision": decision,
         "accepted_path": accepted_path,
-        "next_clip": next_clip,
+        "next_clip": next_clips[0] if next_clips else None,
+        "next_clips": next_clips,
         "deleted_future_clip_count": deleted_future_clip_count,
         "preview": preview,
         "final": final,
@@ -1985,30 +2495,48 @@ def preview_stitch_inputs(
         if should_cancel and should_cancel():
             raise RuntimeError("preview cancelled")
 
-    rolling = [clip for clip in clips if clip.get("input_kind") == "rolling"]
-    if rolling and len(rolling) == len(clips):
+    continuity = [clip for clip in clips if clip.get("input_kind") in CONTINUITY_INPUT_KINDS]
+    if continuity:
         episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
-        plan = rolling_clip_plan(video_duration(Path(episode["head_video_path"]))) if episode and episode.get("head_video_path") else []
-        by_index = {int(clip["clip_index"]): clip for clip in rolling}
+        total = None
+        if episode and episode.get("head_video_path") and Path(episode["head_video_path"]).exists():
+            total = continuity_total_duration(Path(episode["head_video_path"]))
+        summary = continuity_timeline_summary(uuid, clips, episode)
+        relevant = continuity_relevant_clips(
+            clips,
+            int(summary["anchor_clip_id"]) if summary.get("anchor_clip_id") else None,
+        )
         items: list[Path] = []
-        for plan_item in plan:
+        cursor = 0.0
+        black_index = 0
+        for clip in relevant:
             check_cancelled()
-            index = int(plan_item["clip_index"])
-            clip = by_index.get(index)
-            timeline = float(plan_item["timeline_duration_sec"])
-            overlap = float(plan_item["overlap_sec"])
-            if clip and int(clip["id"]) in accepted_by_id:
+            start = clip_timeline_start(clip)
+            end = clip_timeline_end(clip)
+            if end <= cursor + TIME_EPSILON:
+                continue
+            if start > cursor + TIME_EPSILON:
+                black = tmp_root / f"preview_gap_{black_index:04d}.mp4"
+                black_index += 1
+                black_video(black, start - cursor, should_cancel=should_cancel)
+                items.append(black)
+            timeline = max(0.0, end - max(start, cursor))
+            if timeline <= TIME_EPSILON:
+                cursor = max(cursor, end)
+                continue
+            if int(clip["id"]) in accepted_by_id:
                 accepted_path = accepted_by_id[int(clip["id"])]
-                if overlap > 0:
-                    trimmed = tmp_root / f"preview_clip_{index:04d}_trimmed.mp4"
-                    trim_video(accepted_path, trimmed, overlap, timeline, should_cancel=should_cancel)
-                    items.append(trimmed)
-                else:
-                    items.append(accepted_path)
+                trimmed = tmp_root / f"preview_clip_{int(clip['clip_index']):04d}_trimmed.mp4"
+                items.append(trim_continuity_contribution(clip, accepted_path, trimmed, should_cancel=should_cancel))
             else:
-                black = tmp_root / f"preview_clip_{index:04d}_black.mp4"
+                black = tmp_root / f"preview_clip_{int(clip['clip_index']):04d}_black.mp4"
                 black_video(black, timeline, should_cancel=should_cancel)
                 items.append(black)
+            cursor = max(cursor, end)
+        if total is not None and total > cursor + TIME_EPSILON:
+            black = tmp_root / f"preview_gap_{black_index:04d}.mp4"
+            black_video(black, total - cursor, should_cancel=should_cancel)
+            items.append(black)
         return items
 
     items = []
@@ -2029,24 +2557,11 @@ def preview_stitch_inputs(
 def episode_clips_ready_for_stitch(uuid: str, clips: list[dict[str, Any]]) -> bool:
     if not clips:
         return False
-    if any(clip["status"] != "accepted" for clip in clips):
-        return False
-    rolling_count = len([clip for clip in clips if clip.get("input_kind") == "rolling"])
-    if rolling_count == 0:
-        return True
-    if rolling_count != len(clips):
-        return False
-    episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
-    if not episode or not episode.get("head_video_path"):
-        return False
-    head_path = Path(episode["head_video_path"])
-    if not head_path.exists():
-        return False
-    try:
-        plan = rolling_clip_plan(video_duration(head_path))
-    except Exception:
-        return False
-    return len(clips) == len(plan)
+    continuity = [clip for clip in clips if clip.get("input_kind") in CONTINUITY_INPUT_KINDS]
+    if continuity:
+        relevant = stitchable_clips(uuid, clips)
+        return bool(relevant) and continuity_timeline_summary(uuid, clips).get("complete") is True
+    return all(clip["status"] == "accepted" for clip in clips)
 
 
 def queue_stitch_episode(
@@ -2071,7 +2586,8 @@ def queue_stitch_episode(
     with _STITCH_LOCK:
         if uuid in _STITCHING_EPISODES:
             return {"uuid": uuid, "queued": False, "final_status": "stitching", "reason": "already stitching"}
-        lock_tokens = acquire_stitch_locks(uuid, clips)
+        stitch_clips = stitchable_clips(uuid, clips)
+        lock_tokens = acquire_stitch_locks(uuid, stitch_clips)
         _STITCHING_EPISODES.add(uuid)
         with db.connect() as conn:
             conn.execute("UPDATE episodes SET final_status='stitching', error=NULL, updated_at=? WHERE uuid=?", (db.now(), uuid))
@@ -2094,8 +2610,9 @@ def _stitch_episode_worker(uuid: str, lock_tokens: list[str]) -> None:
 def stitch_episode(uuid: str) -> dict[str, Any]:
     uuid = uuid.lower()
     clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    stitch_clips = stitchable_clips(uuid, clips)
     accepted_paths = []
-    for clip in clips:
+    for clip in stitch_clips:
         review = db.one(
             "SELECT * FROM reviews WHERE clip_id=? AND decision='accept' ORDER BY reviewed_at DESC LIMIT 1",
             (clip["id"],),
@@ -2110,31 +2627,45 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             stitch_inputs: list[Path] = []
-            uses_rolling_trim = False
-            for clip, accepted_path in zip(clips, accepted_paths):
-                overlap = float(clip.get("overlap_sec") or 0)
-                if clip.get("input_kind") == "rolling" and overlap > 0:
+            uses_precise_concat = False
+            for clip, accepted_path in zip(stitch_clips, accepted_paths):
+                if clip.get("input_kind") in CONTINUITY_INPUT_KINDS:
                     trimmed = Path(tmpdir) / f"clip_{int(clip['clip_index']):04d}_trimmed.mp4"
-                    trim_video(accepted_path, trimmed, overlap, float(clip.get("timeline_duration_sec") or clip["duration_sec"]))
-                    stitch_inputs.append(trimmed)
-                    uses_rolling_trim = True
+                    stitch_inputs.append(trim_continuity_contribution(clip, accepted_path, trimmed))
+                    uses_precise_concat = True
                 else:
                     stitch_inputs.append(accepted_path)
-            if uses_rolling_trim:
+            if uses_precise_concat:
                 concat_videos_precise(stitch_inputs, tmp)
             else:
                 stitch_videos(stitch_inputs, tmp)
         episode = db.one("SELECT final_status FROM episodes WHERE uuid=?", (uuid,))
-        current_clips = db.rows("SELECT status FROM clips WHERE episode_uuid=?", (uuid,))
-        if not episode or episode.get("final_status") != "stitching" or any(clip["status"] != "accepted" for clip in current_clips):
+        current_clips = db.rows("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
+        if not episode or episode.get("final_status") != "stitching" or not episode_clips_ready_for_stitch(uuid, current_clips):
             tmp.unlink(missing_ok=True)
             return {"uuid": uuid, "final_status": episode.get("final_status") if episode else "missing", "stale": True}
         tmp.replace(out)
         with db.connect() as conn:
             conn.execute(
-                "UPDATE episodes SET final_video_path=?, final_status='ready', error=NULL, updated_at=? WHERE uuid=?",
-                (str(out.resolve()), db.now(), uuid),
+                """
+                UPDATE episodes
+                SET final_video_path=?,
+                    final_status='ready',
+                    continuity_state=CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM clips
+                            WHERE episode_uuid=? AND input_kind IN ('anchor','rolling')
+                        )
+                        THEN 'complete'
+                        ELSE continuity_state
+                    END,
+                    error=NULL,
+                    updated_at=?
+                WHERE uuid=?
+                """,
+                (str(out.resolve()), uuid, db.now(), uuid),
             )
+        update_continuity_state(uuid)
         return {"uuid": uuid, "final_video_path": str(out.resolve()), "final_status": "ready"}
     except Exception as exc:
         tmp.unlink(missing_ok=True)

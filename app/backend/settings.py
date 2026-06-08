@@ -105,6 +105,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "seedance_resolution": "480p",
     "seedance_ratio": "4:3",
     "seedance_seconds_per_video_second": 24,
+    "continuity_overlap_sec": 1,
     "default_prompt": DEFAULT_PROMPT,
     "reference_images": DEFAULT_REFERENCE_IMAGES,
     "default_generation_preset_id": DEFAULT_GENERATION_PRESET_ID,

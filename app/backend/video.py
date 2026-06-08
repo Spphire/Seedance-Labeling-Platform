@@ -334,6 +334,26 @@ def compose_rolling_input(
     anchor_src: Path | None = None,
     overlap_sec: float = 0.0,
 ) -> None:
+    compose_continuity_input(
+        head_src,
+        dst,
+        source_start_sec,
+        source_duration_sec,
+        direction="forward",
+        anchor_src=anchor_src,
+        overlap_sec=overlap_sec,
+    )
+
+
+def compose_continuity_input(
+    head_src: Path,
+    dst: Path,
+    source_start_sec: float,
+    source_duration_sec: float,
+    direction: str,
+    anchor_src: Path | None = None,
+    overlap_sec: float = 0.0,
+) -> None:
     if source_duration_sec <= 0:
         raise ValueError("source_duration_sec must be positive")
     if overlap_sec <= 0:
@@ -341,16 +361,23 @@ def compose_rolling_input(
         return
     if anchor_src is None:
         raise ValueError("anchor_src is required when overlap_sec is positive")
+    if direction not in {"forward", "backward"}:
+        raise ValueError("direction must be forward or backward")
     anchor_duration = video_duration(anchor_src)
     if anchor_duration + 0.05 < overlap_sec:
         raise ValueError(f"anchor video is shorter than overlap: {anchor_duration:.3f}s < {overlap_sec:.3f}s")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        tail_path = tmp / "anchor_tail.mp4"
+        anchor_overlap_path = tmp / "anchor_overlap.mp4"
         source_path = tmp / "source_window.mp4"
-        trim_video(anchor_src, tail_path, max(0.0, anchor_duration - overlap_sec), overlap_sec)
         cut_clip(head_src, source_path, source_start_sec, source_duration_sec)
-        concat_videos_precise([tail_path, source_path], dst)
+        if direction == "forward":
+            trim_video(anchor_src, anchor_overlap_path, max(0.0, anchor_duration - overlap_sec), overlap_sec)
+            inputs = [anchor_overlap_path, source_path]
+        else:
+            trim_video(anchor_src, anchor_overlap_path, 0.0, overlap_sec)
+            inputs = [source_path, anchor_overlap_path]
+        concat_videos_precise(inputs, dst)
 
 
 def rolling_clip_plan(

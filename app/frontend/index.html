@@ -681,6 +681,47 @@
       background: #fffaf0;
     }
 
+    .anchor-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+      margin-bottom: 14px;
+    }
+
+    .anchor-panel h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+
+    .anchor-list {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    .anchor-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #f8fafc;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+
+    .anchor-chip button {
+      width: 20px;
+      min-width: 20px;
+      min-height: 20px;
+      border-radius: 50%;
+      padding: 0;
+      color: var(--muted);
+    }
+
     .statusbar {
       border-top: 1px solid var(--line);
       background: #fff;
@@ -901,6 +942,11 @@
           </div>
         </div>
         <div class="field">
+          <label for="continuityOverlapSec">连续性 overlap 秒数</label>
+          <input id="continuityOverlapSec" type="number" min="0" max="11" step="1" placeholder="1">
+          <div class="hint">新建 rolling clip 时写入；已生成 clip 会继续按自己的时间戳合成。</div>
+        </div>
+        <div class="field">
           <label>Seedance 用量监控</label>
           <button id="refreshUsage">刷新用量</button>
           <div id="seedanceUsageSummary" class="usage-panel"></div>
@@ -1014,6 +1060,7 @@
       adminPresets: [],
       activeAdminPresetId: "",
       runPresetId: "",
+      anchorDrafts: {},
     };
 
     const $ = (id) => document.getElementById(id);
@@ -1139,6 +1186,7 @@
       $("seedanceRatio").value = state.settings.seedance_ratio || "4:3";
       $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
+      $("continuityOverlapSec").value = state.settings.continuity_overlap_sec ?? 1;
     }
 
     function normalizedSeedanceApiKeyPool() {
@@ -1906,6 +1954,8 @@
         `${episode.accepted_clip_count || 0}/${episode.clip_count || 0} accepted`,
         `${episode.review_remaining_count || 0} 待处理`,
       ];
+      if (episode.continuity_state) facts.push(`state ${episode.continuity_state}`);
+      if (episode.continuity_anchor_candidate_count) facts.push(`${episode.continuity_anchor_candidate_count} 锚点候选`);
       if (episode.generating_clip_count) facts.push(`${episode.generating_clip_count} 生成中`);
       if (episode.generated_clip_count) facts.push(`${episode.generated_clip_count} 待审核`);
       if (episode.generated_failed_clip_count) facts.push(`${episode.generated_failed_clip_count} 失败`);
@@ -1982,10 +2032,131 @@
     }
 
     function clipTimingText(clip) {
+      const timelineStart = Number(clip.timeline_start_sec ?? clip.start_sec ?? 0);
+      const timelineEnd = Number(clip.timeline_end_sec ?? (timelineStart + Number(clip.timeline_duration_sec || clip.duration_sec || 0)));
+      const timeline = `${timelineStart.toFixed(2)}-${timelineEnd.toFixed(2)}s`;
+      if (clip.input_kind === "anchor") {
+        return `anchor · timeline ${timeline} · input ${Number(clip.duration_sec || 0).toFixed(2)}s`;
+      }
       if (clip.input_kind === "rolling") {
-        return `rolling · source ${Number(clip.source_start_sec || clip.start_sec).toFixed(2)}s + ${Number(clip.source_duration_sec || 0).toFixed(2)}s · overlap ${Number(clip.overlap_sec || 0).toFixed(2)}s · input ${Number(clip.duration_sec).toFixed(2)}s`;
+        return `rolling ${clip.direction || "forward"} · timeline ${timeline} · source ${Number(clip.source_start_sec || clip.start_sec).toFixed(2)}s + ${Number(clip.source_duration_sec || 0).toFixed(2)}s · overlap ${Number(clip.overlap_sec || 0).toFixed(2)}s · input ${Number(clip.duration_sec).toFixed(2)}s`;
       }
       return `${Number(clip.start_sec).toFixed(2)}s + ${Number(clip.duration_sec).toFixed(2)}s`;
+    }
+
+    function anchorDrafts(uuid) {
+      return state.anchorDrafts[uuid] || [];
+    }
+
+    function setAnchorDrafts(uuid, values) {
+      state.anchorDrafts[uuid] = [...new Set(values.map((value) => Math.max(0, Math.floor(Number(value) || 0))))].sort((a, b) => a - b);
+    }
+
+    function addAnchorDraft(uuid, value) {
+      setAnchorDrafts(uuid, [...anchorDrafts(uuid), value]);
+      render({ forceWorkspace: true });
+    }
+
+    function removeAnchorDraft(uuid, value) {
+      setAnchorDrafts(uuid, anchorDrafts(uuid).filter((item) => item !== value));
+      render({ forceWorkspace: true });
+    }
+
+    function renderAnchorPanel(episode) {
+      if (episode.status !== "preprocessed" || episode.continuity_anchor_clip_id) return "";
+      const drafts = anchorDrafts(episode.uuid);
+      return `
+        <div class="anchor-panel" data-anchor-panel>
+          <h3>锚点候选</h3>
+          <div class="meta">已创建 ${episode.continuity_anchor_candidate_count || 0} 个候选；每个候选为 4s。</div>
+          <div class="row">
+            <input id="anchorStartSec" type="number" min="0" step="1" placeholder="起点秒数">
+            <button data-anchor-action="add-current">添加当前</button>
+            <button data-anchor-action="add-typed">添加</button>
+          </div>
+          <div class="anchor-list">
+            ${drafts.length ? drafts.map((value) => `
+              <span class="anchor-chip">${value}s <button data-anchor-remove="${value}" title="移除">×</button></span>
+            `).join("") : `<span class="hint">暂无草稿</span>`}
+          </div>
+          <div class="row">
+            <button data-anchor-action="clear" ${drafts.length ? "" : "disabled"}>清空</button>
+            <button class="primary" data-anchor-action="create" ${drafts.length ? "" : "disabled"}>创建候选</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function wireAnchorPanel(episode) {
+      const panel = document.querySelector("[data-anchor-panel]");
+      if (!panel) return;
+      const input = $("anchorStartSec");
+      panel.querySelectorAll("[data-anchor-remove]").forEach((button) => {
+        button.addEventListener("click", () => removeAnchorDraft(episode.uuid, Number(button.dataset.anchorRemove)));
+      });
+      panel.querySelectorAll("[data-anchor-action]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const action = button.dataset.anchorAction;
+          if (action === "add-current") {
+            const video = $("originalVideo");
+            addAnchorDraft(episode.uuid, video && Number.isFinite(video.currentTime) ? video.currentTime : 0);
+            return;
+          }
+          if (action === "add-typed") {
+            addAnchorDraft(episode.uuid, input?.value || 0);
+            return;
+          }
+          if (action === "clear") {
+            setAnchorDrafts(episode.uuid, []);
+            render({ forceWorkspace: true });
+            return;
+          }
+          if (action === "create") {
+            const starts = anchorDrafts(episode.uuid);
+            if (!starts.length) return;
+            button.disabled = true;
+            try {
+              const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/anchor_candidates`, {
+                method: "POST",
+                body: { start_secs: starts, lock_token: lock.token },
+              }));
+              setAnchorDrafts(episode.uuid, []);
+              log("anchor candidates created", result);
+              await refresh({ forceWorkspace: true });
+            } catch (err) {
+              log(formatApiError(err));
+            } finally {
+              button.disabled = false;
+            }
+          }
+        });
+      });
+    }
+
+    function dependentContinuityCount(clip) {
+      if (clip.input_kind === "anchor") {
+        return state.clips.filter((item) => item.episode_uuid === clip.episode_uuid && item.input_kind === "rolling").length;
+      }
+      if (clip.input_kind !== "rolling") return 0;
+      const epsilon = 0.001;
+      if ((clip.direction || "forward") === "backward") {
+        const boundary = Number(clip.timeline_start_sec ?? clip.start_sec ?? 0);
+        return state.clips.filter((item) =>
+          item.episode_uuid === clip.episode_uuid
+          && item.input_kind === "rolling"
+          && item.id !== clip.id
+          && (item.direction || "forward") === "backward"
+          && Number(item.timeline_end_sec ?? 0) <= boundary + epsilon
+        ).length;
+      }
+      const boundary = Number(clip.timeline_end_sec ?? ((clip.start_sec || 0) + (clip.timeline_duration_sec || clip.duration_sec || 0)));
+      return state.clips.filter((item) =>
+        item.episode_uuid === clip.episode_uuid
+        && item.input_kind === "rolling"
+        && item.id !== clip.id
+        && (item.direction || "forward") !== "backward"
+        && Number(item.timeline_start_sec ?? 0) >= boundary - epsilon
+      ).length;
     }
 
     function renderClips() {
@@ -2264,6 +2435,12 @@
         episode.preview_url || "",
         episode.clip_count || 0,
         episode.accepted_clip_count || 0,
+        episode.continuity_state || "",
+        episode.continuity_anchor_clip_id || "",
+        episode.continuity_anchor_candidate_count || 0,
+        episode.continuity_coverage_start_sec ?? "",
+        episode.continuity_coverage_end_sec ?? "",
+        anchorDrafts(episode.uuid).join(","),
       ].join("|");
       if (target.dataset.signature === signature) {
         return;
@@ -2275,6 +2452,7 @@
       const outputStatus = finalReady ? episode.final_status : episode.preview_status || "missing";
       target.innerHTML = `
         ${renderEpisodeNotice(episode)}
+        ${renderAnchorPanel(episode)}
         <div class="review-head">
           <div class="review-title">
             <h2>${shortUuid(episode.uuid)} · episode</h2>
@@ -2293,6 +2471,7 @@
         </div>
       `;
       target.dataset.signature = signature;
+      wireAnchorPanel(episode);
       wireSync();
     }
 
@@ -2473,17 +2652,22 @@
               throw new Error("这个 episode 没有编辑锁，不能提交审核操作");
             }
             if (action === "reject") {
-              const futureCount = state.clips.filter((item) =>
-                item.episode_uuid === clip.episode_uuid
-                && item.input_kind === "rolling"
-                && Number(item.clip_index) > Number(clip.clip_index)
-              ).length;
-              const message = futureCount
-                ? `确认 Reject 这个 clip？\n\n这是 rolling 流程，后续 ${futureCount} 个 clip 会被删除，需要从当前 clip 重新生成。`
-                : "确认 Reject 这个 clip？";
+              const dependentCount = dependentContinuityCount(clip);
+              const message = clip.input_kind === "anchor"
+                ? `确认 Reject 这个锚点候选？\n\n如果它已经是正式锚点，后续 ${dependentCount} 个 rolling clip 会被删除，episode 会回到锚点候选阶段。`
+                : dependentCount
+                  ? `确认 Reject 这个 clip？\n\n这是 rolling 流程，后续 ${dependentCount} 个 clip 会被删除，需要从当前 clip 重新生成。`
+                  : "确认 Reject 这个 clip？";
               if (!window.confirm(message)) return;
             }
             if (action === "rerun") {
+              const dependentCount = dependentContinuityCount(clip);
+              if (dependentCount) {
+                const message = clip.input_kind === "anchor"
+                  ? `确认重跑这个正式锚点？\n\n后续 ${dependentCount} 个 rolling clip 会被删除。`
+                  : `确认重跑这个 clip？\n\n后续 ${dependentCount} 个 rolling clip 会被删除。`;
+                if (!window.confirm(message)) return;
+              }
               const mode = $("generationMode").value || "mock";
               const result = await api(`/api/clips/${clip.id}/retry`, {
                 method: "POST",
@@ -2566,7 +2750,7 @@
       log("本次 prompt/ref 已恢复管理员默认值");
     });
     $("addSeedanceApiKey").addEventListener("click", addSeedanceApiKeyRow);
-    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
+    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond", "continuityOverlapSec"].forEach((id) => {
       $(id).addEventListener("input", markSettingsDirty);
       $(id).addEventListener("change", markSettingsDirty);
     });
@@ -2632,6 +2816,7 @@
           seedance_ratio: $("seedanceRatio").value.trim() || "4:3",
           seedance_concurrency: Math.max(1, Number.parseInt($("seedanceConcurrency").value, 10) || 3),
           seedance_seconds_per_video_second: Math.max(1, Number.parseFloat($("seedanceSecondsPerVideoSecond").value) || 24),
+          continuity_overlap_sec: Math.max(0, Math.min(11, Number.parseInt($("continuityOverlapSec").value, 10) || 1)),
           seedance_api_key_pool: seedanceApiKeyPoolValues(),
         };
         const result = await api("/api/settings", { method: "POST", body: { values } });

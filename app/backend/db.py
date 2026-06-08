@@ -52,6 +52,8 @@ def init_db() -> None:
                 preview_status TEXT NOT NULL DEFAULT 'missing',
                 preview_version INTEGER NOT NULL DEFAULT 0,
                 preview_error TEXT,
+                continuity_state TEXT NOT NULL DEFAULT 'select_anchor',
+                anchor_clip_id INTEGER,
                 error TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -67,6 +69,11 @@ def init_db() -> None:
                 source_duration_sec REAL,
                 overlap_sec REAL NOT NULL DEFAULT 0,
                 timeline_duration_sec REAL,
+                timeline_start_sec REAL,
+                timeline_end_sec REAL,
+                input_timeline_start_sec REAL,
+                input_timeline_end_sec REAL,
+                direction TEXT NOT NULL DEFAULT 'forward',
                 input_kind TEXT NOT NULL DEFAULT 'split',
                 local_path TEXT NOT NULL,
                 public_url TEXT NOT NULL,
@@ -172,17 +179,40 @@ def init_db() -> None:
         _ensure_column(conn, "clips", "source_duration_sec", "REAL")
         _ensure_column(conn, "clips", "overlap_sec", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "clips", "timeline_duration_sec", "REAL")
+        _ensure_column(conn, "clips", "timeline_start_sec", "REAL")
+        _ensure_column(conn, "clips", "timeline_end_sec", "REAL")
+        _ensure_column(conn, "clips", "input_timeline_start_sec", "REAL")
+        _ensure_column(conn, "clips", "input_timeline_end_sec", "REAL")
+        _ensure_column(conn, "clips", "direction", "TEXT NOT NULL DEFAULT 'forward'")
         _ensure_column(conn, "clips", "input_kind", "TEXT NOT NULL DEFAULT 'split'")
         conn.execute("UPDATE clips SET source_start_sec=start_sec WHERE source_start_sec IS NULL")
         conn.execute("UPDATE clips SET source_duration_sec=duration_sec WHERE source_duration_sec IS NULL")
         conn.execute("UPDATE clips SET timeline_duration_sec=duration_sec WHERE timeline_duration_sec IS NULL")
+        conn.execute("UPDATE clips SET timeline_start_sec=source_start_sec WHERE timeline_start_sec IS NULL")
+        conn.execute(
+            "UPDATE clips SET timeline_end_sec=timeline_start_sec + timeline_duration_sec WHERE timeline_end_sec IS NULL"
+        )
+        conn.execute("UPDATE clips SET input_timeline_start_sec=start_sec WHERE input_timeline_start_sec IS NULL")
+        conn.execute(
+            "UPDATE clips SET input_timeline_end_sec=input_timeline_start_sec + duration_sec WHERE input_timeline_end_sec IS NULL"
+        )
+        conn.execute("UPDATE clips SET direction='forward' WHERE direction IS NULL OR direction=''")
         conn.execute("UPDATE clips SET input_kind='split' WHERE input_kind IS NULL OR input_kind=''")
         _ensure_column(conn, "episodes", "preview_video_path", "TEXT")
         _ensure_column(conn, "episodes", "preview_status", "TEXT NOT NULL DEFAULT 'missing'")
         _ensure_column(conn, "episodes", "preview_version", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "episodes", "preview_error", "TEXT")
+        _ensure_column(conn, "episodes", "continuity_state", "TEXT NOT NULL DEFAULT 'select_anchor'")
+        _ensure_column(conn, "episodes", "anchor_clip_id", "INTEGER")
         conn.execute("UPDATE episodes SET preview_status='missing' WHERE preview_status IS NULL OR preview_status=''")
         conn.execute("UPDATE episodes SET preview_version=0 WHERE preview_version IS NULL")
+        conn.execute(
+            """
+            UPDATE episodes
+            SET continuity_state='select_anchor'
+            WHERE continuity_state IS NULL OR continuity_state=''
+            """
+        )
         _ensure_column(conn, "reviews", "operator_id", "TEXT")
         _ensure_column(conn, "reviews", "operator_name", "TEXT")
         conn.execute(

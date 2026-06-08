@@ -38,6 +38,11 @@ class GenerationRunRequest(BaseModel):
     reference_images: list[str] | None = None
 
 
+class AnchorCandidatesRequest(BaseModel):
+    start_secs: list[float]
+    lock_token: str | None = None
+
+
 class ReviewRequest(BaseModel):
     decision: str
     job_id: int | None = None

@@ -12,6 +12,7 @@ from . import db
 from .locks import LockError, acquire_lock, list_locks, release_lock, renew_lock
 from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR, ROOT, ensure_dirs
 from .schema import (
+    AnchorCandidatesRequest,
     EpisodeBatchRequest,
     GenerationRunRequest,
     ImportHeadVideoRequest,
@@ -25,6 +26,7 @@ from .schema import (
 )
 from .services import (
     auto_accept_all,
+    create_anchor_candidates,
     import_head_video,
     list_clips,
     list_episodes,
@@ -150,6 +152,14 @@ def post_preprocess(payload: PreprocessRequest) -> list[dict[str, Any]]:
 def post_import_head(payload: ImportHeadVideoRequest) -> dict[str, Any]:
     try:
         return import_head_video(payload.uuid, payload.path, payload.lock_token)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/episodes/{uuid}/anchor_candidates")
+def post_anchor_candidates(uuid: str, payload: AnchorCandidatesRequest) -> dict[str, Any]:
+    try:
+        return create_anchor_candidates(uuid.lower(), payload.start_secs, payload.lock_token)
     except Exception as exc:
         raise _public_error(exc) from exc
 
