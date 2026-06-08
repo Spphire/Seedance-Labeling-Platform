@@ -232,6 +232,32 @@
       margin-bottom: 3px;
     }
 
+    .api-key-pool {
+      display: grid;
+      gap: 8px;
+    }
+
+    .api-key-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) 76px 58px 36px;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+
+    .api-key-row input[type="checkbox"] {
+      width: auto;
+      justify-self: center;
+    }
+
+    .api-key-row button {
+      min-width: 34px;
+      padding: 0;
+    }
+
     .ref-image-order {
       display: grid;
       gap: 8px;
@@ -810,8 +836,11 @@
           <input id="publicBaseUrl" placeholder="http://106.14.2.243:18080">
         </div>
         <div class="field">
-          <label for="seedanceApiKey">Seedance API Key</label>
-          <input id="seedanceApiKey" type="password" autocomplete="off" placeholder="留空则不修改">
+          <label>Seedance API Key 池</label>
+          <div id="seedanceApiKeyPool" class="api-key-pool"></div>
+          <div class="row">
+            <button id="addSeedanceApiKey">新增 API Key</button>
+          </div>
           <div id="seedanceApiKeyHint" class="hint"></div>
         </div>
         <div class="field">
@@ -1099,8 +1128,7 @@
       $("dm3Host").value = state.settings.dm3_host || "DM3data";
       $("dm3NedfRoot").value = state.settings.dm3_nedf_root || "/mnt/nm_data/data/nedf";
       $("publicBaseUrl").value = state.settings.public_base_url || "";
-      $("seedanceApiKey").value = "";
-      $("seedanceApiKeyHint").textContent = state.settings.seedance_api_key_set ? "服务器已保存 API Key；留空不会覆盖。" : "尚未保存 API Key。";
+      renderSeedanceApiKeyPool();
       state.adminPresets = normalizedGenerationPresets();
       state.activeAdminPresetId = state.settings.default_generation_preset_id || state.adminPresets[0]?.id || "";
       renderAdminPresetSelector();
@@ -1111,6 +1139,110 @@
       $("seedanceRatio").value = state.settings.seedance_ratio || "4:3";
       $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
+    }
+
+    function normalizedSeedanceApiKeyPool() {
+      const pool = Array.isArray(state.settings.seedance_api_key_pool) ? state.settings.seedance_api_key_pool : [];
+      if (!pool.length) {
+        return [{
+          id: "default",
+          name: "default",
+          concurrency: Math.max(1, Number.parseInt(state.settings.seedance_concurrency, 10) || 3),
+          enabled: true,
+          key_set: !!state.settings.seedance_api_key_set,
+          fingerprint: "",
+        }];
+      }
+      return pool.map((item, index) => ({
+        id: String(item.id || `key-${index + 1}`),
+        name: String(item.name || item.id || `key-${index + 1}`),
+        concurrency: Math.max(1, Number.parseInt(item.concurrency, 10) || 1),
+        enabled: item.enabled !== false,
+        key_set: !!item.key_set,
+        fingerprint: String(item.fingerprint || ""),
+      }));
+    }
+
+    function renderSeedanceApiKeyPool() {
+      const target = $("seedanceApiKeyPool");
+      const pool = normalizedSeedanceApiKeyPool();
+      target.innerHTML = pool.map((item, index) => {
+        const placeholder = item.key_set
+          ? `留空保留${item.fingerprint ? ` ${item.fingerprint}` : ""}`
+          : "输入 API Key";
+        return `
+          <div class="api-key-row" data-api-key-row="${index}" data-api-key-id="${escapeAttr(item.id)}">
+            <input data-api-key-field="name" value="${escapeAttr(item.name)}" placeholder="名称">
+            <input data-api-key-field="api_key" type="password" autocomplete="off" placeholder="${escapeAttr(placeholder)}">
+            <input data-api-key-field="concurrency" type="number" min="1" step="1" value="${escapeAttr(item.concurrency)}" title="并发">
+            <input data-api-key-field="enabled" type="checkbox" ${item.enabled ? "checked" : ""} title="启用">
+            <button type="button" data-api-key-action="remove" title="删除">×</button>
+          </div>
+        `;
+      }).join("");
+      target.querySelectorAll("input").forEach((input) => {
+        input.addEventListener("input", markSettingsDirty);
+        input.addEventListener("change", markSettingsDirty);
+      });
+      target.querySelectorAll('[data-api-key-action="remove"]').forEach((button) => {
+        button.addEventListener("click", () => {
+          button.closest(".api-key-row")?.remove();
+          markSettingsDirty();
+          updateSeedanceApiKeyPoolHint();
+        });
+      });
+      updateSeedanceApiKeyPoolHint();
+    }
+
+    function seedanceApiKeyPoolValues() {
+      return [...document.querySelectorAll(".api-key-row")].map((row, index) => {
+        const field = (name) => row.querySelector(`[data-api-key-field="${name}"]`);
+        return {
+          id: row.dataset.apiKeyId || `key-${index + 1}`,
+          name: field("name")?.value.trim() || `key-${index + 1}`,
+          api_key: field("api_key")?.value.trim() || "",
+          concurrency: Math.max(1, Number.parseInt(field("concurrency")?.value, 10) || 1),
+          enabled: !!field("enabled")?.checked,
+        };
+      });
+    }
+
+    function addSeedanceApiKeyRow() {
+      const target = $("seedanceApiKeyPool");
+      const index = document.querySelectorAll(".api-key-row").length + 1;
+      const id = `key-${Date.now()}`;
+      const row = document.createElement("div");
+      row.className = "api-key-row";
+      row.dataset.apiKeyRow = String(index - 1);
+      row.dataset.apiKeyId = id;
+      row.innerHTML = `
+        <input data-api-key-field="name" value="key-${index}" placeholder="名称">
+        <input data-api-key-field="api_key" type="password" autocomplete="off" placeholder="输入 API Key">
+        <input data-api-key-field="concurrency" type="number" min="1" step="1" value="1" title="并发">
+        <input data-api-key-field="enabled" type="checkbox" checked title="启用">
+        <button type="button" data-api-key-action="remove" title="删除">×</button>
+      `;
+      target.appendChild(row);
+      row.querySelectorAll("input").forEach((input) => {
+        input.addEventListener("input", markSettingsDirty);
+        input.addEventListener("change", markSettingsDirty);
+      });
+      row.querySelector('[data-api-key-action="remove"]').addEventListener("click", () => {
+        row.remove();
+        markSettingsDirty();
+        updateSeedanceApiKeyPoolHint();
+      });
+      markSettingsDirty();
+      updateSeedanceApiKeyPoolHint();
+    }
+
+    function updateSeedanceApiKeyPoolHint() {
+      const rows = seedanceApiKeyPoolValues();
+      const saved = normalizedSeedanceApiKeyPool().filter((item) => item.key_set).length;
+      const active = rows.filter((item) => item.enabled).length;
+      $("seedanceApiKeyHint").textContent = saved
+        ? `已保存 ${saved} 个 API Key；输入框留空会保留原 key。当前启用 ${active} 行。`
+        : "尚未保存 API Key；请至少添加一个真实 key 后再使用 seedance 模式。";
     }
 
     function normalizedGenerationPresets() {
@@ -1623,6 +1755,21 @@
         : `<div class="hint">暂无真实 Seedance 调用记录。</div>`;
     }
 
+    function keyUsageSummaryRows() {
+      const summary = state.seedanceUsage?.key_summary || [];
+      return summary.length
+        ? `<div class="hint">API Key 维度</div>${summary.map((row) => `
+          <div class="usage-row">
+            <div>
+              <strong>${escapeHtml(row.api_key_name || row.api_key_id || "unknown key")}</strong>
+              <span>${Number(row.clip_count || 0)} clips · ${Number(row.call_count || 0)} calls · ${Number(row.succeeded_count || 0)} ok · ${Number(row.failed_count || 0)} failed</span>
+            </div>
+            <div>${formatDuration(row.requested_duration_sec || 0)}</div>
+          </div>
+        `).join("")}`
+        : "";
+    }
+
     function reviewSummaryRows() {
       const summary = state.reviewerActivity?.summary || [];
       return summary.length
@@ -1965,7 +2112,7 @@
                 <h3>Seedance 用量</h3>
                 <span class="badge">${totalCalls} calls</span>
               </div>
-              <div class="usage-panel">${usageSummaryRows()}</div>
+              <div class="usage-panel">${usageSummaryRows()}${keyUsageSummaryRows()}</div>
             </section>
             <section class="admin-section">
               <div class="admin-section-head">
@@ -2418,7 +2565,8 @@
       syncRunFormFromDefaults();
       log("本次 prompt/ref 已恢复管理员默认值");
     });
-    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "seedanceApiKey", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
+    $("addSeedanceApiKey").addEventListener("click", addSeedanceApiKeyRow);
+    ["dm3Host", "dm3NedfRoot", "publicBaseUrl", "presetName", "defaultPrompt", "seedanceModel", "seedanceBaseUrl", "seedanceResolution", "seedanceRatio", "seedanceConcurrency", "seedanceSecondsPerVideoSecond"].forEach((id) => {
       $(id).addEventListener("input", markSettingsDirty);
       $(id).addEventListener("change", markSettingsDirty);
     });
@@ -2484,11 +2632,8 @@
           seedance_ratio: $("seedanceRatio").value.trim() || "4:3",
           seedance_concurrency: Math.max(1, Number.parseInt($("seedanceConcurrency").value, 10) || 3),
           seedance_seconds_per_video_second: Math.max(1, Number.parseFloat($("seedanceSecondsPerVideoSecond").value) || 24),
+          seedance_api_key_pool: seedanceApiKeyPoolValues(),
         };
-        const apiKey = $("seedanceApiKey").value.trim();
-        if (apiKey) {
-          values.seedance_api_key = apiKey;
-        }
         const result = await api("/api/settings", { method: "POST", body: { values } });
         log("settings saved", result);
         state.settingsDirty = false;

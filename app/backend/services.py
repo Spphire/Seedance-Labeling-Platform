@@ -15,7 +15,7 @@ from .ids import parse_uuids
 from .locks import LockError, active_lock, locks_by_resource, require_lock, require_no_active_lock
 from .nedf import extract_head_video, fetch_episode
 from .paths import ACCEPTED_DIR, CLIPS_DIR, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
-from .settings import load_settings, public_url_for
+from .settings import load_settings, public_url_for, seedance_api_key_pool
 from .video import (
     black_video,
     clip_plan,
@@ -45,6 +45,7 @@ STITCH_LOCK_TTL_SEC = 60 * 60 * 24
 _GENERATION_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="seedance-generation")
 _GENERATION_CONDITION = threading.Condition()
 _GENERATION_ACTIVE = 0
+_SEEDANCE_KEY_ACTIVE: dict[str, int] = {}
 GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
 GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
 DEFAULT_REQUEST_MODE = "mock"
@@ -306,11 +307,27 @@ def list_seedance_usage(limit: int = 100) -> dict[str, Any]:
         ORDER BY last_call_at DESC
         """
     )
+    key_summary_rows = db.rows(
+        """
+        SELECT
+            COALESCE(api_key_id, '') AS api_key_id,
+            COALESCE(api_key_name, '') AS api_key_name,
+            COUNT(*) AS call_count,
+            SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS succeeded_count,
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(COALESCE(requested_duration_sec, 0)) AS requested_duration_sec,
+            COUNT(DISTINCT clip_id) AS clip_count,
+            MAX(created_at) AS last_call_at
+        FROM seedance_api_calls
+        GROUP BY COALESCE(api_key_id, ''), COALESCE(api_key_name, '')
+        ORDER BY last_call_at DESC
+        """
+    )
     for call in calls:
         call["usage"] = parse_json_text(call.get("usage_json"))
         call.pop("usage_json", None)
         call.pop("raw_response_json", None)
-    return {"summary": summary_rows, "recent_calls": calls}
+    return {"summary": summary_rows, "key_summary": key_summary_rows, "recent_calls": calls}
 
 
 def list_reviewer_activity(limit: int = 100) -> dict[str, Any]:
@@ -1210,12 +1227,14 @@ def seedance_job_worker(job_id: int) -> None:
         return
     job = dict(job)
     settings = load_settings()
-    client = SeedanceClient(settings)
     job_prompt, job_refs = generation_values_from_job(job, settings)
     out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
-    max_workers = max(1, int(settings.get("seedance_concurrency", 1)))
-    acquire_generation_slot(max_workers)
+    key_slot: dict[str, Any] | None = None
     try:
+        key_slot = acquire_seedance_key_slot(settings)
+        client = SeedanceClient({**settings, "seedance_api_key": key_slot["api_key"]})
+        job["api_key_id"] = key_slot["id"]
+        job["api_key_name"] = key_slot["name"]
         if not job.get("task_id"):
             try:
                 task = client.create_task(job_prompt, job["public_url"], float(job["duration_sec"]), job_refs)
@@ -1256,20 +1275,54 @@ def seedance_job_worker(job_id: int) -> None:
             update_seedance_api_call(job, "failed", task_id=job.get("task_id"), error=str(exc))
         fail_generation_job(job_id, int(job["clip_id"]), str(exc))
     finally:
-        release_generation_slot()
+        release_seedance_key_slot(key_slot)
 
 
-def acquire_generation_slot(max_workers: int) -> None:
+def active_seedance_key_pool(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    pool = [
+        item
+        for item in seedance_api_key_pool(settings)
+        if item.get("enabled", True) and item.get("api_key") and int(item.get("concurrency") or 0) > 0
+    ]
+    if not pool:
+        raise RuntimeError("seedance_api_key is required for seedance mode")
+    return pool
+
+
+def acquire_seedance_key_slot(settings: dict[str, Any]) -> dict[str, Any]:
     global _GENERATION_ACTIVE
+    pool = active_seedance_key_pool(settings)
     with _GENERATION_CONDITION:
-        while _GENERATION_ACTIVE >= max_workers:
+        while True:
+            available = []
+            for item in pool:
+                key_id = str(item["id"])
+                active = _SEEDANCE_KEY_ACTIVE.get(key_id, 0)
+                limit = max(1, int(item.get("concurrency") or 1))
+                if active < limit:
+                    available.append((active / limit, active, item))
+            if available:
+                _, _, chosen = min(available, key=lambda value: (value[0], value[1], str(value[2]["id"])))
+                key_id = str(chosen["id"])
+                _SEEDANCE_KEY_ACTIVE[key_id] = _SEEDANCE_KEY_ACTIVE.get(key_id, 0) + 1
+                _GENERATION_ACTIVE += 1
+                return dict(chosen)
             _GENERATION_CONDITION.wait(timeout=5)
-        _GENERATION_ACTIVE += 1
 
 
-def release_generation_slot() -> None:
+def release_seedance_key_slot(key_slot: dict[str, Any] | None) -> None:
     global _GENERATION_ACTIVE
     with _GENERATION_CONDITION:
+        if not key_slot:
+            _GENERATION_CONDITION.notify_all()
+            return
+        key_id = str(key_slot.get("id") or "")
+        if key_id:
+            next_active = max(0, _SEEDANCE_KEY_ACTIVE.get(key_id, 0) - 1)
+            if next_active:
+                _SEEDANCE_KEY_ACTIVE[key_id] = next_active
+            else:
+                _SEEDANCE_KEY_ACTIVE.pop(key_id, None)
         _GENERATION_ACTIVE = max(0, _GENERATION_ACTIVE - 1)
         _GENERATION_CONDITION.notify_all()
 
@@ -1372,6 +1425,8 @@ def seedance_call_payload(
         "clip_id": job.get("clip_id"),
         "operator_id": job.get("operator_id") or "",
         "operator_name": job.get("operator_name") or "",
+        "api_key_id": job.get("api_key_id") or "",
+        "api_key_name": job.get("api_key_name") or "",
         "call_type": "create_task",
         "status": status,
         "task_id": task_id or job.get("task_id") or "",
@@ -1399,17 +1454,19 @@ def record_seedance_api_call(
         conn.execute(
             """
             INSERT INTO seedance_api_calls(
-                job_id, clip_id, operator_id, operator_name, call_type, status,
+                job_id, clip_id, operator_id, operator_name, api_key_id, api_key_name, call_type, status,
                 task_id, model, requested_duration_sec, clip_duration_sec,
                 usage_json, raw_response_json, error, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["job_id"],
                 payload["clip_id"],
                 payload["operator_id"],
                 payload["operator_name"],
+                payload["api_key_id"],
+                payload["api_key_name"],
                 payload["call_type"],
                 payload["status"],
                 payload["task_id"],
@@ -1540,6 +1597,7 @@ def run_generation_for_clip(
             task_id = data["task_id"]
             output_url = data["output_url"]
         else:
+            key_slot: dict[str, Any] | None = None
             job_for_call = {
                 "id": job_id,
                 "clip_id": clip["id"],
@@ -1549,28 +1607,35 @@ def run_generation_for_clip(
                 "duration_sec": clip["duration_sec"],
             }
             try:
-                task = client.create_task(prompt, clip["public_url"], float(clip["duration_sec"]), reference_images or [])
-            except Exception as exc:
-                record_seedance_api_call(job_for_call, "failed", error=str(exc))
-                raise
-            task_id = task["task_id"]
-            job_for_call["task_id"] = task_id
-            record_seedance_api_call(
-                job_for_call,
-                "submitted",
-                task_id=task_id,
-                usage=task.get("usage"),
-                raw_response=task.get("raw_response"),
-            )
-            try:
+                key_slot = acquire_seedance_key_slot(settings)
+                client = SeedanceClient({**settings, "seedance_api_key": key_slot["api_key"]})
+                job_for_call["api_key_id"] = key_slot["id"]
+                job_for_call["api_key_name"] = key_slot["name"]
+                try:
+                    task = client.create_task(prompt, clip["public_url"], float(clip["duration_sec"]), reference_images or [])
+                except Exception as exc:
+                    record_seedance_api_call(job_for_call, "failed", error=str(exc))
+                    raise
+                task_id = task["task_id"]
+                job_for_call["task_id"] = task_id
+                record_seedance_api_call(
+                    job_for_call,
+                    "submitted",
+                    task_id=task_id,
+                    usage=task.get("usage"),
+                    raw_response=task.get("raw_response"),
+                )
                 data = client.wait_for_task(task_id, out_path, input_url=clip["public_url"])
             except Exception as exc:
-                update_seedance_api_call(job_for_call, "failed", task_id=task_id, error=str(exc))
+                if job_for_call.get("task_id"):
+                    update_seedance_api_call(job_for_call, "failed", task_id=job_for_call.get("task_id"), error=str(exc))
                 raise
+            finally:
+                release_seedance_key_slot(key_slot)
             update_seedance_api_call(
                 job_for_call,
                 "succeeded",
-                task_id=task_id,
+                task_id=job_for_call.get("task_id"),
                 usage=data.get("usage"),
                 raw_response=data.get("raw_response"),
             )

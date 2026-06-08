@@ -9,7 +9,7 @@ from .paths import CONFIG_DIR, REFERENCE_IMAGES_DIR, ROOT
 
 
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
-SECRET_KEYS = {"seedance_api_key"}
+SECRET_KEYS = {"seedance_api_key", "seedance_api_key_pool"}
 DEFAULT_PUBLIC_BASE_URL = "http://106.14.2.243:18080"
 DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND = 0.2
 DEFAULT_PROMPT = (
@@ -18,7 +18,7 @@ DEFAULT_PROMPT = (
     "爪夹形态、动作、画面、背景保持不变"
 )
 IPHONE2DEPLOY_PROMPT = (
-    "把@视频1中的真人手臂和手机换成@图片1@图片2的机械臂和上面安装的相机，"
+    "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2的机械臂和摄像头，"
     "爪夹形态、动作、画面、背景保持不变"
 )
 LEGACY_DEFAULT_PROMPTS = {
@@ -34,11 +34,11 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/r-far-iphone.png",
 ]
 IPHONE2DEPLOY_REFERENCE_IMAGES = [
-    "app/reference_images/iphone2deploy-left.png",
-    "app/reference_images/iphone2deploy-right.png",
+    "app/reference_images/l-near-deploy.png",
+    "app/reference_images/r-near-deploy.png",
 ]
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
-GENERATION_PRESETS_VERSION = 4
+GENERATION_PRESETS_VERSION = 5
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -87,6 +87,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "seedance_model": "doubao-seedance-2-0-fast-260128",
     "seedance_base_url": "https://ark.cn-beijing.volces.com/api/v3",
     "seedance_api_key": "",
+    "seedance_api_key_pool": [],
     "seedance_resolution": "480p",
     "seedance_ratio": "4:3",
     "seedance_seconds_per_video_second": 24,
@@ -100,6 +101,119 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 def _env_api_key() -> str:
     return os.environ.get("SEEDANCE_API_KEY") or os.environ.get("ARK_API_KEY") or ""
+
+
+def _bool_value(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    return default
+
+
+def _positive_int(value: Any, default: int = 1) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _api_key_fingerprint(api_key: str) -> str:
+    api_key = api_key.strip()
+    if not api_key:
+        return ""
+    return f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "set"
+
+
+def _normalize_seedance_api_key_pool(
+    value: Any,
+    legacy_key: str = "",
+    legacy_concurrency: Any = 1,
+    include_empty: bool = True,
+) -> list[dict[str, Any]]:
+    raw = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        item = item if isinstance(item, dict) else {}
+        key_id = str(item.get("id") or f"key-{index + 1}").strip() or f"key-{index + 1}"
+        if key_id in seen:
+            key_id = f"{key_id}-{index + 1}"
+        seen.add(key_id)
+        api_key = str(item.get("api_key") or "").strip()
+        if not include_empty and not api_key:
+            continue
+        normalized.append(
+            {
+                "id": key_id,
+                "name": str(item.get("name") or key_id).strip() or key_id,
+                "api_key": api_key,
+                "concurrency": _positive_int(item.get("concurrency"), _positive_int(legacy_concurrency, 1)),
+                "enabled": _bool_value(item.get("enabled"), True),
+            }
+        )
+    if not normalized and legacy_key:
+        normalized.append(
+            {
+                "id": "default",
+                "name": "default",
+                "api_key": legacy_key.strip(),
+                "concurrency": _positive_int(legacy_concurrency, 1),
+                "enabled": True,
+            }
+        )
+    return normalized
+
+
+def _public_seedance_api_key_pool(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item["id"],
+            "name": item["name"],
+            "concurrency": item["concurrency"],
+            "enabled": item["enabled"],
+            "key_set": bool(item.get("api_key")),
+            "fingerprint": _api_key_fingerprint(str(item.get("api_key") or "")),
+        }
+        for item in seedance_api_key_pool(settings, include_empty=True)
+    ]
+
+
+def seedance_api_key_pool(settings: dict[str, Any], include_empty: bool = False) -> list[dict[str, Any]]:
+    return _normalize_seedance_api_key_pool(
+        settings.get("seedance_api_key_pool"),
+        str(settings.get("seedance_api_key") or ""),
+        settings.get("seedance_concurrency") or 1,
+        include_empty=include_empty,
+    )
+
+
+def _merge_seedance_api_key_pool(existing: dict[str, Any], incoming: Any) -> list[dict[str, Any]]:
+    existing_pool = {item["id"]: item for item in seedance_api_key_pool(existing, include_empty=True)}
+    result: list[dict[str, Any]] = []
+    raw = incoming if isinstance(incoming, list) else []
+    for index, item in enumerate(raw):
+        item = item if isinstance(item, dict) else {}
+        key_id = str(item.get("id") or f"key-{index + 1}").strip() or f"key-{index + 1}"
+        existing_item = existing_pool.get(key_id, {})
+        api_key = str(item.get("api_key") or "").strip() or str(existing_item.get("api_key") or "")
+        result.append(
+            {
+                "id": key_id,
+                "name": str(item.get("name") or existing_item.get("name") or key_id).strip() or key_id,
+                "api_key": api_key,
+                "concurrency": _positive_int(
+                    item.get("concurrency"),
+                    existing_item.get("concurrency") or existing.get("seedance_concurrency") or 1,
+                ),
+                "enabled": _bool_value(item.get("enabled"), _bool_value(existing_item.get("enabled"), True)),
+            }
+        )
+    return _normalize_seedance_api_key_pool(result, include_empty=True)
 
 
 def _prompt_needs_repair(value: Any) -> bool:
@@ -198,6 +312,19 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
                 if default_preset and preset["reference_images"] != default_preset["reference_images"]:
                     preset["reference_images"] = list(default_preset["reference_images"])
                     changed = True
+        if presets_version < 5:
+            for preset in presets:
+                if preset["id"] != "iphone2deploy":
+                    continue
+                default_preset = _default_preset_by_id("iphone2deploy")
+                if not default_preset:
+                    continue
+                if preset["prompt"] != default_preset["prompt"]:
+                    preset["prompt"] = str(default_preset["prompt"])
+                    changed = True
+                if preset["reference_images"] != default_preset["reference_images"]:
+                    preset["reference_images"] = list(default_preset["reference_images"])
+                    changed = True
         data["generation_presets_version"] = GENERATION_PRESETS_VERSION
         changed = True
     elif data.get("generation_presets_version") != GENERATION_PRESETS_VERSION:
@@ -248,6 +375,15 @@ def _settings_from_disk() -> dict[str, Any]:
         changed = True
     if _normalize_generation_presets(data):
         changed = True
+    normalized_pool = _normalize_seedance_api_key_pool(
+        data.get("seedance_api_key_pool"),
+        str(data.get("seedance_api_key") or ""),
+        data.get("seedance_concurrency") or 1,
+        include_empty=True,
+    )
+    if data.get("seedance_api_key_pool") != normalized_pool:
+        data["seedance_api_key_pool"] = normalized_pool
+        changed = True
     if changed:
         SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     merged = dict(DEFAULT_SETTINGS)
@@ -258,14 +394,50 @@ def _settings_from_disk() -> dict[str, Any]:
 def load_settings() -> dict[str, Any]:
     settings = _settings_from_disk()
     env_key = _env_api_key()
-    if env_key and not settings.get("seedance_api_key"):
+    if env_key and not settings.get("seedance_api_key") and not seedance_api_key_pool(settings):
         settings["seedance_api_key"] = env_key
+        settings["seedance_api_key_pool"] = _normalize_seedance_api_key_pool(
+            [],
+            env_key,
+            settings.get("seedance_concurrency") or 1,
+            include_empty=True,
+        )
     return settings
 
 
 def save_settings(data: dict[str, Any]) -> dict[str, Any]:
     merged = _settings_from_disk()
-    merged.update(data)
+    incoming = dict(data)
+    pool_submitted = "seedance_api_key_pool" in incoming
+    if "seedance_api_key_pool" in incoming:
+        incoming["seedance_api_key_pool"] = _merge_seedance_api_key_pool(merged, incoming["seedance_api_key_pool"])
+    if "seedance_api_key" in incoming and incoming["seedance_api_key"] and "seedance_api_key_pool" not in incoming:
+        incoming["seedance_api_key_pool"] = _merge_seedance_api_key_pool(
+            merged,
+            [
+                {
+                    "id": "default",
+                    "name": "default",
+                    "api_key": incoming["seedance_api_key"],
+                    "concurrency": incoming.get("seedance_concurrency", merged.get("seedance_concurrency", 1)),
+                    "enabled": True,
+                }
+            ],
+        )
+    merged.update(incoming)
+    if pool_submitted:
+        pool = _normalize_seedance_api_key_pool(
+            merged.get("seedance_api_key_pool"),
+            "",
+            merged.get("seedance_concurrency") or 1,
+            include_empty=True,
+        )
+        merged["seedance_api_key_pool"] = pool
+    else:
+        pool = seedance_api_key_pool(merged, include_empty=True)
+    first_key = next((str(item.get("api_key") or "") for item in pool if item.get("api_key")), "")
+    if pool_submitted or first_key:
+        merged["seedance_api_key"] = first_key
     SETTINGS_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     return load_settings()
 
@@ -273,7 +445,9 @@ def save_settings(data: dict[str, Any]) -> dict[str, Any]:
 def public_settings() -> dict[str, Any]:
     settings = load_settings()
     visible = {key: value for key, value in settings.items() if key not in SECRET_KEYS}
-    visible["seedance_api_key_set"] = bool(settings.get("seedance_api_key"))
+    public_pool = _public_seedance_api_key_pool(settings)
+    visible["seedance_api_key_pool"] = public_pool
+    visible["seedance_api_key_set"] = any(item["key_set"] for item in public_pool)
     visible["available_reference_images"] = available_reference_images()
     return visible
 

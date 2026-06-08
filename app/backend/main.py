@@ -116,10 +116,10 @@ def get_settings() -> dict[str, Any]:
 @app.post("/api/settings")
 def post_settings(payload: dict[str, Any]) -> dict[str, Any]:
     values = payload.get("values", payload)
-    saved = save_settings(values)
+    save_settings(values)
     if "public_base_url" in values:
         refresh_clip_public_urls()
-    return {key: value for key, value in saved.items() if key != "seedance_api_key"}
+    return public_settings()
 
 
 @app.post("/api/episodes/batch")

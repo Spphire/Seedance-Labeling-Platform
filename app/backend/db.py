@@ -104,6 +104,8 @@ def init_db() -> None:
                 clip_id INTEGER REFERENCES clips(id) ON DELETE SET NULL,
                 operator_id TEXT,
                 operator_name TEXT,
+                api_key_id TEXT,
+                api_key_name TEXT,
                 call_type TEXT NOT NULL DEFAULT 'create_task',
                 status TEXT NOT NULL,
                 task_id TEXT,
@@ -164,6 +166,8 @@ def init_db() -> None:
         _ensure_column(conn, "generation_jobs", "operator_name", "TEXT")
         _ensure_column(conn, "generation_jobs", "prompt", "TEXT")
         _ensure_column(conn, "generation_jobs", "reference_images_json", "TEXT")
+        _ensure_column(conn, "seedance_api_calls", "api_key_id", "TEXT")
+        _ensure_column(conn, "seedance_api_calls", "api_key_name", "TEXT")
         _ensure_column(conn, "clips", "source_start_sec", "REAL")
         _ensure_column(conn, "clips", "source_duration_sec", "REAL")
         _ensure_column(conn, "clips", "overlap_sec", "REAL NOT NULL DEFAULT 0")

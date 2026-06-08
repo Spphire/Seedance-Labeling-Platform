@@ -53,6 +53,9 @@ class MockPipelineTest(unittest.TestCase):
         with backend_services._PREVIEW_LOCK, backend_services._STITCH_LOCK:
             backend_services._PREVIEWING_EPISODES.clear()
             backend_services._STITCHING_EPISODES.clear()
+        with backend_services._GENERATION_CONDITION:
+            backend_services._SEEDANCE_KEY_ACTIVE.clear()
+            backend_services._GENERATION_ACTIVE = 0
         save_settings(dict(DEFAULT_SETTINGS))
         self.unlink_with_retry(DB_PATH)
         for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR]:
@@ -617,6 +620,50 @@ class MockPipelineTest(unittest.TestCase):
             IPHONE2DEPLOY_REFERENCE_IMAGES,
         )
 
+    def test_iphone2deploy_prompt_and_refs_are_migrated_from_v4(self) -> None:
+        old_prompt = "把@视频1中的真人手臂和手机换成@图片1@图片2的机械臂和上面安装的相机，爪夹形态、动作、画面、背景保持不变"
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "default_prompt": DEFAULT_PROMPT,
+                    "reference_images": DEFAULT_SETTINGS["reference_images"],
+                    "default_generation_preset_id": "iphone-default",
+                    "generation_presets_version": 4,
+                    "generation_presets": [
+                        {
+                            "id": "iphone-default",
+                            "name": "iPhone 默认组合",
+                            "prompt": DEFAULT_PROMPT,
+                            "reference_images": DEFAULT_SETTINGS["reference_images"],
+                        },
+                        {
+                            "id": "iphone2deploy",
+                            "name": "iphone2deploy",
+                            "prompt": old_prompt,
+                            "reference_images": [
+                                "app/reference_images/iphone2deploy-left.png",
+                                "app/reference_images/iphone2deploy-right.png",
+                            ],
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+
+        self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        persisted_preset = next(item for item in persisted["generation_presets"] if item["id"] == "iphone2deploy")
+        self.assertEqual(persisted_preset["prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(persisted_preset["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+
     def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
         save_settings(
             {
@@ -850,11 +897,11 @@ class MockPipelineTest(unittest.TestCase):
             conn.execute(
                 """
                 INSERT INTO seedance_api_calls(
-                    job_id, clip_id, operator_id, operator_name, status, task_id,
+                    job_id, clip_id, operator_id, operator_name, api_key_id, api_key_name, status, task_id,
                     model, requested_duration_sec, clip_duration_sec, usage_json,
                     raw_response_json, created_at, updated_at
                 )
-                VALUES (?, ?, 'client-a', 'Alice', 'succeeded', 'task-1', 'seedance-fast', 6, 5, ?, ?, ?, ?)
+                VALUES (?, ?, 'client-a', 'Alice', 'key-a', 'Primary key', 'succeeded', 'task-1', 'seedance-fast', 6, 5, ?, ?, ?, ?)
                 """,
                 (job_cur.lastrowid, clip_id, json.dumps({"total_tokens": 123}), json.dumps({"large": True}), now, now),
             )
@@ -866,6 +913,10 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(data["summary"][0]["operator_id"], "client-a")
         self.assertEqual(data["summary"][0]["call_count"], 1)
         self.assertEqual(data["summary"][0]["requested_duration_sec"], 6)
+        self.assertEqual(data["key_summary"][0]["api_key_id"], "key-a")
+        self.assertEqual(data["key_summary"][0]["api_key_name"], "Primary key")
+        self.assertEqual(data["key_summary"][0]["call_count"], 1)
+        self.assertEqual(data["recent_calls"][0]["api_key_name"], "Primary key")
         self.assertEqual(data["recent_calls"][0]["usage"], {"total_tokens": 123})
         self.assertNotIn("raw_response_json", data["recent_calls"][0])
 
@@ -954,6 +1005,75 @@ class MockPipelineTest(unittest.TestCase):
         data = res.json()
         self.assertNotIn("seedance_api_key", data)
         self.assertTrue(data["seedance_api_key_set"])
+        self.assertNotIn("secret-token", json.dumps(data, ensure_ascii=False))
+        self.assertNotIn("api_key", data["seedance_api_key_pool"][0])
+        self.assertTrue(data["seedance_api_key_pool"][0]["key_set"])
+
+    def test_seedance_api_key_pool_preserves_blank_existing_keys_and_sanitizes_response(self) -> None:
+        save_settings(
+            {
+                "seedance_api_key_pool": [
+                    {"id": "key-a", "name": "Primary", "api_key": "secret-a", "concurrency": 2, "enabled": True},
+                    {"id": "key-b", "name": "Secondary", "api_key": "secret-b", "concurrency": 1, "enabled": True},
+                ]
+            }
+        )
+
+        res = self.client.post(
+            "/api/settings",
+            json={
+                "values": {
+                    "seedance_api_key_pool": [
+                        {"id": "key-a", "name": "Primary renamed", "api_key": "", "concurrency": 3, "enabled": False},
+                        {"id": "key-c", "name": "Third", "api_key": "secret-c", "concurrency": 1, "enabled": True},
+                    ]
+                }
+            },
+        )
+
+        self.assertEqual(res.status_code, 200, res.text)
+        public_json = json.dumps(res.json(), ensure_ascii=False)
+        self.assertNotIn("secret-a", public_json)
+        self.assertNotIn("secret-b", public_json)
+        self.assertNotIn("secret-c", public_json)
+        settings = load_settings()
+        pool = {item["id"]: item for item in settings["seedance_api_key_pool"]}
+        self.assertEqual(set(pool), {"key-a", "key-c"})
+        self.assertEqual(pool["key-a"]["api_key"], "secret-a")
+        self.assertEqual(pool["key-a"]["name"], "Primary renamed")
+        self.assertEqual(pool["key-a"]["concurrency"], 3)
+        self.assertFalse(pool["key-a"]["enabled"])
+        self.assertEqual(pool["key-c"]["api_key"], "secret-c")
+
+    def test_seedance_api_key_pool_submit_empty_clears_legacy_key(self) -> None:
+        save_settings({"seedance_api_key": "legacy-secret"})
+
+        save_settings({"seedance_api_key_pool": []})
+
+        settings = load_settings()
+        self.assertEqual(settings["seedance_api_key"], "")
+        self.assertEqual(settings["seedance_api_key_pool"], [])
+
+    def test_seedance_key_slots_respect_per_key_concurrency(self) -> None:
+        settings = {
+            "seedance_api_key_pool": [
+                {"id": "key-a", "name": "A", "api_key": "secret-a", "concurrency": 1, "enabled": True},
+                {"id": "key-b", "name": "B", "api_key": "secret-b", "concurrency": 2, "enabled": True},
+                {"id": "key-c", "name": "C", "api_key": "secret-c", "concurrency": 1, "enabled": False},
+                {"id": "key-empty", "name": "Empty", "api_key": "", "concurrency": 1, "enabled": True},
+            ]
+        }
+
+        slots = [backend_services.acquire_seedance_key_slot(settings) for _ in range(3)]
+        backend_services.release_seedance_key_slot(None)
+
+        self.assertEqual([slot["id"] for slot in slots], ["key-a", "key-b", "key-b"])
+        self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {"key-a": 1, "key-b": 2})
+        self.assertEqual(backend_services._GENERATION_ACTIVE, 3)
+        for slot in slots:
+            backend_services.release_seedance_key_slot(slot)
+        self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {})
+        self.assertEqual(backend_services._GENERATION_ACTIVE, 0)
 
     def test_old_mock_timing_is_migrated_to_fast_default(self) -> None:
         SETTINGS_PATH.write_text(json.dumps({"mock_seconds_per_video_second": 24}, ensure_ascii=False), encoding="utf-8")
