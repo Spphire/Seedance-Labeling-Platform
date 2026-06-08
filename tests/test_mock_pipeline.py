@@ -273,6 +273,19 @@ class MockPipelineTest(unittest.TestCase):
         statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips WHERE episode_uuid=?", (uuid,))}
         self.assertEqual(set(statuses.values()), {"generated"})
 
+    def test_anchor_candidate_creation_skips_invalid_starts_without_dropping_valid_ones(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000031"
+        self.make_head_ready_episode(uuid, 20)
+
+        result = self.create_anchor_candidates_with_lock(uuid, [1, 4, 8, 8])
+
+        self.assertEqual([clip["timeline_start_sec"] for clip in result["created"]], [4.0, 8.0])
+        self.assertEqual(len(result["skipped"]), 2)
+        self.assertEqual(result["continuity_state"], "anchor_candidates")
+        clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY timeline_start_sec", (uuid,))
+        self.assertEqual([clip["input_kind"] for clip in clips], ["anchor", "anchor"])
+        self.assertEqual([clip["status"] for clip in clips], ["pending", "pending"])
+
     def test_rolling_generation_advances_after_accept_and_reject_reruns_same_clip(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000023"
         save_settings({"mock_async": False})

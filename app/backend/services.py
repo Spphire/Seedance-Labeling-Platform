@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import shutil
 import tempfile
@@ -14,7 +15,7 @@ from . import db
 from .ids import parse_uuids
 from .locks import LockError, active_lock, locks_by_resource, require_lock, require_no_active_lock
 from .nedf import extract_head_video, fetch_episode
-from .paths import ACCEPTED_DIR, CLIPS_DIR, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
+from .paths import ACCEPTED_DIR, ARCHIVED_ANCHORS_DIR, CLIPS_DIR, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
 from .settings import load_settings, public_url_for, seedance_api_key_pool
 from .video import (
     black_video,
@@ -648,6 +649,41 @@ def delete_clip_rows(uuid: str, clips: list[dict[str, Any]]) -> int:
     return len(clips)
 
 
+def archive_anchor_candidates(uuid: str, clips: list[dict[str, Any]], reason: str) -> Path | None:
+    if not clips:
+        return None
+    archive_dir = ARCHIVED_ANCHORS_DIR / uuid / f"{int(time.time() * 1000)}_{reason}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    metadata: list[dict[str, Any]] = []
+    for clip in clips:
+        clip_index = int(clip["clip_index"])
+        item = dict(clip)
+        input_path = Path(clip["local_path"])
+        if input_path.exists():
+            archived_input = archive_dir / f"clip_{clip_index:04d}_input.mp4"
+            shutil.copy2(input_path, archived_input)
+            item["archived_input_path"] = str(archived_input.resolve())
+        jobs = db.rows("SELECT * FROM generation_jobs WHERE clip_id=? ORDER BY created_at", (clip["id"],))
+        archived_jobs = []
+        for job in jobs:
+            archived_job = dict(job)
+            for field, suffix in [("payload_path", "payload.json"), ("output_path", "output.mp4")]:
+                value = job.get(field)
+                if not value:
+                    continue
+                source = Path(value)
+                if not source.exists():
+                    continue
+                dst = archive_dir / f"clip_{clip_index:04d}_job_{int(job['id'])}_{suffix}"
+                shutil.copy2(source, dst)
+                archived_job[f"archived_{field}"] = str(dst.resolve())
+            archived_jobs.append(archived_job)
+        item["jobs"] = archived_jobs
+        metadata.append(item)
+    (archive_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return archive_dir
+
+
 def delete_anchor_candidates_except(uuid: str, keep_clip_id: int) -> int:
     clips = db.rows(
         """
@@ -657,6 +693,7 @@ def delete_anchor_candidates_except(uuid: str, keep_clip_id: int) -> int:
         """,
         (uuid, keep_clip_id),
     )
+    archive_anchor_candidates(uuid, clips, "official_anchor_selected")
     return delete_clip_rows(uuid, clips)
 
 
@@ -886,7 +923,7 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
     total = continuity_total_duration(head_path)
     if total < ANCHOR_CLIP_DURATION_SEC:
         raise ValueError(f"episode is too short for a {ANCHOR_CLIP_DURATION_SEC}s anchor")
-    starts = normalize_anchor_starts(start_secs, total, continuity_overlap())
+    starts, skipped = normalize_anchor_start_candidates(start_secs, total, continuity_overlap())
     existing_keys = {
         int(round(float(row.get("timeline_start_sec") or row.get("start_sec") or 0.0) * 1000))
         for row in db.rows("SELECT timeline_start_sec, start_sec FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
@@ -894,6 +931,7 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
     created = []
     for start in starts:
         if int(round(start * 1000)) in existing_keys:
+            skipped.append({"start_sec": start, "reason": "候选已存在"})
             continue
         plan_item = {
             "start_sec": start,
@@ -920,16 +958,20 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
             conn.execute("UPDATE clips SET status='pending', updated_at=? WHERE id=?", (db.now(), clip["id"]))
         created.append(db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip)
         existing_keys.add(int(round(start * 1000)))
-    with db.connect() as conn:
-        conn.execute(
-            """
-            UPDATE episodes
-            SET continuity_state='anchor_candidates', final_status='stale', updated_at=?
-            WHERE uuid=?
-            """,
-            (db.now(), uuid),
-        )
-    return {"uuid": uuid, "created": created, "continuity_state": "anchor_candidates"}
+    if existing_keys:
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET continuity_state='anchor_candidates', final_status='stale', updated_at=?
+                WHERE uuid=?
+                """,
+                (db.now(), uuid),
+            )
+        state = "anchor_candidates"
+    else:
+        state = update_continuity_state(uuid)["state"]
+    return {"uuid": uuid, "created": created, "skipped": skipped, "continuity_state": state}
 
 
 def normalize_anchor_starts(start_secs: list[float], total_duration: float, overlap: float | None = None) -> list[float]:
@@ -950,6 +992,42 @@ def normalize_anchor_starts(start_secs: list[float], total_duration: float, over
     if not result:
         raise ValueError("no valid anchor starts")
     return result
+
+
+def normalize_anchor_start_candidates(
+    start_secs: list[float],
+    total_duration: float,
+    overlap: float | None = None,
+) -> tuple[list[float], list[dict[str, Any]]]:
+    overlap = continuity_overlap() if overlap is None else float(overlap)
+    max_start = max(0.0, total_duration - ANCHOR_CLIP_DURATION_SEC)
+    result: list[float] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for value in start_secs:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            skipped.append({"start_sec": value, "reason": "不是数字"})
+            continue
+        if not math.isfinite(numeric):
+            skipped.append({"start_sec": value, "reason": "不是有限数字"})
+            continue
+        start = min(max(0.0, float(int(numeric))), max_start)
+        key = int(round(start * 1000))
+        if key in seen:
+            skipped.append({"start_sec": start, "reason": "重复起点"})
+            continue
+        try:
+            validate_anchor_start(start, total_duration, overlap)
+        except ValueError as exc:
+            skipped.append({"start_sec": start, "reason": f"起点不合法：{exc}"})
+            continue
+        seen.add(key)
+        result.append(start)
+    if not start_secs:
+        skipped.append({"start_sec": None, "reason": "至少需要一个起点"})
+    return result, skipped
 
 
 def math_floor_millis(value: float) -> float:

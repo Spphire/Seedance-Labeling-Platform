@@ -722,6 +722,22 @@
       color: var(--muted);
     }
 
+    .anchor-status {
+      min-height: 18px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+
+    .anchor-status.success {
+      color: var(--good);
+    }
+
+    .anchor-status.error {
+      color: var(--bad);
+    }
+
     .statusbar {
       border-top: 1px solid var(--line);
       background: #fff;
@@ -1061,6 +1077,7 @@
       activeAdminPresetId: "",
       runPresetId: "",
       anchorDrafts: {},
+      anchorStatus: {},
     };
 
     const $ = (id) => document.getElementById(id);
@@ -1390,6 +1407,19 @@
 
     function badge(status, label) {
       return `<span class="badge ${status || ""}">${label || status || "unknown"}</span>`;
+    }
+
+    function clipBadges(clip) {
+      const values = [];
+      if (clip.input_kind === "anchor") {
+        const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid);
+        const isOfficial = Number(episode?.continuity_anchor_clip_id || 0) === Number(clip.id);
+        values.push(badge(isOfficial ? "ready" : "pending", isOfficial ? "正式锚点" : "候选锚点"));
+      } else if (clip.input_kind === "rolling") {
+        values.push(badge("stale", clip.direction === "backward" ? "向前滚动" : "向后滚动"));
+      }
+      values.push(badge(clip.status));
+      return values.join("");
     }
 
     function episodeBadges(episode) {
@@ -2049,7 +2079,11 @@
     }
 
     function setAnchorDrafts(uuid, values) {
-      state.anchorDrafts[uuid] = [...new Set(values.map((value) => Math.max(0, Math.floor(Number(value) || 0))))].sort((a, b) => a - b);
+      const normalized = values
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value))
+        .map((value) => Math.max(0, Math.floor(value)));
+      state.anchorDrafts[uuid] = [...new Set(normalized)].sort((a, b) => a - b);
     }
 
     function addAnchorDraft(uuid, value) {
@@ -2062,15 +2096,34 @@
       render({ forceWorkspace: true });
     }
 
+    function parseAnchorStartInput(value) {
+      return String(value || "")
+        .split(/[\s,，;；]+/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item));
+    }
+
+    function setAnchorPanelStatus(uuid, message, kind = "") {
+      state.anchorStatus[uuid] = { message, kind };
+      const target = document.querySelector("[data-anchor-status]");
+      if (target && state.selectedEpisode === uuid) {
+        target.textContent = message || "";
+        target.className = `anchor-status ${kind}`;
+      }
+    }
+
     function renderAnchorPanel(episode) {
       if (episode.status !== "preprocessed" || episode.continuity_anchor_clip_id) return "";
       const drafts = anchorDrafts(episode.uuid);
+      const panelStatus = state.anchorStatus[episode.uuid] || {};
       return `
         <div class="anchor-panel" data-anchor-panel>
           <h3>锚点候选</h3>
           <div class="meta">已创建 ${episode.continuity_anchor_candidate_count || 0} 个候选；每个候选为 4s。</div>
           <div class="row">
-            <input id="anchorStartSec" type="number" min="0" step="1" placeholder="起点秒数">
+            <input id="anchorStartSec" inputmode="decimal" placeholder="起点秒数，可空格/逗号分隔">
             <button data-anchor-action="add-current">添加当前</button>
             <button data-anchor-action="add-typed">添加</button>
           </div>
@@ -2081,8 +2134,9 @@
           </div>
           <div class="row">
             <button data-anchor-action="clear" ${drafts.length ? "" : "disabled"}>清空</button>
-            <button class="primary" data-anchor-action="create" ${drafts.length ? "" : "disabled"}>创建候选</button>
+            <button class="primary" data-anchor-action="create">创建候选</button>
           </div>
+          <div class="anchor-status ${panelStatus.kind || ""}" data-anchor-status>${panelStatus.message || ""}</div>
         </div>
       `;
     }
@@ -2100,30 +2154,54 @@
           if (action === "add-current") {
             const video = $("originalVideo");
             addAnchorDraft(episode.uuid, video && Number.isFinite(video.currentTime) ? video.currentTime : 0);
+            setAnchorPanelStatus(episode.uuid, "已添加当前播放位置。", "success");
             return;
           }
           if (action === "add-typed") {
-            addAnchorDraft(episode.uuid, input?.value || 0);
+            const typed = parseAnchorStartInput(input?.value);
+            if (!typed.length) {
+              setAnchorPanelStatus(episode.uuid, "请输入至少一个起点秒数。", "error");
+              return;
+            }
+            setAnchorDrafts(episode.uuid, [...anchorDrafts(episode.uuid), ...typed]);
+            if (input) input.value = "";
+            setAnchorPanelStatus(episode.uuid, `已添加 ${typed.length} 个起点。`, "success");
+            render({ forceWorkspace: true });
             return;
           }
           if (action === "clear") {
             setAnchorDrafts(episode.uuid, []);
+            setAnchorPanelStatus(episode.uuid, "", "");
             render({ forceWorkspace: true });
             return;
           }
           if (action === "create") {
+            setAnchorDrafts(episode.uuid, [...anchorDrafts(episode.uuid), ...parseAnchorStartInput(input?.value)]);
             const starts = anchorDrafts(episode.uuid);
-            if (!starts.length) return;
+            if (!starts.length) {
+              setAnchorPanelStatus(episode.uuid, "请先添加至少一个起点秒数。", "error");
+              render({ forceWorkspace: true });
+              return;
+            }
             button.disabled = true;
+            setAnchorPanelStatus(episode.uuid, `正在创建 ${starts.length} 个候选锚点...`, "");
             try {
               const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/anchor_candidates`, {
                 method: "POST",
                 body: { start_secs: starts, lock_token: lock.token },
               }));
               setAnchorDrafts(episode.uuid, []);
+              if (input) input.value = "";
+              const skipped = result.skipped || [];
+              const createdCount = (result.created || []).length;
+              const skippedText = skipped.length
+                ? `\n跳过 ${skipped.length} 个：${skipped.map((item) => `${item.start_sec ?? "-"}s ${item.reason}`).join("；")}`
+                : "";
+              setAnchorPanelStatus(episode.uuid, `已创建 ${createdCount} 个候选锚点。${skippedText}`, createdCount ? "success" : "error");
               log("anchor candidates created", result);
               await refresh({ forceWorkspace: true });
             } catch (err) {
+              setAnchorPanelStatus(episode.uuid, formatApiError(err), "error");
               log(formatApiError(err));
             } finally {
               button.disabled = false;
@@ -2174,7 +2252,7 @@
         div.innerHTML = `
           <div class="item-title">
             <span>${shortUuid(clip.episode_uuid)} #${String(clip.clip_index).padStart(4, "0")}</span>
-            ${badge(clip.status)}
+            ${clipBadges(clip)}
           </div>
           <div class="meta">${clipTimingText(clip)}</div>
           ${job ? `<div class="meta">${jobSummary(job)}</div>` : ""}
@@ -2403,7 +2481,7 @@
         </div>
         <div class="videos">
           <div class="video-pane">
-            <h3><span>原 clip</span><span>${badge(clip.status)}</span></h3>
+            <h3><span>原 clip</span><span>${clipBadges(clip)}</span></h3>
             <video id="originalVideo" src="${clip.video_url || ""}" controls playsinline></video>
           </div>
           <div class="video-pane">
@@ -2650,6 +2728,17 @@
             const lock = myClipLock(clip.id);
             if (!lock) {
               throw new Error("这个 episode 没有编辑锁，不能提交审核操作");
+            }
+            if (action === "accept" && clip.input_kind === "anchor") {
+              const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid);
+              const isOfficial = Number(episode?.continuity_anchor_clip_id || 0) === Number(clip.id);
+              const otherCandidates = state.clips.filter((item) =>
+                item.episode_uuid === clip.episode_uuid && item.input_kind === "anchor" && item.id !== clip.id
+              ).length;
+              const message = isOfficial
+                ? "确认保留这个正式锚点？"
+                : `确认选择这个候选锚点作为正式锚点？\n\n其它 ${otherCandidates} 个候选锚点会从当前候选列表移除；它们的输入和生成结果会先归档到后台，episode 会进入双向串行生成阶段。`;
+              if (!window.confirm(message)) return;
             }
             if (action === "reject") {
               const dependentCount = dependentContinuityCount(clip);

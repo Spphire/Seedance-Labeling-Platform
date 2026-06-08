@@ -14,6 +14,7 @@ HEAD_VIDEOS_DIR = DATA_DIR / "head_videos"
 CLIPS_DIR = DATA_DIR / "clips"
 GENERATED_DIR = DATA_DIR / "generated"
 ACCEPTED_DIR = DATA_DIR / "accepted_clips"
+ARCHIVED_ANCHORS_DIR = DATA_DIR / "archived_anchor_candidates"
 FINAL_DIR = DATA_DIR / "final_episodes"
 LOGS_DIR = ROOT / "logs"
 REFERENCE_IMAGES_DIR = ROOT / "app" / "reference_images"
@@ -27,6 +28,7 @@ def ensure_dirs() -> None:
         CLIPS_DIR,
         GENERATED_DIR,
         ACCEPTED_DIR,
+        ARCHIVED_ANCHORS_DIR,
         FINAL_DIR,
         LOGS_DIR,
     ]:
