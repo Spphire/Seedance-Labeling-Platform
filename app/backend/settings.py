@@ -38,10 +38,14 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/r-far-iphone.png",
 ]
 IPHONE2DEPLOY_REFERENCE_IMAGES = [
-    "app/reference_images/l-near-deploy.png",
-    "app/reference_images/r-near-deploy.png",
+    "app/reference_images/l-near-deploy-v2.png",
+    "app/reference_images/r-near-deploy-v2.png",
 ]
 LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
+    (
+        "app/reference_images/l-near-deploy.png",
+        "app/reference_images/r-near-deploy.png",
+    ),
     (
         "app/reference_images/iphone2deploy-left.jpg",
         "app/reference_images/iphone2deploy-right.jpg",
@@ -52,7 +56,7 @@ LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
     ),
 }
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
-GENERATION_PRESETS_VERSION = 5
+GENERATION_PRESETS_VERSION = 6
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -362,6 +366,14 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
                     preset["prompt"] = str(default_preset["prompt"])
                     changed = True
                 if preset["reference_images"] != default_preset["reference_images"]:
+                    preset["reference_images"] = list(default_preset["reference_images"])
+                    changed = True
+        if presets_version < 6:
+            for preset in presets:
+                if preset["id"] != "iphone2deploy":
+                    continue
+                default_preset = _default_preset_by_id("iphone2deploy")
+                if default_preset and preset["reference_images"] != default_preset["reference_images"]:
                     preset["reference_images"] = list(default_preset["reference_images"])
                     changed = True
         data["generation_presets_version"] = GENERATION_PRESETS_VERSION
