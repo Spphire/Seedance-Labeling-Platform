@@ -286,7 +286,11 @@ def list_clips() -> list[dict[str, Any]]:
         )
     }
     for clip in clips:
-        clip["video_url"] = static_url_from_path(clip.get("local_path"), CLIPS_DIR, "clips")
+        input_video_url = clip_input_video_url(clip)
+        raw_video_url = raw_clip_video_url(clip)
+        clip["input_video_url"] = input_video_url
+        clip["raw_video_url"] = raw_video_url
+        clip["video_url"] = clip_display_video_url(clip, input_video_url, raw_video_url)
         latest_job = latest_jobs.get(clip["id"])
         clip["latest_job_id"] = latest_job["id"] if latest_job else None
         clip["lock"] = clip_locks.get(str(clip["id"]))
@@ -462,6 +466,30 @@ def static_url_from_path(path_value: str | None, root: Path, prefix: str) -> str
     except ValueError:
         return None
     return f"/{prefix}/{rel.as_posix()}"
+
+
+def static_url_from_clip_input_path(path_value: str | None) -> str | None:
+    return static_url_from_path(path_value, CLIPS_DIR, "clips") or static_url_from_path(path_value, ACCEPTED_DIR, "accepted")
+
+
+def raw_clip_path(clip: dict[str, Any]) -> Path:
+    return CLIPS_DIR / str(clip["episode_uuid"]) / f"clip_{int(clip['clip_index']):04d}.mp4"
+
+
+def raw_clip_video_url(clip: dict[str, Any]) -> str | None:
+    if clip.get("input_kind") != "anchor":
+        return static_url_from_path(clip.get("local_path"), CLIPS_DIR, "clips")
+    return static_url_from_path(str(raw_clip_path(clip)), CLIPS_DIR, "clips")
+
+
+def clip_input_video_url(clip: dict[str, Any]) -> str | None:
+    return static_url_from_clip_input_path(clip.get("local_path")) or clip.get("public_url")
+
+
+def clip_display_video_url(clip: dict[str, Any], input_video_url: str | None, raw_video_url: str | None) -> str | None:
+    if clip.get("input_kind") == "anchor" and clip_anchor_stage(clip) == ANCHOR_STAGE_OFFICIAL:
+        return raw_video_url or input_video_url
+    return input_video_url or raw_video_url
 
 
 def require_episode_mutation_lock(uuid: str, lock_token: str | None) -> None:

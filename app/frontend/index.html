@@ -2457,6 +2457,10 @@
       const signature = [
         clip.id,
         clip.status,
+        clip.anchor_stage || "",
+        clip.video_url || "",
+        clip.input_video_url || "",
+        clip.raw_video_url || "",
         generated,
         clip.latest_job_id || "",
         job ? job.status : "",
