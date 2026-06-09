@@ -32,6 +32,7 @@ from .video import (
     cut_clip,
     normalize_accepted,
     requested_seedance_duration,
+    reverse_video,
     stitch_videos,
     transcode_760x570,
     trim_video,
@@ -688,6 +689,8 @@ def delete_clip_rows(uuid: str, clips: list[dict[str, Any]]) -> int:
         Path(clip["local_path"]).unlink(missing_ok=True)
         accepted_path = ACCEPTED_DIR / uuid / f"clip_{int(clip['clip_index']):04d}.mp4"
         accepted_path.unlink(missing_ok=True)
+        accepted_chronological_path = chronological_accepted_output_path(clip)
+        accepted_chronological_path.unlink(missing_ok=True)
         generated_dir = GENERATED_DIR / uuid
         if generated_dir.exists():
             for path in generated_dir.glob(f"clip_{int(clip['clip_index']):04d}_job_*"):
@@ -743,6 +746,146 @@ def delete_anchor_candidates_except(uuid: str, keep_clip_id: int) -> int:
     return delete_clip_rows(uuid, clips)
 
 
+def latest_anchor_candidate_archive(uuid: str, reason: str = "official_anchor_selected") -> Path | None:
+    archive_root = ARCHIVED_ANCHORS_DIR / uuid
+    if not archive_root.exists():
+        return None
+    candidates = [
+        path
+        for path in archive_root.iterdir()
+        if path.is_dir() and path.name.endswith(f"_{reason}") and (path / "metadata.json").exists()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def restore_archived_anchor_candidates(uuid: str) -> int:
+    archive_dir = latest_anchor_candidate_archive(uuid)
+    if not archive_dir:
+        return 0
+    metadata_path = archive_dir / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(metadata, list):
+        return 0
+
+    restored = 0
+    clip_dir = CLIPS_DIR / uuid
+    generated_dir = GENERATED_DIR / uuid
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    now = db.now()
+    for raw_item in metadata:
+        if not isinstance(raw_item, dict):
+            continue
+        clip_id = int(raw_item.get("id") or 0)
+        clip_index = int(raw_item.get("clip_index") or 0)
+        if clip_id <= 0:
+            continue
+        if db.one("SELECT id FROM clips WHERE id=?", (clip_id,)):
+            continue
+        input_path = Path(str(raw_item.get("archived_input_path") or ""))
+        restored_input = clip_dir / f"clip_{clip_index:04d}.mp4"
+        if input_path.exists():
+            shutil.copy2(input_path, restored_input)
+        elif raw_item.get("local_path") and Path(str(raw_item["local_path"])).exists():
+            shutil.copy2(Path(str(raw_item["local_path"])), restored_input)
+        else:
+            continue
+        public_url = public_url_for("clips", Path(uuid) / restored_input.name)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO clips(
+                    id, episode_uuid, clip_index, start_sec, duration_sec,
+                    source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec,
+                    timeline_start_sec, timeline_end_sec, input_timeline_start_sec, input_timeline_end_sec,
+                    direction, input_kind, anchor_stage,
+                    local_path, public_url, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clip_id,
+                    uuid,
+                    clip_index,
+                    float(raw_item.get("start_sec") or 0),
+                    float(raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC),
+                    float(raw_item.get("source_start_sec") if raw_item.get("source_start_sec") is not None else raw_item.get("start_sec") or 0),
+                    float(raw_item.get("source_duration_sec") if raw_item.get("source_duration_sec") is not None else raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC),
+                    float(raw_item.get("overlap_sec") or 0),
+                    float(raw_item.get("timeline_duration_sec") if raw_item.get("timeline_duration_sec") is not None else raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC),
+                    float(raw_item.get("timeline_start_sec") if raw_item.get("timeline_start_sec") is not None else raw_item.get("start_sec") or 0),
+                    float(raw_item.get("timeline_end_sec") if raw_item.get("timeline_end_sec") is not None else (float(raw_item.get("start_sec") or 0) + float(raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC))),
+                    float(raw_item.get("input_timeline_start_sec") if raw_item.get("input_timeline_start_sec") is not None else raw_item.get("start_sec") or 0),
+                    float(raw_item.get("input_timeline_end_sec") if raw_item.get("input_timeline_end_sec") is not None else (float(raw_item.get("start_sec") or 0) + float(raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC))),
+                    str(raw_item.get("direction") or "anchor"),
+                    str(raw_item.get("input_kind") or "anchor"),
+                    str(raw_item.get("anchor_stage") or ANCHOR_STAGE_REPLACE_ARM),
+                    str(restored_input.resolve()),
+                    public_url,
+                    str(raw_item.get("status") or "pending"),
+                    float(raw_item.get("created_at") or now),
+                    now,
+                ),
+            )
+        restored += 1
+        for raw_job in raw_item.get("jobs") or []:
+            if isinstance(raw_job, dict):
+                restore_archived_generation_job(uuid, clip_id, clip_index, raw_job)
+    return restored
+
+
+def restore_archived_generation_job(uuid: str, clip_id: int, clip_index: int, raw_job: dict[str, Any]) -> None:
+    job_id = int(raw_job.get("id") or 0)
+    if job_id <= 0 or db.one("SELECT id FROM generation_jobs WHERE id=?", (job_id,)):
+        return
+    output_path = None
+    archived_output = Path(str(raw_job.get("archived_output_path") or ""))
+    if archived_output.exists():
+        suffix = archived_output.suffix or ".mp4"
+        output_path = GENERATED_DIR / uuid / f"clip_{clip_index:04d}_job_{job_id}_restored{suffix}"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(archived_output, output_path)
+    now = db.now()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO generation_jobs(
+                id, clip_id, mode, requested_duration_sec, operator_id, operator_name,
+                prompt, reference_images_json, task_id, status, output_url, output_path,
+                error, started_at, completed_at, estimated_total_sec, retry_count,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                clip_id,
+                str(raw_job.get("mode") or "mock"),
+                int(raw_job.get("requested_duration_sec") or 0),
+                raw_job.get("operator_id"),
+                raw_job.get("operator_name"),
+                raw_job.get("prompt"),
+                raw_job.get("reference_images_json"),
+                raw_job.get("task_id"),
+                str(raw_job.get("status") or "failed"),
+                raw_job.get("output_url"),
+                str(output_path.resolve()) if output_path else raw_job.get("output_path"),
+                raw_job.get("error"),
+                raw_job.get("started_at"),
+                raw_job.get("completed_at"),
+                raw_job.get("estimated_total_sec"),
+                int(raw_job.get("retry_count") or 0),
+                float(raw_job.get("created_at") or now),
+                float(raw_job.get("updated_at") or now),
+            ),
+        )
+
+
 def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
     uuid = clip["episode_uuid"]
     input_kind = clip.get("input_kind") or ""
@@ -769,6 +912,7 @@ def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
                     """,
                     (db.now(), uuid),
                 )
+            restore_archived_anchor_candidates(uuid)
         return deleted
     if input_kind != "rolling":
         return 0
@@ -1304,6 +1448,7 @@ def trim_continuity_contribution(
     dst: Path,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Path:
+    accepted_path = ensure_chronological_accepted_path(clip, accepted_path, should_cancel=should_cancel)
     timeline_start = clip_timeline_start(clip)
     timeline_end = clip_timeline_end(clip)
     duration = max(0.0, timeline_end - timeline_start)
@@ -1576,6 +1721,9 @@ def adjacent_accepted_path(clip: dict[str, Any]) -> Path | None:
 
 
 def latest_accepted_path(clip_id: int) -> Path | None:
+    clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
+    if not clip:
+        return None
     review = db.one(
         "SELECT * FROM reviews WHERE clip_id=? AND decision='accept' ORDER BY reviewed_at DESC LIMIT 1",
         (clip_id,),
@@ -1583,7 +1731,9 @@ def latest_accepted_path(clip_id: int) -> Path | None:
     if not review or not review.get("accepted_path"):
         return None
     path = Path(review["accepted_path"])
-    return path if path.exists() else None
+    if not path.exists():
+        return None
+    return ensure_chronological_accepted_path(clip, path)
 
 
 def queue_generation_for_selected_clips(
@@ -2576,6 +2726,44 @@ def accepted_clip_output_path(clip: dict[str, Any]) -> Path:
     return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}.mp4"
 
 
+def chronological_accepted_output_path(clip: dict[str, Any]) -> Path:
+    return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}_chronological.mp4"
+
+
+def accepted_output_needs_chronological_sidecar(clip: dict[str, Any]) -> bool:
+    return clip.get("input_kind") == "rolling" and str(clip.get("direction") or "forward") == "backward"
+
+
+def ensure_chronological_accepted_path(
+    clip: dict[str, Any],
+    accepted_path: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    accepted_path = Path(accepted_path)
+    if not accepted_output_needs_chronological_sidecar(clip):
+        return accepted_path
+    if not accepted_path.exists():
+        raise FileNotFoundError(f"accepted output is missing: {accepted_path}")
+    chronological_path = chronological_accepted_output_path(clip)
+    if accepted_path.resolve() == chronological_path.resolve():
+        return chronological_path
+    if (
+        chronological_path.exists()
+        and chronological_path.stat().st_size > 0
+        and chronological_path.stat().st_mtime >= accepted_path.stat().st_mtime
+    ):
+        return chronological_path
+    tmp = chronological_path.with_name(
+        f".{chronological_path.stem}_{int(time.time() * 1000)}{chronological_path.suffix}"
+    )
+    try:
+        reverse_video(accepted_path, tmp, should_cancel=should_cancel)
+        tmp.replace(chronological_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return chronological_path
+
+
 def review_clip(
     clip_id: int,
     decision: str,
@@ -2627,6 +2815,7 @@ def review_clip(
             if require_lock_token:
                 require_lock("episode", clip["episode_uuid"], lock_token)
             temp_accepted_path.replace(accepted_path_obj)
+            ensure_chronological_accepted_path(clip, accepted_path_obj)
         except Exception:
             temp_accepted_path.unlink(missing_ok=True)
             raise
@@ -2819,6 +3008,7 @@ def preview_episode(uuid: str, version: int) -> dict[str, Any]:
     clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
     if not clips:
         return {"uuid": uuid, "preview_status": "missing", "reason": "no clips"}
+    should_cancel = lambda: _preview_is_stale(uuid, version)
     accepted_by_id: dict[int, Path] = {}
     for clip in clips:
         if clip.get("status") != "accepted":
@@ -2830,7 +3020,7 @@ def preview_episode(uuid: str, version: int) -> dict[str, Any]:
         if review and review.get("accepted_path"):
             path = Path(review["accepted_path"])
             if path.exists():
-                accepted_by_id[int(clip["id"])] = path
+                accepted_by_id[int(clip["id"])] = ensure_chronological_accepted_path(clip, path, should_cancel)
     if _preview_is_stale(uuid, version):
         return {"uuid": uuid, "preview_status": "stitching", "stale": True}
     if not accepted_by_id:
@@ -2846,7 +3036,6 @@ def preview_episode(uuid: str, version: int) -> dict[str, Any]:
         return {"uuid": uuid, "preview_status": "missing", "reason": "no accepted clips"}
     out = FINAL_DIR / f"{uuid}_preview_accepted_with_black.mp4"
     tmp = FINAL_DIR / f".{uuid}_preview-{version}-{int(time.time() * 1000)}.mp4"
-    should_cancel = lambda: _preview_is_stale(uuid, version)
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
@@ -3007,7 +3196,7 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
         )
         if not review or not review.get("accepted_path"):
             raise RuntimeError(f"clip {clip['id']} is not accepted")
-        accepted_paths.append(Path(review["accepted_path"]))
+        accepted_paths.append(ensure_chronological_accepted_path(clip, Path(review["accepted_path"])))
     out = FINAL_DIR / f"{uuid}_accepted_30fps.mp4"
     tmp = FINAL_DIR / f".{uuid}_accepted_30fps.stitching-{int(time.time() * 1000)}.mp4"
     with db.connect() as conn:

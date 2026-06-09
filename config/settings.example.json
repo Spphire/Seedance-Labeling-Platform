@@ -13,6 +13,8 @@
   "seedance_resolution": "480p",
   "seedance_ratio": "4:3",
   "seedance_seconds_per_video_second": 24,
+  "continuity_overlap_sec": 1,
+  "continuity_prefer_input_sec": 12,
   "default_prompt": "把@视频1中的真人手换成@图片1@图片2的机械臂，把@视频1中真人手臂换成@图片3@图片4中的机械臂，爪夹形态、动作、画面、背景保持不变",
   "reference_images": [
     "app/reference_images/l-near.png",

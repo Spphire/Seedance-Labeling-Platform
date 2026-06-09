@@ -294,6 +294,27 @@ def trim_video(
     )
 
 
+def reverse_video(src: Path, dst: Path, should_cancel: Callable[[], bool] | None = None) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg_cancellable(
+        [
+            "-i",
+            str(src),
+            "-vf",
+            "reverse,scale=760:570,setsar=1,fps=30",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ],
+        should_cancel,
+    )
+
+
 def black_video(
     dst: Path,
     duration_sec: float,
@@ -377,7 +398,12 @@ def compose_continuity_input(
         else:
             trim_video(anchor_src, anchor_overlap_path, 0.0, overlap_sec)
             inputs = [source_path, anchor_overlap_path]
-        concat_videos_precise(inputs, dst)
+        if direction == "forward":
+            concat_videos_precise(inputs, dst)
+        else:
+            chronological = tmp / "chronological_input.mp4"
+            concat_videos_precise(inputs, chronological)
+            reverse_video(chronological, dst)
 
 
 def rolling_clip_plan(

@@ -964,14 +964,8 @@
         </div>
         <div class="field">
           <label for="continuityPreferInputSec">Rolling prefer input 秒数</label>
-          <input id="continuityPreferInputSec" type="number" min="4" max="15" step="1" placeholder="15">
+          <input id="continuityPreferInputSec" type="number" min="4" max="15" step="1" placeholder="12">
           <div class="hint">只影响非锚点 rolling clip；锚点候选固定 4s。实际切分仍会保证 Seedance 输入在 4-15s。</div>
-        </div>
-        <div class="field">
-          <label>Seedance 用量监控</label>
-          <button id="refreshUsage">刷新用量</button>
-          <div id="seedanceUsageSummary" class="usage-panel"></div>
-          <div id="seedanceUsageRecent" class="usage-panel"></div>
         </div>
         <div class="admin-actions">
           <button id="closeSettings">关闭</button>
@@ -1166,31 +1160,40 @@
     }
 
     async function refresh(options = {}) {
-      const data = await api("/api/state");
-      state.episodes = data.episodes || [];
-      state.clips = data.clips || [];
-      state.jobs = data.jobs || [];
-      state.locks = data.locks || [];
-      state.settings = data.settings || {};
-      state.availableReferenceImages = state.settings.available_reference_images || [];
-      if (state.route === "admin") {
-        await loadAdminData({ render: false }).catch((err) => log(formatApiError(err)));
+      let refreshed = false;
+      try {
+        const data = await api("/api/state");
+        state.episodes = data.episodes || [];
+        state.clips = data.clips || [];
+        state.jobs = data.jobs || [];
+        state.locks = data.locks || [];
+        state.settings = data.settings || {};
+        state.availableReferenceImages = state.settings.available_reference_images || [];
+        if (state.route === "admin") {
+          await loadAdminData({ render: false }).catch((err) => log(formatApiError(err)));
+        }
+        if (!$("generationMode").dataset.initialized) {
+          $("generationMode").value = "mock";
+          $("generationMode").dataset.initialized = "1";
+        }
+        if (!state.settingsDirty) {
+          syncSettingsForm();
+        }
+        if (!state.runDefaultsInitialized) {
+          syncRunFormFromDefaults();
+        }
+        reconcileLocks();
+        render(options);
+        refreshed = true;
+        if (!options.silent) {
+          log("state refreshed");
+        }
+      } finally {
+        schedulePolling();
+        if (refreshed) {
+          scheduleRenewals();
+        }
       }
-      if (!$("generationMode").dataset.initialized) {
-        $("generationMode").value = "mock";
-        $("generationMode").dataset.initialized = "1";
-      }
-      if (!state.settingsDirty) {
-        syncSettingsForm();
-      }
-      if (!state.runDefaultsInitialized) {
-        syncRunFormFromDefaults();
-      }
-      reconcileLocks();
-      render(options);
-      log("state refreshed");
-      schedulePolling();
-      scheduleRenewals();
     }
 
     function syncSettingsForm() {
@@ -1209,7 +1212,7 @@
       $("seedanceConcurrency").value = state.settings.seedance_concurrency || 3;
       $("seedanceSecondsPerVideoSecond").value = state.settings.seedance_seconds_per_video_second || 24;
       $("continuityOverlapSec").value = state.settings.continuity_overlap_sec ?? 1;
-      $("continuityPreferInputSec").value = state.settings.continuity_prefer_input_sec ?? 15;
+      $("continuityPreferInputSec").value = state.settings.continuity_prefer_input_sec ?? 12;
     }
 
     function normalizedSeedanceApiKeyPool() {
@@ -1800,6 +1803,7 @@
       const data = state.seedanceUsage || {};
       const summaryTarget = $("seedanceUsageSummary");
       const recentTarget = $("seedanceUsageRecent");
+      if (!summaryTarget || !recentTarget) return;
       const summary = data.summary || [];
       const recent = data.recent_calls || [];
       summaryTarget.innerHTML = summary.length
@@ -2018,9 +2022,10 @@
       }
       const hasActiveWork = state.episodes.some((episode) => episode.final_status === "stitching" || episode.preview_status === "stitching")
         || state.clips.some((clip) => clip.status === "generating");
+      const delay = document.hidden ? 30000 : hasActiveWork ? 1500 : 15000;
       state.pollTimer = setTimeout(() => {
-        refresh().catch((err) => log(err.message));
-      }, hasActiveWork ? 1500 : 15000);
+        refresh({ silent: true }).catch((err) => log(formatApiError(err)));
+      }, delay);
     }
 
     function renderEpisodes() {
@@ -2416,7 +2421,6 @@
           if (action === "settings") {
             $("settingsOverlay").classList.remove("hidden");
             $("dm3NedfRoot").focus();
-            renderSeedanceUsage();
             return;
           }
           if (action === "refresh") {
@@ -2869,13 +2873,19 @@
         navigator.sendBeacon?.("/api/locks/release", new Blob([body], { type: "application/json" }));
       });
     });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        schedulePolling();
+        return;
+      }
+      refresh({ silent: true }).catch((err) => log(formatApiError(err)));
+    });
 
     $("refresh").addEventListener("click", () => refresh().catch((err) => log(formatApiError(err))));
     $("openSettings").addEventListener("click", () => {
       if (state.route === "admin") {
         $("settingsOverlay").classList.remove("hidden");
         $("dm3NedfRoot").focus();
-        loadSeedanceUsage().catch((err) => log(formatApiError(err)));
       } else {
         $("runSettingsOverlay").classList.remove("hidden");
         $("runPrompt").focus();
@@ -2923,7 +2933,7 @@
           seedance_concurrency: Math.max(1, Number.parseInt($("seedanceConcurrency").value, 10) || 3),
           seedance_seconds_per_video_second: Math.max(1, Number.parseFloat($("seedanceSecondsPerVideoSecond").value) || 24),
           continuity_overlap_sec: Math.max(0, Math.min(11, Number.parseInt($("continuityOverlapSec").value, 10) || 1)),
-          continuity_prefer_input_sec: Math.max(4, Math.min(15, Number.parseInt($("continuityPreferInputSec").value, 10) || 15)),
+          continuity_prefer_input_sec: Math.max(4, Math.min(15, Number.parseInt($("continuityPreferInputSec").value, 10) || 12)),
           seedance_api_key_pool: seedanceApiKeyPoolValues(),
         };
         const result = await api("/api/settings", { method: "POST", body: { values } });
@@ -3006,14 +3016,6 @@
         await refresh();
       } catch (err) {
         log(err.message);
-      }
-    });
-    $("refreshUsage").addEventListener("click", async () => {
-      try {
-        const data = await loadSeedanceUsage();
-        log("seedance usage refreshed", data.summary || []);
-      } catch (err) {
-        log(formatApiError(err));
       }
     });
     $("dryRun").addEventListener("click", async () => {
