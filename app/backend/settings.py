@@ -18,10 +18,14 @@ DEFAULT_PROMPT = (
     "爪夹形态、动作、画面、背景保持不变"
 )
 IPHONE2DEPLOY_PROMPT = (
-    "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2的机械臂和摄像头，"
-    "爪夹形态、动作、画面、背景保持不变"
+    "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2@图片3@图片4的机械臂和摄像头，"
+    "根据爪夹上的绿点对齐形态、动作、画面、背景保持不变"
 )
 LEGACY_IPHONE2DEPLOY_PROMPTS = {
+    (
+        "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2的机械臂和摄像头，"
+        "爪夹形态、动作、画面、背景保持不变"
+    ),
     "把@视频1中的真人手臂和手机换成@图片1@图片2的机械臂和上面安装的相机，"
     "爪夹形态、动作、画面、背景保持不变",
 }
@@ -38,10 +42,16 @@ DEFAULT_REFERENCE_IMAGES = [
     "app/reference_images/r-far-iphone.png",
 ]
 IPHONE2DEPLOY_REFERENCE_IMAGES = [
+    "app/reference_images/l-nn-deploy.png",
+    "app/reference_images/r-nn-deploy.png",
     "app/reference_images/l-near-deploy-v2.png",
     "app/reference_images/r-near-deploy-v2.png",
 ]
 LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
+    (
+        "app/reference_images/l-near-deploy-v2.png",
+        "app/reference_images/r-near-deploy-v2.png",
+    ),
     (
         "app/reference_images/l-near-deploy.png",
         "app/reference_images/r-near-deploy.png",
@@ -56,7 +66,7 @@ LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
     ),
 }
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
-GENERATION_PRESETS_VERSION = 6
+GENERATION_PRESETS_VERSION = 7
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -374,6 +384,19 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
                     continue
                 default_preset = _default_preset_by_id("iphone2deploy")
                 if default_preset and preset["reference_images"] != default_preset["reference_images"]:
+                    preset["reference_images"] = list(default_preset["reference_images"])
+                    changed = True
+        if presets_version < 7:
+            for preset in presets:
+                if preset["id"] != "iphone2deploy":
+                    continue
+                default_preset = _default_preset_by_id("iphone2deploy")
+                if not default_preset:
+                    continue
+                if preset["prompt"] != default_preset["prompt"]:
+                    preset["prompt"] = str(default_preset["prompt"])
+                    changed = True
+                if preset["reference_images"] != default_preset["reference_images"]:
                     preset["reference_images"] = list(default_preset["reference_images"])
                     changed = True
         data["generation_presets_version"] = GENERATION_PRESETS_VERSION

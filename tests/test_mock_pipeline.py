@@ -619,7 +619,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(presets["iphone2deploy"]["name"], "iphone2deploy")
         self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
-        self.assertEqual(len(presets["iphone2deploy"]["reference_images"]), 2)
+        self.assertEqual(len(presets["iphone2deploy"]["reference_images"]), 4)
 
     def test_old_generation_presets_gain_iphone2deploy_once(self) -> None:
         SETTINGS_PATH.write_text(
@@ -786,6 +786,52 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
         self.assertEqual(settings["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(persisted["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+
+    def test_iphone2deploy_v6_deploy_refs_are_migrated_to_four_image_prompt(self) -> None:
+        old_prompt = "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2的机械臂和摄像头，爪夹形态、动作、画面、背景保持不变"
+        old_refs = [
+            "app/reference_images/l-near-deploy-v2.png",
+            "app/reference_images/r-near-deploy-v2.png",
+        ]
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "default_prompt": old_prompt,
+                    "reference_images": old_refs,
+                    "default_generation_preset_id": "iphone2deploy",
+                    "generation_presets_version": 6,
+                    "generation_presets": [
+                        {
+                            "id": "iphone-default",
+                            "name": "iPhone default",
+                            "prompt": DEFAULT_PROMPT,
+                            "reference_images": DEFAULT_SETTINGS["reference_images"],
+                        },
+                        {
+                            "id": "iphone2deploy",
+                            "name": "iphone2deploy",
+                            "prompt": old_prompt,
+                            "reference_images": old_refs,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+
+        self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertEqual(settings["default_prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(settings["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
+        self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(persisted["default_prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(persisted["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
 
     def test_stale_iphone2deploy_default_is_repaired_even_at_current_version(self) -> None:
