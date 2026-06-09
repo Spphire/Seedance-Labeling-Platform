@@ -37,6 +37,7 @@ from .services import (
     queue_generation,
     queue_rolling_generation,
     queue_stitch_episode,
+    recover_interrupted_generation_jobs,
     refresh_clip_public_urls,
     retry_clip,
     retry_job,
@@ -71,6 +72,7 @@ def _init() -> None:
 def startup() -> None:
     _init()
     refresh_clip_public_urls()
+    recover_interrupted_generation_jobs()
 
 
 def _public_error(exc: Exception) -> HTTPException:

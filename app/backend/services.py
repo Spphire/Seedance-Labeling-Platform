@@ -1943,6 +1943,30 @@ def fail_generation_job(job_id: int, clip_id: int, error: str) -> None:
         conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=? AND status='generating'", (now, clip_id))
 
 
+def recover_interrupted_generation_jobs() -> dict[str, list[int]]:
+    jobs = db.rows(
+        """
+        SELECT j.*, c.status AS clip_status
+        FROM generation_jobs j
+        JOIN clips c ON c.id = j.clip_id
+        WHERE j.status='running'
+        ORDER BY j.created_at
+        """
+    )
+    resumed: list[int] = []
+    failed: list[int] = []
+    for job in jobs:
+        job_id = int(job["id"])
+        clip_id = int(job["clip_id"])
+        if job.get("mode") == "seedance" and job.get("task_id"):
+            _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)
+            resumed.append(job_id)
+            continue
+        fail_generation_job(job_id, clip_id, "generation job was interrupted before it could be resumed")
+        failed.append(job_id)
+    return {"resumed": resumed, "failed": failed}
+
+
 def filter_generation_clips(
     clips: list[dict[str, Any]],
     lock_tokens: dict[str, str],
