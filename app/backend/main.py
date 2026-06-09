@@ -42,6 +42,7 @@ from .services import (
     retry_clip,
     retry_job,
     review_clip,
+    start_generation_watchdog,
     submit_and_preprocess_episodes,
     submit_episodes,
 )
@@ -72,7 +73,8 @@ def _init() -> None:
 def startup() -> None:
     _init()
     refresh_clip_public_urls()
-    recover_interrupted_generation_jobs()
+    recover_interrupted_generation_jobs(include_download_failures=True)
+    start_generation_watchdog()
 
 
 def _public_error(exc: Exception) -> HTTPException:

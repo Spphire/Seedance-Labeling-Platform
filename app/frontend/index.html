@@ -2018,11 +2018,9 @@
       }
       const hasActiveWork = state.episodes.some((episode) => episode.final_status === "stitching" || episode.preview_status === "stitching")
         || state.clips.some((clip) => clip.status === "generating");
-      if (hasActiveWork) {
-        state.pollTimer = setTimeout(() => {
-          refresh().catch((err) => log(err.message));
-        }, 1500);
-      }
+      state.pollTimer = setTimeout(() => {
+        refresh().catch((err) => log(err.message));
+      }, hasActiveWork ? 1500 : 15000);
     }
 
     function renderEpisodes() {

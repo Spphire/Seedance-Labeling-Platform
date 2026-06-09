@@ -8,7 +8,7 @@ import shutil
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from volcenginesdkarkruntime import Ark
 
@@ -97,12 +97,26 @@ class SeedanceClient:
         data = self._model_dump(result)
         return {"task_id": result.id, "usage": self._find_usage(data), "raw_response": data}
 
-    def wait_for_task(self, task_id: str, output_path: Path, input_url: str | None = None) -> dict[str, Any]:
+    def wait_for_task(
+        self,
+        task_id: str,
+        output_path: Path,
+        input_url: str | None = None,
+        on_poll: Callable[[Any], None] | None = None,
+        on_download_progress: Callable[[int, int | None], None] | None = None,
+    ) -> dict[str, Any]:
         api_key = self.settings.get("seedance_api_key")
         if not api_key:
             raise RuntimeError("seedance_api_key is required for seedance mode")
         client = Ark(base_url=self.settings["seedance_base_url"], api_key=api_key)
-        return self.wait_and_download(client, task_id, output_path, input_url=input_url)
+        return self.wait_and_download(
+            client,
+            task_id,
+            output_path,
+            input_url=input_url,
+            on_poll=on_poll,
+            on_download_progress=on_download_progress,
+        )
 
     def wait_and_download(
         self,
@@ -110,16 +124,19 @@ class SeedanceClient:
         task_id: str,
         output_path: Path,
         input_url: str | None = None,
+        on_poll: Callable[[Any], None] | None = None,
+        on_download_progress: Callable[[int, int | None], None] | None = None,
     ) -> dict[str, Any]:
         while True:
             task = client.content_generation.tasks.get(task_id=task_id)
+            if on_poll:
+                on_poll(task)
             if task.status == "succeeded":
                 data = self._model_dump(task)
                 output_url = self._find_output_url(data, input_urls={input_url} if input_url else set())
                 if not output_url:
                     raise RuntimeError(f"Seedance succeeded but no output URL found: {data}")
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                urllib.request.urlretrieve(output_url, output_path)
+                self._download_with_retries(output_url, output_path, on_progress=on_download_progress)
                 return {
                     "task_id": task_id,
                     "output_url": output_url,
@@ -131,6 +148,43 @@ class SeedanceClient:
                 data = self._model_dump(task)
                 raise RuntimeError(str(data.get("error") or "Seedance task failed"))
             time.sleep(10)
+
+    @staticmethod
+    def _download_with_retries(
+        url: str,
+        output_path: Path,
+        attempts: int = 5,
+        timeout_sec: float = 120,
+        on_progress: Callable[[int, int | None], None] | None = None,
+    ) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            tmp_path = output_path.with_name(f".{output_path.name}.{int(time.time() * 1000)}.{attempt}.download")
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": "seedance-labeling-platform/1.0"})
+                with urllib.request.urlopen(request, timeout=timeout_sec) as response, tmp_path.open("wb") as out:
+                    expected = int(response.headers.get("Content-Length") or 0) or None
+                    received = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        received += len(chunk)
+                        if on_progress:
+                            on_progress(received, expected)
+                if expected is not None and received < expected:
+                    raise RuntimeError(f"download incomplete: got only {received} out of {expected} bytes")
+                tmp_path.replace(output_path)
+                return
+            except Exception as exc:
+                last_error = exc
+                tmp_path.unlink(missing_ok=True)
+                if attempt < attempts:
+                    time.sleep(min(2 * attempt, 10))
+        assert last_error is not None
+        raise last_error
 
     @staticmethod
     def _model_dump(value: Any) -> dict[str, Any]:

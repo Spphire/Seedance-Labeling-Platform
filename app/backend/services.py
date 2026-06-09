@@ -53,8 +53,14 @@ _GENERATION_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="se
 _GENERATION_CONDITION = threading.Condition()
 _GENERATION_ACTIVE = 0
 _SEEDANCE_KEY_ACTIVE: dict[str, int] = {}
+_GENERATION_WORKER_LOCK = threading.Lock()
+_GENERATION_WORKER_JOB_IDS: set[int] = set()
+_GENERATION_WATCHDOG_STARTED = False
 GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
 GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
+GENERATION_WATCHDOG_INTERVAL_SEC = 30
+GENERATION_STALE_RUNNING_SEC = 180
+GENERATION_DOWNLOAD_RECOVERY_LIMIT = 3
 DEFAULT_REQUEST_MODE = "mock"
 ANCHOR_CLIP_DURATION_SEC = 4
 ANCHOR_STAGE_REPLACE_ARM = "replace_arm"
@@ -1848,23 +1854,27 @@ def mock_job_worker(job_id: int) -> None:
 
 
 def seedance_job_worker(job_id: int) -> None:
-    job = db.one(
-        """
-        SELECT j.*, c.episode_uuid, c.clip_index, c.duration_sec, c.public_url
-        FROM generation_jobs j
-        JOIN clips c ON c.id = j.clip_id
-        WHERE j.id=?
-        """,
-        (job_id,),
-    )
-    if not job or job.get("status") != "running":
+    if not begin_generation_worker(job_id):
         return
-    job = dict(job)
-    settings = load_settings()
-    job_prompt, job_refs = generation_values_from_job(job, settings)
-    out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
     key_slot: dict[str, Any] | None = None
+    job: dict[str, Any] | None = None
     try:
+        row = db.one(
+            """
+            SELECT j.*, c.episode_uuid, c.clip_index, c.duration_sec, c.public_url
+            FROM generation_jobs j
+            JOIN clips c ON c.id = j.clip_id
+            WHERE j.id=?
+            """,
+            (job_id,),
+        )
+        if not row or row.get("status") != "running":
+            return
+        job = dict(row)
+        settings = load_settings()
+        job_prompt, job_refs = generation_values_from_job(job, settings)
+        out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
+        heartbeat = generation_job_heartbeat(job_id)
         key_slot = acquire_seedance_key_slot(settings)
         client = SeedanceClient({**settings, "seedance_api_key": key_slot["api_key"]})
         job["api_key_id"] = key_slot["id"]
@@ -1885,7 +1895,13 @@ def seedance_job_worker(job_id: int) -> None:
             )
             with db.connect() as conn:
                 conn.execute("UPDATE generation_jobs SET task_id=?, updated_at=? WHERE id=?", (job["task_id"], db.now(), job_id))
-        data = client.wait_for_task(job["task_id"], out_path, input_url=job["public_url"])
+        data = client.wait_for_task(
+            job["task_id"],
+            out_path,
+            input_url=job["public_url"],
+            on_poll=lambda _task: heartbeat(),
+            on_download_progress=lambda _received, _expected: heartbeat(),
+        )
         update_seedance_api_call(
             job,
             "succeeded",
@@ -1905,11 +1921,45 @@ def seedance_job_worker(job_id: int) -> None:
             )
             conn.execute("UPDATE clips SET status='generated', updated_at=? WHERE id=? AND status='generating'", (now, job["clip_id"]))
     except Exception as exc:
-        if job.get("task_id"):
+        if job and job.get("task_id"):
             update_seedance_api_call(job, "failed", task_id=job.get("task_id"), error=str(exc))
-        fail_generation_job(job_id, int(job["clip_id"]), str(exc))
+        fail_generation_job(job_id, int(job["clip_id"]) if job else 0, str(exc))
     finally:
         release_seedance_key_slot(key_slot)
+        end_generation_worker(job_id)
+
+
+def begin_generation_worker(job_id: int) -> bool:
+    with _GENERATION_WORKER_LOCK:
+        if job_id in _GENERATION_WORKER_JOB_IDS:
+            return False
+        _GENERATION_WORKER_JOB_IDS.add(job_id)
+        return True
+
+
+def end_generation_worker(job_id: int) -> None:
+    with _GENERATION_WORKER_LOCK:
+        _GENERATION_WORKER_JOB_IDS.discard(job_id)
+
+
+def generation_worker_is_active(job_id: int) -> bool:
+    with _GENERATION_WORKER_LOCK:
+        return job_id in _GENERATION_WORKER_JOB_IDS
+
+
+def generation_job_heartbeat(job_id: int, min_interval_sec: float = 5.0) -> Callable[[], None]:
+    last = 0.0
+
+    def touch() -> None:
+        nonlocal last
+        now = db.now()
+        if now - last < min_interval_sec:
+            return
+        last = now
+        with db.connect() as conn:
+            conn.execute("UPDATE generation_jobs SET updated_at=? WHERE id=? AND status='running'", (now, job_id))
+
+    return touch
 
 
 def active_seedance_key_pool(settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1971,28 +2021,101 @@ def fail_generation_job(job_id: int, clip_id: int, error: str) -> None:
         conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=? AND status='generating'", (now, clip_id))
 
 
-def recover_interrupted_generation_jobs() -> dict[str, list[int]]:
-    jobs = db.rows(
+def recover_interrupted_generation_jobs(stale_after_sec: float = 0.0, include_download_failures: bool = False) -> dict[str, list[int]]:
+    now = db.now()
+    running_jobs = db.rows(
         """
         SELECT j.*, c.status AS clip_status
         FROM generation_jobs j
         JOIN clips c ON c.id = j.clip_id
         WHERE j.status='running'
+          AND (? <= 0 OR j.updated_at <= ?)
         ORDER BY j.created_at
-        """
+        """,
+        (stale_after_sec, now - max(0.0, stale_after_sec)),
+    )
+    failed_jobs = (
+        db.rows(
+            """
+            SELECT j.*, c.status AS clip_status
+            FROM generation_jobs j
+            JOIN clips c ON c.id = j.clip_id
+            WHERE j.status='failed'
+              AND j.mode='seedance'
+              AND j.task_id IS NOT NULL
+              AND j.retry_count < ?
+              AND c.status='generated_failed'
+              AND j.created_at = (
+                  SELECT MAX(j2.created_at)
+                  FROM generation_jobs j2
+                  WHERE j2.clip_id=j.clip_id
+              )
+            ORDER BY j.updated_at
+            """,
+            (GENERATION_DOWNLOAD_RECOVERY_LIMIT,),
+        )
+        if include_download_failures
+        else []
     )
     resumed: list[int] = []
     failed: list[int] = []
-    for job in jobs:
+    for job in running_jobs:
         job_id = int(job["id"])
         clip_id = int(job["clip_id"])
+        if generation_worker_is_active(job_id):
+            continue
         if job.get("mode") == "seedance" and job.get("task_id"):
             _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)
             resumed.append(job_id)
             continue
         fail_generation_job(job_id, clip_id, "generation job was interrupted before it could be resumed")
         failed.append(job_id)
+    for job in failed_jobs:
+        job_id = int(job["id"])
+        if generation_worker_is_active(job_id) or not is_recoverable_seedance_download_error(job.get("error")):
+            continue
+        with db.connect() as conn:
+            now = db.now()
+            conn.execute(
+                """
+                UPDATE generation_jobs
+                SET status='running', error=NULL, completed_at=NULL,
+                    retry_count=retry_count + 1, updated_at=?
+                WHERE id=? AND status='failed'
+                """,
+                (now, job_id),
+            )
+            conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, int(job["clip_id"])))
+        _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)
+        resumed.append(job_id)
     return {"resumed": resumed, "failed": failed}
+
+
+def is_recoverable_seedance_download_error(error: str | None) -> bool:
+    text = (error or "").lower()
+    return any(pattern in text for pattern in ["urlopen", "retrieval incomplete", "download", "incomplete", "timed out"])
+
+
+def start_generation_watchdog() -> None:
+    global _GENERATION_WATCHDOG_STARTED
+    with _GENERATION_WORKER_LOCK:
+        if _GENERATION_WATCHDOG_STARTED:
+            return
+        _GENERATION_WATCHDOG_STARTED = True
+    thread = threading.Thread(target=generation_watchdog_loop, name="seedance-generation-watchdog", daemon=True)
+    thread.start()
+
+
+def generation_watchdog_loop() -> None:
+    while True:
+        try:
+            recover_interrupted_generation_jobs(
+                stale_after_sec=GENERATION_STALE_RUNNING_SEC,
+                include_download_failures=True,
+            )
+        except Exception:
+            pass
+        time.sleep(GENERATION_WATCHDOG_INTERVAL_SEC)
 
 
 def filter_generation_clips(

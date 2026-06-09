@@ -1566,6 +1566,53 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(db.one("SELECT status FROM generation_jobs WHERE id=?", (job_id,))["status"], "failed")
         self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generated_failed")
 
+    def test_recover_failed_seedance_download_reuses_existing_task(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000037"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='generated_failed' WHERE id=?", (clips[0]["id"],))
+            cur = conn.execute(
+                """
+                INSERT INTO generation_jobs(
+                    clip_id, mode, requested_duration_sec, task_id, status, error, retry_count,
+                    started_at, completed_at, created_at, updated_at
+                )
+                VALUES (?, 'seedance', 5, 'cgt-existing', 'failed', ?, 0, ?, ?, ?, ?)
+                """,
+                (
+                    clips[0]["id"],
+                    "<urlopen error retrieval incomplete: got only 10 out of 20 bytes>",
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            job_id = cur.lastrowid
+
+        with patch.object(backend_services._GENERATION_EXECUTOR, "submit") as submit:
+            recovered = backend_services.recover_interrupted_generation_jobs(include_download_failures=True)
+
+        self.assertEqual(recovered, {"resumed": [job_id], "failed": []})
+        submit.assert_called_once_with(backend_services.seedance_job_worker, job_id)
+        job = db.one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))
+        self.assertEqual(job["status"], "running")
+        self.assertIsNone(job["error"])
+        self.assertIsNone(job["completed_at"])
+        self.assertEqual(job["retry_count"], 1)
+        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generating")
+
     def test_fetch_episode_uses_local_mount_without_copying(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000010"
         source_root = DATA_DIR / "local_remote_source"
