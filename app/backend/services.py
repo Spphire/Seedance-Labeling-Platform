@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 from . import db
 from .ids import parse_uuids
@@ -127,10 +128,8 @@ def list_episodes() -> list[dict[str, Any]]:
             """
         )
     }
-    clip_paths_by_episode: dict[str, list[str]] = {}
     clips_by_episode: dict[str, list[dict[str, Any]]] = {}
     for row in db.rows("SELECT * FROM clips"):
-        clip_paths_by_episode.setdefault(row["episode_uuid"], []).append(row["local_path"])
         clips_by_episode.setdefault(row["episode_uuid"], []).append(row)
     for episode in episodes:
         aggregate = counts.get(episode["uuid"], {})
@@ -150,7 +149,7 @@ def list_episodes() -> list[dict[str, Any]]:
             "flagged_clip_count",
         ]:
             episode[key] = int(aggregate.get(key) or 0)
-        health, health_reason = episode_preprocess_health(episode, clip_paths_by_episode.get(episode["uuid"], []))
+        health, health_reason = episode_preprocess_health(episode, clips_by_episode.get(episode["uuid"], []))
         episode["preprocess_health"] = health
         episode["preprocess_health_reason"] = health_reason
         episode.update(rolling_episode_progress(episode, clips_by_episode.get(episode["uuid"], [])))
@@ -167,7 +166,7 @@ def list_episodes() -> list[dict[str, Any]]:
     return episodes
 
 
-def episode_preprocess_health(episode: dict[str, Any], clip_paths: list[str]) -> tuple[str, str]:
+def episode_preprocess_health(episode: dict[str, Any], clips: list[dict[str, Any]]) -> tuple[str, str]:
     if episode.get("status") != "preprocessed":
         return "not_ready", ""
     head_value = episode.get("head_video_path")
@@ -175,7 +174,14 @@ def episode_preprocess_health(episode: dict[str, Any], clip_paths: list[str]) ->
         return "damaged", "head video path missing"
     if not Path(head_value).exists():
         return "damaged", "head video file missing"
-    missing = sum(1 for path in clip_paths if not path or not Path(path).exists())
+    missing = 0
+    for clip in clips:
+        path = clip.get("local_path")
+        if not path or Path(path).exists():
+            continue
+        if clip.get("input_kind") in CONTINUITY_INPUT_KINDS and path_is_under(path, CLIPS_DIR):
+            continue
+        missing += 1
     if missing:
         return "damaged", f"{missing} clip file(s) missing"
     return "ok", ""
@@ -451,11 +457,7 @@ def refresh_clip_public_urls() -> int:
     clips = db.rows("SELECT id, episode_uuid, local_path, public_url FROM clips")
     with db.connect() as conn:
         for clip in clips:
-            try:
-                rel = Path(clip["local_path"]).resolve().relative_to(CLIPS_DIR.resolve())
-            except ValueError:
-                rel = Path(clip["episode_uuid"]) / Path(clip["local_path"]).name
-            public_url = public_url_for("clips", rel)
+            public_url = public_url_for_local_path(clip["local_path"], clip["episode_uuid"])
             if public_url != clip["public_url"]:
                 conn.execute(
                     "UPDATE clips SET public_url=?, updated_at=? WHERE id=?",
@@ -463,6 +465,49 @@ def refresh_clip_public_urls() -> int:
                 )
                 updated += 1
     return updated
+
+
+def public_url_for_local_path(path_value: str | Path, uuid: str) -> str:
+    path = Path(path_value)
+    try:
+        rel = path.resolve().relative_to(CLIPS_DIR.resolve())
+        return public_url_for("clips", rel)
+    except ValueError:
+        pass
+    try:
+        rel = path.resolve().relative_to(ACCEPTED_DIR.resolve())
+        return public_url_for("accepted", rel)
+    except ValueError:
+        pass
+    return public_url_for("clips", Path(uuid) / path.name)
+
+
+def path_is_under(path_value: str | Path | None, root: Path) -> bool:
+    if not path_value:
+        return False
+    try:
+        Path(path_value).resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def url_with_query(url: str, params: dict[str, Any]) -> str:
+    clean = {key: str(value) for key, value in params.items() if value is not None and value != ""}
+    if not clean:
+        return url
+    return f"{url}{'&' if '?' in url else '?'}{urlencode(clean)}"
+
+
+def generation_input_url(item: dict[str, Any], job_id: int) -> str:
+    return url_with_query(
+        str(item["public_url"]),
+        {
+            "job": int(job_id),
+            "clip": clip_record_id(item),
+            "v": int(float(item.get("clip_updated_at") or item.get("updated_at") or db.now()) * 1000),
+        },
+    )
 
 
 def static_url_from_path(path_value: str | None, root: Path, prefix: str) -> str | None:
@@ -479,17 +524,206 @@ def static_url_from_clip_input_path(path_value: str | None) -> str | None:
     return static_url_from_path(path_value, CLIPS_DIR, "clips") or static_url_from_path(path_value, ACCEPTED_DIR, "accepted")
 
 
-def raw_clip_path(clip: dict[str, Any]) -> Path:
+def continuity_clip_input_path(
+    uuid: str,
+    clip_index: int,
+    clip_id: int,
+    input_kind: str,
+    direction: str = "forward",
+) -> Path:
+    label = "anchor" if input_kind == "anchor" else str(direction or "forward")
+    return CLIPS_DIR / uuid / f"clip_{int(clip_index):04d}_{label}_input_{int(clip_id)}.mp4"
+
+
+def legacy_clip_input_path(clip: dict[str, Any]) -> Path:
     return CLIPS_DIR / str(clip["episode_uuid"]) / f"clip_{int(clip['clip_index']):04d}.mp4"
+
+
+def clip_record_id(item: dict[str, Any]) -> int:
+    value = item.get("clip_row_id")
+    if value is None:
+        value = item.get("clip_id") if item.get("clip_id") is not None else item.get("id")
+    return int(value)
+
+
+def merge_latest_clip_fields(item: dict[str, Any], latest: dict[str, Any] | None) -> dict[str, Any]:
+    if not latest:
+        return item
+    result = dict(item)
+    is_joined_job = "clip_id" in result or "clip_row_id" in result
+    clip_field_names = {
+        "episode_uuid",
+        "clip_index",
+        "start_sec",
+        "duration_sec",
+        "source_start_sec",
+        "source_duration_sec",
+        "overlap_sec",
+        "timeline_duration_sec",
+        "timeline_start_sec",
+        "timeline_end_sec",
+        "input_timeline_start_sec",
+        "input_timeline_end_sec",
+        "direction",
+        "input_kind",
+        "anchor_stage",
+        "local_path",
+        "public_url",
+    }
+    for key, value in latest.items():
+        if key == "id":
+            if is_joined_job:
+                result["clip_row_id"] = value
+            else:
+                result["id"] = value
+        elif key == "updated_at" and is_joined_job:
+            result["clip_updated_at"] = value
+        elif key == "status" and is_joined_job:
+            result["clip_status"] = value
+        elif is_joined_job and key not in clip_field_names:
+            continue
+        else:
+            result[key] = value
+    return result
+
+
+def is_regenerable_continuity_input(clip: dict[str, Any]) -> bool:
+    if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS:
+        return False
+    return path_is_under(clip.get("local_path"), CLIPS_DIR)
+
+
+def canonical_continuity_input_path(clip: dict[str, Any]) -> Path:
+    return continuity_clip_input_path(
+        str(clip["episode_uuid"]),
+        int(clip["clip_index"]),
+        clip_record_id(clip),
+        str(clip.get("input_kind") or "rolling"),
+        str(clip.get("direction") or "forward"),
+    )
+
+
+def ensure_continuity_cache_target(clip: dict[str, Any]) -> dict[str, Any]:
+    if not is_regenerable_continuity_input(clip):
+        return clip
+    target = canonical_continuity_input_path(clip)
+    current = Path(str(clip["local_path"]))
+    if current.resolve() == target.resolve():
+        return clip
+    old_public_url = str(clip.get("public_url") or "")
+    public_url = public_url_for_local_path(target, str(clip["episode_uuid"]))
+    now = db.now()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE clips
+            SET local_path=?, public_url=?, updated_at=?
+            WHERE id=?
+            """,
+            (str(target.resolve()), public_url, now, clip_record_id(clip)),
+        )
+    if path_is_under(current, CLIPS_DIR):
+        current.unlink(missing_ok=True)
+    clip = dict(clip)
+    clip["local_path"] = str(target.resolve())
+    clip["public_url"] = public_url
+    if "clip_id" in clip or "clip_row_id" in clip:
+        clip["clip_updated_at"] = now
+    else:
+        clip["updated_at"] = now
+    if old_public_url and old_public_url != public_url:
+        clip["previous_public_url"] = old_public_url
+    return clip
+
+
+def continuity_input_cache_stale(clip: dict[str, Any], path: Path) -> bool:
+    if not path.exists():
+        return True
+    try:
+        actual = video_duration(path)
+    except Exception:
+        return True
+    expected = float(clip.get("duration_sec") or 0.0)
+    return bool(expected > 0 and abs(actual - expected) > 0.35)
+
+
+def continuity_input_cache_paths(clip: dict[str, Any]) -> list[Path]:
+    if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS:
+        return [Path(str(clip["local_path"]))]
+    paths: list[Path] = []
+    local_value = clip.get("local_path")
+    if local_value and path_is_under(local_value, CLIPS_DIR):
+        paths.append(Path(str(local_value)))
+    paths.append(canonical_continuity_input_path(clip))
+    paths.append(legacy_clip_input_path(clip))
+    clip_dir = CLIPS_DIR / str(clip["episode_uuid"])
+    clip_index = int(clip["clip_index"])
+    clip_id = clip_record_id(clip)
+    if clip_dir.exists():
+        paths.extend(clip_dir.glob(f"clip_{clip_index:04d}_*_input_{clip_id}.mp4"))
+    unique: dict[str, Path] = {}
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        unique[key] = path
+    return list(unique.values())
+
+
+def raw_clip_path(clip: dict[str, Any]) -> Path:
+    if clip.get("input_kind") == "anchor":
+        return continuity_clip_input_path(
+            str(clip["episode_uuid"]),
+            int(clip["clip_index"]),
+            clip_record_id(clip),
+            "anchor",
+            "anchor",
+        )
+    return Path(str(clip.get("local_path") or legacy_clip_input_path(clip)))
+
+
+def ensure_anchor_raw_input(clip: dict[str, Any]) -> Path:
+    path = raw_clip_path(clip)
+    if path.exists():
+        return path
+    episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (clip["episode_uuid"],))
+    if not episode or not episode.get("head_video_path"):
+        raise RuntimeError("episode head video path missing")
+    head_path = Path(episode["head_video_path"])
+    if not head_path.exists():
+        raise RuntimeError("episode head video file missing")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cut_clip(
+        head_path,
+        path,
+        float(clip.get("source_start_sec") if clip.get("source_start_sec") is not None else clip["start_sec"]),
+        float(clip.get("source_duration_sec") if clip.get("source_duration_sec") is not None else clip["duration_sec"]),
+    )
+    return path
 
 
 def raw_clip_video_url(clip: dict[str, Any]) -> str | None:
     if clip.get("input_kind") != "anchor":
+        if clip.get("input_kind") in CONTINUITY_INPUT_KINDS:
+            try:
+                clip = ensure_continuity_clip_input(clip, verify_duration=False)
+            except Exception:
+                pass
         return static_url_from_path(clip.get("local_path"), CLIPS_DIR, "clips")
-    return static_url_from_path(str(raw_clip_path(clip)), CLIPS_DIR, "clips")
+    try:
+        path = ensure_anchor_raw_input(clip)
+    except Exception:
+        path = raw_clip_path(clip)
+    return static_url_from_path(str(path), CLIPS_DIR, "clips")
 
 
 def clip_input_video_url(clip: dict[str, Any]) -> str | None:
+    if clip.get("input_kind") in CONTINUITY_INPUT_KINDS and path_is_under(clip.get("local_path"), CLIPS_DIR):
+        try:
+            clip = ensure_continuity_clip_input(clip, verify_duration=False)
+        except Exception:
+            pass
     return static_url_from_clip_input_path(clip.get("local_path")) or clip.get("public_url")
 
 
@@ -686,14 +920,8 @@ def delete_clip_rows(uuid: str, clips: list[dict[str, Any]]) -> int:
         conn.execute(f"DELETE FROM generation_jobs WHERE clip_id IN ({placeholders})", ids)
         conn.execute(f"DELETE FROM clips WHERE id IN ({placeholders})", ids)
     for clip in clips:
-        Path(clip["local_path"]).unlink(missing_ok=True)
-        accepted_path = ACCEPTED_DIR / uuid / f"clip_{int(clip['clip_index']):04d}.mp4"
-        accepted_path.unlink(missing_ok=True)
-        accepted_chronological_path = chronological_accepted_output_path(clip)
-        accepted_chronological_path.unlink(missing_ok=True)
-        generated_dir = GENERATED_DIR / uuid
-        if generated_dir.exists():
-            for path in generated_dir.glob(f"clip_{int(clip['clip_index']):04d}_job_*"):
+        for path in continuity_input_cache_paths(clip):
+            if path_is_under(path, CLIPS_DIR):
                 path.unlink(missing_ok=True)
     return len(clips)
 
@@ -707,11 +935,6 @@ def archive_anchor_candidates(uuid: str, clips: list[dict[str, Any]], reason: st
     for clip in clips:
         clip_index = int(clip["clip_index"])
         item = dict(clip)
-        input_path = Path(clip["local_path"])
-        if input_path.exists():
-            archived_input = archive_dir / f"clip_{clip_index:04d}_input.mp4"
-            shutil.copy2(input_path, archived_input)
-            item["archived_input_path"] = str(archived_input.resolve())
         jobs = db.rows("SELECT * FROM generation_jobs WHERE clip_id=? ORDER BY created_at", (clip["id"],))
         archived_jobs = []
         for job in jobs:
@@ -787,15 +1010,18 @@ def restore_archived_anchor_candidates(uuid: str) -> int:
             continue
         if db.one("SELECT id FROM clips WHERE id=?", (clip_id,)):
             continue
-        input_path = Path(str(raw_item.get("archived_input_path") or ""))
-        restored_input = clip_dir / f"clip_{clip_index:04d}.mp4"
-        if input_path.exists():
+        direction = str(raw_item.get("direction") or "anchor")
+        input_kind = str(raw_item.get("input_kind") or "anchor")
+        input_path_value = str(raw_item.get("archived_input_path") or "").strip()
+        input_path = Path(input_path_value) if input_path_value else None
+        restored_input = continuity_clip_input_path(uuid, clip_index, clip_id, input_kind, direction)
+        source_value = str(raw_item.get("local_path") or "").strip()
+        source_path = Path(source_value) if source_value else None
+        if input_path and input_path.is_file():
             shutil.copy2(input_path, restored_input)
-        elif raw_item.get("local_path") and Path(str(raw_item["local_path"])).exists():
-            shutil.copy2(Path(str(raw_item["local_path"])), restored_input)
-        else:
-            continue
-        public_url = public_url_for("clips", Path(uuid) / restored_input.name)
+        elif source_path and source_path.is_file():
+            shutil.copy2(source_path, restored_input)
+        public_url = public_url_for_local_path(restored_input, uuid)
         with db.connect() as conn:
             conn.execute(
                 """
@@ -822,8 +1048,8 @@ def restore_archived_anchor_candidates(uuid: str) -> int:
                     float(raw_item.get("timeline_end_sec") if raw_item.get("timeline_end_sec") is not None else (float(raw_item.get("start_sec") or 0) + float(raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC))),
                     float(raw_item.get("input_timeline_start_sec") if raw_item.get("input_timeline_start_sec") is not None else raw_item.get("start_sec") or 0),
                     float(raw_item.get("input_timeline_end_sec") if raw_item.get("input_timeline_end_sec") is not None else (float(raw_item.get("start_sec") or 0) + float(raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC))),
-                    str(raw_item.get("direction") or "anchor"),
-                    str(raw_item.get("input_kind") or "anchor"),
+                    direction,
+                    input_kind,
                     str(raw_item.get("anchor_stage") or ANCHOR_STAGE_REPLACE_ARM),
                     str(restored_input.resolve()),
                     public_url,
@@ -1602,8 +1828,8 @@ def rolling_skip(uuid: str, reason: str) -> dict[str, Any]:
 
 def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
     clip_index = int(plan_item.get("clip_index") or next_clip_index(uuid))
-    path = CLIPS_DIR / uuid / f"clip_{clip_index:04d}.mp4"
-    public_url = public_url_for("clips", Path(uuid) / path.name)
+    placeholder_path = CLIPS_DIR / uuid / f".clip_{clip_index:04d}_preparing.mp4"
+    placeholder_url = public_url_for("clips", Path(uuid) / placeholder_path.name)
     now = db.now()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1640,13 +1866,29 @@ def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, An
                 str(plan_item.get("direction") or "forward"),
                 str(plan_item.get("input_kind") or "rolling"),
                 str(plan_item.get("anchor_stage") or ""),
-                str(path.resolve()),
-                public_url,
+                str(placeholder_path.resolve()),
+                placeholder_url,
                 now,
                 now,
             ),
         )
         clip_id = cur.lastrowid
+        path = continuity_clip_input_path(
+            uuid,
+            clip_index,
+            int(clip_id),
+            str(plan_item.get("input_kind") or "rolling"),
+            str(plan_item.get("direction") or "forward"),
+        )
+        public_url = public_url_for_local_path(path, uuid)
+        conn.execute(
+            """
+            UPDATE clips
+            SET local_path=?, public_url=?, updated_at=?
+            WHERE id=?
+            """,
+            (str(path.resolve()), public_url, now, int(clip_id)),
+        )
         conn.execute(
             "UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=? AND final_status IN ('ready','stitching')",
             (now, uuid),
@@ -1659,14 +1901,26 @@ def next_clip_index(uuid: str) -> int:
     return int(row["next_index"] if row else 0)
 
 
-def ensure_continuity_clip_input(clip: dict[str, Any]) -> None:
+def ensure_continuity_clip_input(clip: dict[str, Any], verify_duration: bool = True) -> dict[str, Any]:
+    if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS or not path_is_under(clip.get("local_path"), CLIPS_DIR):
+        return clip
+    clip = ensure_continuity_cache_target(clip)
     path = Path(clip["local_path"])
-    if path.exists():
-        return
+    if not verify_duration and path.exists():
+        return clip
+    if not continuity_input_cache_stale(clip, path):
+        return clip
+    for stale_path in continuity_input_cache_paths(clip):
+        if path_is_under(stale_path, CLIPS_DIR):
+            stale_path.unlink(missing_ok=True)
     build_continuity_clip_input(clip)
+    latest = db.one("SELECT * FROM clips WHERE id=?", (clip_record_id(clip),))
+    return merge_latest_clip_fields(clip, latest)
 
 
 def build_continuity_clip_input(clip: dict[str, Any]) -> None:
+    if clip.get("input_kind") in CONTINUITY_INPUT_KINDS and path_is_under(clip.get("local_path"), CLIPS_DIR):
+        clip = ensure_continuity_cache_target(clip)
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (clip["episode_uuid"],))
     if not episode or not episode.get("head_video_path"):
         raise RuntimeError("episode head video path missing")
@@ -1691,6 +1945,12 @@ def build_continuity_clip_input(clip: dict[str, Any]) -> None:
         anchor_path,
         overlap,
     )
+    with db.connect() as conn:
+        now = db.now()
+        conn.execute(
+            "UPDATE clips SET public_url=?, updated_at=? WHERE id=?",
+            (public_url_for_local_path(clip["local_path"], clip["episode_uuid"]), now, clip_record_id(clip)),
+        )
 
 
 def adjacent_accepted_path(clip: dict[str, Any]) -> Path | None:
@@ -1969,7 +2229,9 @@ def claim_async_generation_job(
 def mock_job_worker(job_id: int) -> None:
     job = db.one(
         """
-        SELECT j.*, c.episode_uuid, c.clip_index, c.local_path
+        SELECT j.*, c.id AS clip_row_id, c.episode_uuid, c.clip_index, c.local_path,
+               c.input_kind, c.direction, c.duration_sec, c.source_start_sec, c.source_duration_sec,
+               c.overlap_sec, c.start_sec, c.updated_at AS clip_updated_at, c.public_url
         FROM generation_jobs j
         JOIN clips c ON c.id = j.clip_id
         WHERE j.id=?
@@ -1987,6 +2249,7 @@ def mock_job_worker(job_id: int) -> None:
             remaining -= sleep_for
             with db.connect() as conn:
                 conn.execute("UPDATE generation_jobs SET updated_at=? WHERE id=? AND status='running'", (db.now(), job_id))
+        job = ensure_continuity_clip_input(dict(job))
         data = SeedanceClient(load_settings()).mock_generate(Path(job["local_path"]), out_path)
         with db.connect() as conn:
             now = db.now()
@@ -2011,7 +2274,9 @@ def seedance_job_worker(job_id: int) -> None:
     try:
         row = db.one(
             """
-            SELECT j.*, c.episode_uuid, c.clip_index, c.duration_sec, c.public_url
+            SELECT j.*, c.id AS clip_row_id, c.episode_uuid, c.clip_index, c.duration_sec,
+                   c.public_url, c.local_path, c.input_kind, c.direction, c.source_start_sec,
+                   c.source_duration_sec, c.overlap_sec, c.start_sec, c.updated_at AS clip_updated_at
             FROM generation_jobs j
             JOIN clips c ON c.id = j.clip_id
             WHERE j.id=?
@@ -2021,6 +2286,8 @@ def seedance_job_worker(job_id: int) -> None:
         if not row or row.get("status") != "running":
             return
         job = dict(row)
+        job = ensure_continuity_clip_input(job)
+        input_url = generation_input_url(job, job_id)
         settings = load_settings()
         job_prompt, job_refs = generation_values_from_job(job, settings)
         out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
@@ -2031,7 +2298,7 @@ def seedance_job_worker(job_id: int) -> None:
         job["api_key_name"] = key_slot["name"]
         if not job.get("task_id"):
             try:
-                task = client.create_task(job_prompt, job["public_url"], float(job["duration_sec"]), job_refs)
+                task = client.create_task(job_prompt, input_url, float(job["duration_sec"]), job_refs)
             except Exception as exc:
                 record_seedance_api_call(job, "failed", error=str(exc))
                 raise
@@ -2048,7 +2315,7 @@ def seedance_job_worker(job_id: int) -> None:
         data = client.wait_for_task(
             job["task_id"],
             out_path,
-            input_url=job["public_url"],
+            input_url=input_url,
             on_poll=lambda _task: heartbeat(),
             on_download_progress=lambda _received, _expected: heartbeat(),
         )
@@ -2570,11 +2837,16 @@ def run_generation_for_clip(
             (now, clip["episode_uuid"]),
         )
     try:
+        latest_clip = db.one("SELECT * FROM clips WHERE id=?", (clip["id"],))
+        if not latest_clip:
+            raise RuntimeError("clip disappeared before generation")
+        clip = ensure_continuity_clip_input(latest_clip)
+        input_url = generation_input_url(clip, job_id)
         episode_uuid = clip["episode_uuid"]
         suffix = "dryrun" if dry_run else mode
         out_path = GENERATED_DIR / episode_uuid / f"clip_{int(clip['clip_index']):04d}_job_{job_id}_{suffix}.mp4"
         if dry_run:
-            payload = client.dry_run_payload(prompt, clip["public_url"], float(clip["duration_sec"]), reference_images or [])
+            payload = client.dry_run_payload(prompt, input_url, float(clip["duration_sec"]), reference_images or [])
             out_path = out_path.with_suffix(".json")
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(__import__("json").dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2600,7 +2872,7 @@ def run_generation_for_clip(
                 job_for_call["api_key_id"] = key_slot["id"]
                 job_for_call["api_key_name"] = key_slot["name"]
                 try:
-                    task = client.create_task(prompt, clip["public_url"], float(clip["duration_sec"]), reference_images or [])
+                    task = client.create_task(prompt, input_url, float(clip["duration_sec"]), reference_images or [])
                 except Exception as exc:
                     record_seedance_api_call(job_for_call, "failed", error=str(exc))
                     raise
@@ -2613,7 +2885,7 @@ def run_generation_for_clip(
                     usage=task.get("usage"),
                     raw_response=task.get("raw_response"),
                 )
-                data = client.wait_for_task(task_id, out_path, input_url=clip["public_url"])
+                data = client.wait_for_task(task_id, out_path, input_url=input_url)
             except Exception as exc:
                 if job_for_call.get("task_id"):
                     update_seedance_api_call(job_for_call, "failed", task_id=job_for_call.get("task_id"), error=str(exc))

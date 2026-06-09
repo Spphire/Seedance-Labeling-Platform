@@ -1726,6 +1726,13 @@
       return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
     }
 
+    function mediaUrl(url, ...versions) {
+      if (!url) return "";
+      const token = versions.find((value) => value !== null && value !== undefined && value !== "");
+      if (!token) return url;
+      return `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(String(token))}`;
+    }
+
     function startButtonProgress(button, label) {
       const originalText = button.textContent;
       const originalDisabled = button.disabled;
@@ -2463,10 +2470,12 @@
         clip.video_url || "",
         clip.input_video_url || "",
         clip.raw_video_url || "",
+        clip.updated_at || "",
         generated,
         clip.latest_job_id || "",
         job ? job.status : "",
         job ? job.output_path || "" : "",
+        job ? job.updated_at || "" : "",
         episode.final_status || "",
         episode.preview_status || "",
         episode.preview_version || "",
@@ -2481,6 +2490,8 @@
       const canEdit = clipCanEdit(clip);
       const lockNotice = renderClipLockNotice(clip, canEdit);
       const jobNotice = renderJobNotice(job);
+      const sourceVideo = mediaUrl(clip.video_url || "", clip.updated_at, clip.status);
+      const generatedVideo = mediaUrl(generated, job ? job.updated_at : "", job ? job.output_path : "");
       target.innerHTML = `
         ${episodeNotice}
         ${lockNotice}
@@ -2500,11 +2511,11 @@
         <div class="videos">
           <div class="video-pane">
             <h3><span>原 clip</span><span>${clipBadges(clip)}</span></h3>
-            <video id="originalVideo" src="${clip.video_url || ""}" controls playsinline></video>
+            <video id="originalVideo" src="${sourceVideo}" controls playsinline></video>
           </div>
           <div class="video-pane">
             <h3><span>生成结果</span><span>${generated ? "ready" : "waiting"}</span></h3>
-            <video id="generatedVideo" src="${generated}" controls playsinline></video>
+            <video id="generatedVideo" src="${generatedVideo}" controls playsinline></video>
           </div>
         </div>
       `;
@@ -2529,6 +2540,7 @@
         episode.head_video_url || "",
         episode.final_url || "",
         episode.preview_url || "",
+        episode.updated_at || "",
         episode.clip_count || 0,
         episode.accepted_clip_count || 0,
         episode.continuity_state || "",
@@ -2546,6 +2558,8 @@
       const outputUrl = finalReady ? episode.final_url : previewReady ? episode.preview_url : "";
       const outputTitle = finalReady ? "合成 final" : "accepted preview";
       const outputStatus = finalReady ? episode.final_status : episode.preview_status || "missing";
+      const headVideo = mediaUrl(episode.head_video_url || "", episode.updated_at, episode.status);
+      const outputVideo = mediaUrl(outputUrl, episode.preview_version, episode.updated_at, outputStatus);
       target.innerHTML = `
         ${renderEpisodeNotice(episode)}
         ${renderAnchorPanel(episode)}
@@ -2558,11 +2572,11 @@
         <div class="videos">
           <div class="video-pane">
             <h3><span>原 head 视频</span><span>${badge(episode.status)}</span></h3>
-            <video id="originalVideo" src="${episode.head_video_url || ""}" controls playsinline></video>
+            <video id="originalVideo" src="${headVideo}" controls playsinline></video>
           </div>
           <div class="video-pane">
             <h3><span>${outputTitle}</span><span>${badge(outputStatus)}</span></h3>
-            <video id="generatedVideo" src="${outputUrl}" controls playsinline></video>
+            <video id="generatedVideo" src="${outputVideo}" controls playsinline></video>
           </div>
         </div>
       `;

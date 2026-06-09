@@ -63,6 +63,15 @@ app.add_middleware(
 )
 
 
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: dict[str, Any]) -> FileResponse:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+
 def _init() -> None:
     ensure_dirs()
     db.init_db()
@@ -348,7 +357,7 @@ def get_state() -> dict[str, Any]:
 
 def _mount_static(prefix: str, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    app.mount(prefix, StaticFiles(directory=directory), name=prefix.strip("/"))
+    app.mount(prefix, NoCacheStaticFiles(directory=directory), name=prefix.strip("/"))
 
 
 _mount_static("/clips", CLIPS_DIR)

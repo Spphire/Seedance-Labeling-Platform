@@ -330,7 +330,11 @@ class MockPipelineTest(unittest.TestCase):
         self.assertTrue(Path(stage2_anchor["local_path"]).exists())
         stage2_view = next(clip for clip in list_clips() if clip["id"] == anchor["id"])
         self.assertTrue(stage2_view["input_video_url"].endswith("/accepted/%s/clip_0000_stage1_input.mp4" % uuid))
-        self.assertTrue(stage2_view["raw_video_url"].endswith("/clips/%s/clip_0000.mp4" % uuid))
+        self.assertTrue(
+            stage2_view["raw_video_url"].endswith(
+                f"/clips/{uuid}/clip_{int(anchor['clip_index']):04d}_anchor_input_{anchor['id']}.mp4"
+            )
+        )
         self.assertEqual(stage2_view["video_url"], stage2_view["input_video_url"])
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertIsNone(episode["anchor_clip_id"])
@@ -349,7 +353,11 @@ class MockPipelineTest(unittest.TestCase):
         official_view = next(clip for clip in list_clips() if clip["id"] == anchor["id"])
         self.assertEqual(official_view["anchor_stage"], "official")
         self.assertTrue(official_view["input_video_url"].endswith("/accepted/%s/clip_0000_stage1_input.mp4" % uuid))
-        self.assertTrue(official_view["video_url"].endswith("/clips/%s/clip_0000.mp4" % uuid))
+        self.assertTrue(
+            official_view["video_url"].endswith(
+                f"/clips/{uuid}/clip_{int(anchor['clip_index']):04d}_anchor_input_{anchor['id']}.mp4"
+            )
+        )
 
         rolling = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
         self.assertEqual(len(rolling), 2)
@@ -418,13 +426,13 @@ class MockPipelineTest(unittest.TestCase):
         restored_by_id = {int(clip["id"]): clip for clip in restored}
         for clip_id in archived_candidate_ids:
             self.assertEqual(restored_by_id[clip_id]["status"], "generated")
-            self.assertTrue(Path(restored_by_id[clip_id]["local_path"]).exists())
             restored_job = db.one("SELECT * FROM generation_jobs WHERE clip_id=? AND status='succeeded'", (clip_id,))
             self.assertIsNotNone(restored_job)
             self.assertTrue(Path(restored_job["output_path"]).exists())
         restored_views = {int(clip["id"]): clip for clip in list_clips() if clip["episode_uuid"] == uuid}
         for clip_id in archived_candidate_ids:
             self.assertTrue(restored_views[clip_id]["generated_url"])
+            self.assertTrue(Path(restored_views[clip_id]["local_path"]).exists())
 
     def test_backward_rolling_is_displayed_reversed_and_accept_sidecar_is_chronological(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000036"
@@ -439,7 +447,11 @@ class MockPipelineTest(unittest.TestCase):
         )
         self.assertIsNotNone(backward)
         backward_view = next(clip for clip in list_clips() if clip["id"] == backward["id"])
-        self.assertTrue(backward_view["input_video_url"].endswith(f"/clips/{uuid}/clip_{int(backward['clip_index']):04d}.mp4"))
+        self.assertTrue(
+            backward_view["input_video_url"].endswith(
+                f"/clips/{uuid}/clip_{int(backward['clip_index']):04d}_backward_input_{backward['id']}.mp4"
+            )
+        )
         self.assertEqual(backward_view["video_url"], backward_view["input_video_url"])
         self.assertTrue(Path(backward["local_path"]).exists())
 
@@ -478,6 +490,64 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual({clip["duration_sec"] for clip in rolling}, {10.0})
         self.assertEqual({clip["source_duration_sec"] for clip in rolling}, {9.0})
         self.assertEqual({clip["overlap_sec"] for clip in rolling}, {1.0})
+
+    def test_reselecting_anchor_after_prefer_length_change_rebuilds_unique_input_cache(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000037"
+        save_settings({"mock_async": False, "continuity_prefer_input_sec": 12})
+        self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [6, 14])
+
+        candidate_result = queue_rolling_generation(mode="mock")
+        candidates = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor' ORDER BY timeline_start_sec", (uuid,))
+        anchor_14 = next(clip for clip in candidates if float(clip["timeline_start_sec"]) == 14.0)
+        anchor_6 = next(clip for clip in candidates if float(clip["timeline_start_sec"]) == 6.0)
+        job_14_stage1 = next(item["job_id"] for item in candidate_result if item["clip_id"] == anchor_14["id"])
+        review_clip(anchor_14["id"], "accept", job_14_stage1, require_lock_token=False)
+        stage2_result = queue_rolling_generation(mode="mock")
+        job_14_stage2 = next(item["job_id"] for item in stage2_result if item["clip_id"] == anchor_14["id"])
+        review_clip(anchor_14["id"], "accept", job_14_stage2, require_lock_token=False)
+
+        rolling_12 = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
+        old_paths = {Path(clip["local_path"]) for clip in rolling_12}
+        self.assertEqual({clip["duration_sec"] for clip in rolling_12}, {12.0})
+        self.assertEqual({clip["source_duration_sec"] for clip in rolling_12}, {11.0})
+        self.assertTrue(all(path.exists() for path in old_paths))
+
+        rejected = review_clip(anchor_14["id"], "reject", job_14_stage2, require_lock_token=False)
+        self.assertEqual(rejected["deleted_future_clip_count"], 2)
+        self.assertTrue(all(not path.exists() for path in old_paths))
+        self.assertFalse(db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling'", (uuid,)))
+
+        save_settings({"mock_async": False, "continuity_prefer_input_sec": 6})
+        restored_anchor_6 = db.one("SELECT * FROM clips WHERE id=?", (anchor_6["id"],))
+        self.assertIsNotNone(restored_anchor_6)
+        restored_job_6 = db.one(
+            "SELECT * FROM generation_jobs WHERE clip_id=? AND status='succeeded' ORDER BY created_at DESC LIMIT 1",
+            (anchor_6["id"],),
+        )
+        self.assertIsNotNone(restored_job_6)
+        review_clip(anchor_6["id"], "accept", restored_job_6["id"], require_lock_token=False)
+        anchor_6_stage2 = queue_rolling_generation(mode="mock")
+        job_6_stage2 = next(item["job_id"] for item in anchor_6_stage2 if item["clip_id"] == anchor_6["id"])
+        review_clip(anchor_6["id"], "accept", job_6_stage2, require_lock_token=False)
+
+        rolling_6 = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
+        new_paths = {Path(clip["local_path"]) for clip in rolling_6}
+        self.assertTrue(all(4.0 <= float(clip["duration_sec"]) <= 15.0 for clip in rolling_6))
+        self.assertNotIn(12.0, {clip["duration_sec"] for clip in rolling_6})
+        self.assertNotIn(11.0, {clip["source_duration_sec"] for clip in rolling_6})
+        self.assertEqual({clip["overlap_sec"] for clip in rolling_6}, {1.0})
+        self.assertTrue(new_paths.isdisjoint(old_paths))
+        self.assertTrue(all(path.exists() for path in new_paths))
+        self.assertTrue(all(not path.exists() for path in old_paths))
+
+        cache_path = next(iter(new_paths))
+        cache_path.unlink()
+        episode = next(item for item in list_episodes() if item["uuid"] == uuid)
+        self.assertEqual(episode["preprocess_health"], "ok")
+        rebuilt_view = next(clip for clip in list_clips() if Path(clip["local_path"]) == cache_path)
+        self.assertTrue(cache_path.exists())
+        self.assertIn(f"_input_{rebuilt_view['id']}.mp4", rebuilt_view["video_url"])
 
     def test_list_clips_returns_bidirectional_clips_in_timeline_order(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000032"
