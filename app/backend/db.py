@@ -75,6 +75,7 @@ def init_db() -> None:
                 input_timeline_end_sec REAL,
                 direction TEXT NOT NULL DEFAULT 'forward',
                 input_kind TEXT NOT NULL DEFAULT 'split',
+                anchor_stage TEXT NOT NULL DEFAULT '',
                 local_path TEXT NOT NULL,
                 public_url TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -185,6 +186,7 @@ def init_db() -> None:
         _ensure_column(conn, "clips", "input_timeline_end_sec", "REAL")
         _ensure_column(conn, "clips", "direction", "TEXT NOT NULL DEFAULT 'forward'")
         _ensure_column(conn, "clips", "input_kind", "TEXT NOT NULL DEFAULT 'split'")
+        _ensure_column(conn, "clips", "anchor_stage", "TEXT NOT NULL DEFAULT ''")
         conn.execute("UPDATE clips SET source_start_sec=start_sec WHERE source_start_sec IS NULL")
         conn.execute("UPDATE clips SET source_duration_sec=duration_sec WHERE source_duration_sec IS NULL")
         conn.execute("UPDATE clips SET timeline_duration_sec=duration_sec WHERE timeline_duration_sec IS NULL")
@@ -198,6 +200,25 @@ def init_db() -> None:
         )
         conn.execute("UPDATE clips SET direction='forward' WHERE direction IS NULL OR direction=''")
         conn.execute("UPDATE clips SET input_kind='split' WHERE input_kind IS NULL OR input_kind=''")
+        conn.execute(
+            """
+            UPDATE clips
+            SET anchor_stage='official'
+            WHERE input_kind='anchor'
+              AND (anchor_stage IS NULL OR anchor_stage='')
+              AND id IN (
+                SELECT anchor_clip_id FROM episodes
+                WHERE anchor_clip_id IS NOT NULL
+              )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE clips
+            SET anchor_stage='replace_arm'
+            WHERE input_kind='anchor' AND (anchor_stage IS NULL OR anchor_stage='')
+            """
+        )
         _ensure_column(conn, "episodes", "preview_video_path", "TEXT")
         _ensure_column(conn, "episodes", "preview_status", "TEXT NOT NULL DEFAULT 'missing'")
         _ensure_column(conn, "episodes", "preview_version", "INTEGER NOT NULL DEFAULT 0")

@@ -16,7 +16,14 @@ from .ids import parse_uuids
 from .locks import LockError, active_lock, locks_by_resource, require_lock, require_no_active_lock
 from .nedf import extract_head_video, fetch_episode
 from .paths import ACCEPTED_DIR, ARCHIVED_ANCHORS_DIR, CLIPS_DIR, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
-from .settings import load_settings, public_url_for, seedance_api_key_pool
+from .settings import (
+    COLLECTOR_ONLY_PRESET_ID,
+    DEFAULT_GENERATION_PRESET_ID,
+    IPHONE2DEPLOY_PRESET_ID,
+    load_settings,
+    public_url_for,
+    seedance_api_key_pool,
+)
 from .video import (
     black_video,
     clip_plan,
@@ -50,6 +57,9 @@ GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
 GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
 DEFAULT_REQUEST_MODE = "mock"
 ANCHOR_CLIP_DURATION_SEC = 4
+ANCHOR_STAGE_REPLACE_ARM = "replace_arm"
+ANCHOR_STAGE_REPLACE_COLLECTOR = "replace_collector"
+ANCHOR_STAGE_OFFICIAL = "official"
 CONTINUITY_INPUT_KINDS = {"anchor", "rolling"}
 CONTINUITY_DIRECTIONS = {"anchor", "forward", "backward"}
 MIN_SEEDANCE_INPUT_SEC = 4
@@ -954,6 +964,7 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
             "input_timeline_end_sec": start + ANCHOR_CLIP_DURATION_SEC,
             "input_kind": "anchor",
             "direction": "anchor",
+            "anchor_stage": ANCHOR_STAGE_REPLACE_ARM,
         }
         clip = insert_continuity_clip(uuid, plan_item)
         try:
@@ -1429,10 +1440,10 @@ def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, An
                 episode_uuid, clip_index, start_sec, duration_sec,
                 source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec,
                 timeline_start_sec, timeline_end_sec, input_timeline_start_sec, input_timeline_end_sec,
-                direction, input_kind,
+                direction, input_kind, anchor_stage,
                 local_path, public_url, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
             """,
             (
                 uuid,
@@ -1449,6 +1460,7 @@ def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, An
                 float(plan_item["input_timeline_end_sec"]),
                 str(plan_item.get("direction") or "forward"),
                 str(plan_item.get("input_kind") or "rolling"),
+                str(plan_item.get("anchor_stage") or ""),
                 str(path.resolve()),
                 public_url,
                 now,
@@ -1558,7 +1570,6 @@ def queue_generation_for_selected_clips(
     available = filter_generation_clips(clips, {}, strict=False, operator_id=operator_id)
     if not available:
         return []
-    generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     if dry_run or (mode == "mock" and not settings.get("mock_async")):
         client = SeedanceClient(settings)
         concurrency_key = "mock_concurrency" if mode == "mock" or dry_run else "seedance_concurrency"
@@ -1576,8 +1587,7 @@ def queue_generation_for_selected_clips(
                     force,
                     operator_id,
                     operator_name,
-                    generation_prompt,
-                    generation_refs,
+                    *generation_values_for_clip(settings, clip, prompt, reference_images),
                 )
                 for clip in available
             ]
@@ -1587,6 +1597,7 @@ def queue_generation_for_selected_clips(
 
     claimed = []
     for clip in available:
+        generation_prompt, generation_refs = generation_values_for_clip(settings, clip, prompt, reference_images)
         item = claim_async_generation_job(clip, mode, settings, force, operator_id, operator_name, generation_prompt, generation_refs)
         if item.get("status") == "queued":
             claimed.append(item)
@@ -1632,7 +1643,6 @@ def run_generation(
     if not clips:
         return []
     client = SeedanceClient(settings)
-    generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     concurrency_key = "mock_concurrency" if mode == "mock" or dry_run else "seedance_concurrency"
     max_workers = max(1, int(settings.get(concurrency_key, 1)))
     max_workers = min(max_workers, len(clips))
@@ -1649,8 +1659,7 @@ def run_generation(
                 force,
                 operator_id,
                 operator_name,
-                generation_prompt,
-                generation_refs,
+                *generation_values_for_clip(settings, clip, prompt, reference_images),
             )
             for clip in clips
         ]
@@ -1697,8 +1706,8 @@ def queue_generation(
     if not clips:
         return []
     claimed = []
-    generation_prompt, generation_refs = generation_overrides(settings, prompt, reference_images)
     for clip in clips:
+        generation_prompt, generation_refs = generation_values_for_clip(settings, clip, prompt, reference_images)
         item = claim_async_generation_job(clip, mode, settings, force, operator_id, operator_name, generation_prompt, generation_refs)
         if item.get("status") == "queued":
             claimed.append(item)
@@ -1997,6 +2006,49 @@ def generation_overrides(
     else:
         generation_refs = reference_images
     return generation_prompt, [str(item) for item in generation_refs if str(item).strip()]
+
+
+def preset_generation_values(settings: dict[str, Any], preset_id: str) -> tuple[str, list[str]]:
+    presets = settings.get("generation_presets") if isinstance(settings.get("generation_presets"), list) else []
+    preset = next((item for item in presets if str(item.get("id") or "") == preset_id), None)
+    if not preset:
+        raise RuntimeError(f"generation preset is missing: {preset_id}")
+    prompt = str(preset.get("prompt") or "").strip()
+    refs = [str(item) for item in (preset.get("reference_images") or []) if str(item).strip()]
+    if not prompt:
+        raise RuntimeError(f"generation preset prompt is empty: {preset_id}")
+    return prompt, refs
+
+
+def clip_anchor_stage(clip: dict[str, Any]) -> str:
+    stage = str(clip.get("anchor_stage") or "").strip()
+    if stage:
+        return stage
+    return ANCHOR_STAGE_REPLACE_ARM if clip.get("input_kind") == "anchor" else ""
+
+
+def locked_generation_preset_id(clip: dict[str, Any]) -> str | None:
+    input_kind = str(clip.get("input_kind") or "")
+    if input_kind == "anchor":
+        stage = clip_anchor_stage(clip)
+        if stage == ANCHOR_STAGE_REPLACE_COLLECTOR or stage == ANCHOR_STAGE_OFFICIAL:
+            return COLLECTOR_ONLY_PRESET_ID
+        return DEFAULT_GENERATION_PRESET_ID
+    if input_kind == "rolling":
+        return IPHONE2DEPLOY_PRESET_ID
+    return None
+
+
+def generation_values_for_clip(
+    settings: dict[str, Any],
+    clip: dict[str, Any],
+    prompt: str | None,
+    reference_images: list[str] | None,
+) -> tuple[str, list[str]]:
+    preset_id = locked_generation_preset_id(clip)
+    if preset_id:
+        return preset_generation_values(settings, preset_id)
+    return generation_overrides(settings, prompt, reference_images)
 
 
 def generation_values_from_job(job: dict[str, Any], settings: dict[str, Any]) -> tuple[str, list[str]]:
@@ -2341,6 +2393,14 @@ def retry_clip(
     return result
 
 
+def anchor_stage1_input_path(clip: dict[str, Any]) -> Path:
+    return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}_stage1_input.mp4"
+
+
+def accepted_clip_output_path(clip: dict[str, Any]) -> Path:
+    return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}.mp4"
+
+
 def review_clip(
     clip_id: int,
     decision: str,
@@ -2371,6 +2431,11 @@ def review_clip(
         raise ValueError("generation job does not belong to this clip")
     accepted_path = None
     status = {"accept": "accepted", "reject": "rejected", "rerun": "pending", "flag": "flagged"}[decision]
+    stage1_anchor_accept = (
+        decision == "accept"
+        and clip.get("input_kind") == "anchor"
+        and clip_anchor_stage(clip) == ANCHOR_STAGE_REPLACE_ARM
+    )
     if decision == "accept":
         if not job or not job.get("output_path"):
             raise ValueError("accept requires a succeeded generation job")
@@ -2378,7 +2443,7 @@ def review_clip(
             raise ValueError("accept requires a succeeded generation job")
         if not str(job.get("output_path", "")).lower().endswith(".mp4"):
             raise ValueError("accept requires a generated mp4 output")
-        accepted_path_obj = ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}.mp4"
+        accepted_path_obj = anchor_stage1_input_path(clip) if stage1_anchor_accept else accepted_clip_output_path(clip)
         temp_accepted_path = accepted_path_obj.with_name(
             f".clip_{int(clip['clip_index']):04d}_review_{int(time.time() * 1000)}.mp4"
         )
@@ -2391,6 +2456,8 @@ def review_clip(
             temp_accepted_path.unlink(missing_ok=True)
             raise
         accepted_path = str(accepted_path_obj.resolve())
+        if stage1_anchor_accept:
+            status = "pending"
     elif decision == "rerun":
         rerun_result = retry_clip(
             clip_id,
@@ -2422,21 +2489,55 @@ def review_clip(
             """,
             (clip_id, job["id"] if job else None, normalized_operator_id, normalized_operator_name, decision, note, accepted_path, now),
         )
-        conn.execute("UPDATE clips SET status=?, updated_at=? WHERE id=?", (status, now, clip_id))
+        if stage1_anchor_accept:
+            assert accepted_path is not None
+            public_url = public_url_for("accepted", Path(clip["episode_uuid"]) / Path(accepted_path).name)
+            conn.execute(
+                """
+                UPDATE clips
+                SET status=?, anchor_stage=?, local_path=?, public_url=?, updated_at=?
+                WHERE id=?
+                """,
+                (status, ANCHOR_STAGE_REPLACE_COLLECTOR, accepted_path, public_url, now, clip_id),
+            )
+        elif decision == "accept" and clip.get("input_kind") == "anchor":
+            conn.execute(
+                """
+                UPDATE clips
+                SET status=?, anchor_stage=?, updated_at=?
+                WHERE id=?
+                """,
+                (status, ANCHOR_STAGE_OFFICIAL, now, clip_id),
+            )
+        else:
+            conn.execute("UPDATE clips SET status=?, updated_at=? WHERE id=?", (status, now, clip_id))
         conn.execute("UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=?", (now, clip["episode_uuid"]))
     deleted_future_clip_count = (
         delete_dependent_continuity_clips(clip)
         if decision in {"reject", "rerun"} and clip.get("input_kind") in CONTINUITY_INPUT_KINDS
         else 0
     )
-    next_clips = (
-        maybe_prepare_next_continuity_clips_after_accept(clip["episode_uuid"], clip_id, accepted_path)
-        if decision == "accept"
-        else []
-    )
+    if stage1_anchor_accept:
+        next_clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
+        next_clips = [next_clip] if next_clip else []
+    else:
+        next_clips = (
+            maybe_prepare_next_continuity_clips_after_accept(clip["episode_uuid"], clip_id, accepted_path)
+            if decision == "accept"
+            else []
+        )
     update_continuity_state(clip["episode_uuid"])
-    preview = queue_preview_episode(clip["episode_uuid"])
-    final = maybe_stitch_episode(clip["episode_uuid"])
+    if stage1_anchor_accept:
+        preview = {
+            "uuid": clip["episode_uuid"],
+            "queued": False,
+            "preview_status": db.one("SELECT preview_status FROM episodes WHERE uuid=?", (clip["episode_uuid"],))["preview_status"],
+            "reason": "anchor advanced to collector replacement stage",
+        }
+        final = None
+    else:
+        preview = queue_preview_episode(clip["episode_uuid"])
+        final = maybe_stitch_episode(clip["episode_uuid"])
     return {
         "clip_id": clip_id,
         "decision": decision,

@@ -33,10 +33,15 @@ from app.backend.services import (
     run_generation,
 )
 from app.backend.settings import (
+    COLLECTOR_ONLY_PRESET_ID,
+    COLLECTOR_ONLY_PROMPT,
+    COLLECTOR_ONLY_REFERENCE_IMAGES,
     DEFAULT_PROMPT,
     DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND,
     DEFAULT_SETTINGS,
+    DEFAULT_GENERATION_PRESET_ID,
     GENERATION_PRESETS_VERSION,
+    IPHONE2DEPLOY_PRESET_ID,
     IPHONE2DEPLOY_PROMPT,
     IPHONE2DEPLOY_REFERENCE_IMAGES,
     SETTINGS_PATH,
@@ -149,6 +154,12 @@ class MockPipelineTest(unittest.TestCase):
             result.append(path)
         return [str(path) for path in result]
 
+    def make_reference_files_for(self, refs: list[str]) -> None:
+        REFERENCE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        for ref in refs:
+            path = REFERENCE_IMAGES_DIR / Path(ref).name
+            path.write_bytes(f"fake-{path.name}".encode("ascii"))
+
     def make_episode_with_generated_clip(self, uuid: str, duration: float = 5.0) -> tuple[list[dict], list[dict]]:
         now = db.now()
         with db.connect() as conn:
@@ -190,6 +201,17 @@ class MockPipelineTest(unittest.TestCase):
             return create_anchor_candidates(uuid, starts, token)
         finally:
             self.client.post("/api/locks/release", json={"token": token, "owner_id": "alice"})
+
+    def accept_single_anchor_candidate_to_official(self, uuid: str) -> tuple[dict, dict]:
+        first_result = queue_rolling_generation(mode="mock")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        self.assertIsNotNone(anchor)
+        first_job = next(item for item in first_result if item.get("clip_id") == anchor["id"])
+        review_clip(anchor["id"], "accept", first_job["job_id"], require_lock_token=False)
+        second_result = queue_rolling_generation(mode="mock")
+        second_job = next(item for item in second_result if item.get("clip_id") == anchor["id"])
+        accepted = review_clip(anchor["id"], "accept", second_job["job_id"], require_lock_token=False)
+        return db.one("SELECT * FROM clips WHERE id=?", (anchor["id"],)), accepted
 
     def test_mock_generation_accept_and_stitch(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000001"
@@ -298,6 +320,21 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(anchor["status"], "generated")
         accepted = review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
         self.assertIsNone(accepted["final"])
+        self.assertEqual(len(accepted["next_clips"]), 1)
+        stage2_anchor = db.one("SELECT * FROM clips WHERE id=?", (anchor["id"],))
+        self.assertEqual(stage2_anchor["status"], "pending")
+        self.assertEqual(stage2_anchor["anchor_stage"], "replace_collector")
+        self.assertTrue(stage2_anchor["public_url"].endswith("/accepted/%s/clip_0000_stage1_input.mp4" % uuid))
+        self.assertTrue(Path(stage2_anchor["local_path"]).exists())
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertIsNone(episode["anchor_clip_id"])
+        self.assertEqual(episode["continuity_state"], "anchor_candidates")
+        self.assertEqual(db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=? AND input_kind='rolling'", (uuid,))["count"], 0)
+
+        stage2_result = queue_rolling_generation(mode="mock")
+        self.assertEqual(stage2_result[0]["clip_id"], anchor["id"])
+        self.assertEqual(stage2_result[0]["status"], "succeeded")
+        accepted = review_clip(anchor["id"], "accept", stage2_result[0]["job_id"], require_lock_token=False)
         self.assertEqual({clip["direction"] for clip in accepted["next_clips"]}, {"backward", "forward"})
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertEqual(episode["anchor_clip_id"], anchor["id"])
@@ -330,10 +367,8 @@ class MockPipelineTest(unittest.TestCase):
         self.make_head_ready_episode(uuid, 32)
         self.create_anchor_candidates_with_lock(uuid, [14])
 
-        anchor_result = queue_rolling_generation(mode="mock")
-        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        anchor, _ = self.accept_single_anchor_candidate_to_official(uuid)
         self.assertEqual(anchor["duration_sec"], 4.0)
-        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
 
         rolling = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
 
@@ -347,9 +382,7 @@ class MockPipelineTest(unittest.TestCase):
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 32)
         self.create_anchor_candidates_with_lock(uuid, [14])
-        anchor_result = queue_rolling_generation(mode="mock")
-        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
-        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+        self.accept_single_anchor_candidate_to_official(uuid)
 
         clips = [clip for clip in list_clips() if clip["episode_uuid"] == uuid]
 
@@ -365,9 +398,7 @@ class MockPipelineTest(unittest.TestCase):
         save_settings({"mock_async": False})
         self.make_head_ready_episode(uuid, 32)
         self.create_anchor_candidates_with_lock(uuid, [4])
-        anchor_result = queue_rolling_generation(mode="mock")
-        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
-        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+        self.accept_single_anchor_candidate_to_official(uuid)
         first_forward = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward'", (uuid,))
         first_forward_result = queue_rolling_generation(mode="mock")
         first_forward_job = next(item["job_id"] for item in first_forward_result if item.get("clip_id") == first_forward["id"])
@@ -403,18 +434,68 @@ class MockPipelineTest(unittest.TestCase):
 
     def test_rolling_dry_run_keeps_anchor_clip_pending(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000024"
-        save_settings({"reference_images": ["data:image/png;base64,AA=="]})
+        self.make_reference_files_for(DEFAULT_SETTINGS["reference_images"])
         self.make_head_ready_episode(uuid, 32)
         self.create_anchor_candidates_with_lock(uuid, [14])
 
-        result = queue_rolling_generation(mode="seedance", dry_run=True)
+        result = queue_rolling_generation(
+            mode="seedance",
+            dry_run=True,
+            prompt="ignored prompt",
+            reference_images=["data:image/png;base64,AA=="],
+        )
         payload_path = Path(result[0]["output_path"])
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         clip = db.one("SELECT * FROM clips WHERE id=?", (result[0]["clip_id"],))
+        image_items = [item for item in payload["content"] if item["type"] == "image_url"]
 
         self.assertEqual(payload["duration"], 4)
+        self.assertEqual(payload["content"][0]["text"], DEFAULT_PROMPT)
+        self.assertEqual(len(image_items), 4)
+        self.assertEqual(
+            [item["image_url"]["url"] for item in image_items],
+            [resolve_image_value(item) for item in DEFAULT_SETTINGS["reference_images"]],
+        )
         self.assertEqual(clip["status"], "pending")
         self.assertEqual(clip["input_kind"], "anchor")
+
+    def test_anchor_stage_two_and_rolling_use_locked_generation_presets(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000034"
+        self.make_reference_files_for(DEFAULT_SETTINGS["reference_images"])
+        self.make_reference_files_for(COLLECTOR_ONLY_REFERENCE_IMAGES)
+        self.make_reference_files_for(IPHONE2DEPLOY_REFERENCE_IMAGES)
+        save_settings({"mock_async": False, "reference_images": ["data:image/png;base64,AA=="], "default_prompt": "custom default"})
+        self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [14])
+
+        first = queue_rolling_generation(mode="mock")
+        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        review_clip(anchor["id"], "accept", first[0]["job_id"], require_lock_token=False)
+
+        stage2 = queue_rolling_generation(mode="seedance", dry_run=True, prompt="ignored", reference_images=["data:image/png;base64,AA=="])
+        stage2_payload = json.loads(Path(stage2[0]["output_path"]).read_text(encoding="utf-8"))
+        stage2_images = [item for item in stage2_payload["content"] if item["type"] == "image_url"]
+        self.assertEqual(stage2_payload["content"][0]["text"], COLLECTOR_ONLY_PROMPT)
+        self.assertEqual(
+            [item["image_url"]["url"] for item in stage2_images],
+            [resolve_image_value(item) for item in COLLECTOR_ONLY_REFERENCE_IMAGES],
+        )
+
+        stage2_real = queue_rolling_generation(mode="mock")
+        review_clip(anchor["id"], "accept", stage2_real[0]["job_id"], require_lock_token=False)
+        rolling = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward'", (uuid,))
+        self.assertIsNotNone(rolling)
+
+        rolling_dry_run = queue_rolling_generation(mode="seedance", dry_run=True, prompt="ignored", reference_images=["data:image/png;base64,AA=="])
+        rolling_payloads = [json.loads(Path(item["output_path"]).read_text(encoding="utf-8")) for item in rolling_dry_run]
+        self.assertTrue(rolling_payloads)
+        for payload in rolling_payloads:
+            image_items = [item for item in payload["content"] if item["type"] == "image_url"]
+            self.assertEqual(payload["content"][0]["text"], IPHONE2DEPLOY_PROMPT)
+            self.assertEqual(
+                [item["image_url"]["url"] for item in image_items],
+                [resolve_image_value(item) for item in IPHONE2DEPLOY_REFERENCE_IMAGES],
+            )
 
     def test_bidirectional_stitch_trims_overlap_from_final(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000025"
@@ -422,9 +503,7 @@ class MockPipelineTest(unittest.TestCase):
         self.make_head_ready_episode(uuid, 18)
         self.create_anchor_candidates_with_lock(uuid, [7])
 
-        anchor_result = queue_rolling_generation(mode="mock")
-        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
-        review_clip(anchor["id"], "accept", anchor_result[0]["job_id"], require_lock_token=False)
+        self.accept_single_anchor_candidate_to_official(uuid)
         rolling_result = queue_rolling_generation(mode="mock")
         for item in rolling_result:
             if item.get("status") == "succeeded":
@@ -441,9 +520,7 @@ class MockPipelineTest(unittest.TestCase):
         self.make_head_ready_episode(uuid, 18)
         self.create_anchor_candidates_with_lock(uuid, [7])
 
-        first = queue_rolling_generation(mode="mock")
-        anchor = db.one("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
-        result = review_clip(anchor["id"], "accept", first[0]["job_id"], require_lock_token=False)
+        _, result = self.accept_single_anchor_candidate_to_official(uuid)
 
         self.assertIsNone(result["final"])
         self.assertEqual(result["preview"]["preview_status"], "stitching")
@@ -614,8 +691,16 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(settings["default_generation_preset_id"], "iphone-default")
         self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
         presets = {item["id"]: item for item in settings["generation_presets"]}
+        self.assertEqual([item["id"] for item in settings["generation_presets"]], [
+            DEFAULT_GENERATION_PRESET_ID,
+            COLLECTOR_ONLY_PRESET_ID,
+            IPHONE2DEPLOY_PRESET_ID,
+        ])
         self.assertEqual(presets["iphone-default"]["prompt"], DEFAULT_PROMPT)
         self.assertEqual(presets["iphone-default"]["reference_images"], settings["reference_images"])
+        self.assertEqual(presets["collector-only"]["name"], "仅替换采集器")
+        self.assertEqual(presets["collector-only"]["prompt"], COLLECTOR_ONLY_PROMPT)
+        self.assertEqual(presets["collector-only"]["reference_images"], COLLECTOR_ONLY_REFERENCE_IMAGES)
         self.assertEqual(presets["iphone2deploy"]["name"], "iphone2deploy")
         self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
@@ -648,9 +733,13 @@ class MockPipelineTest(unittest.TestCase):
         presets = {item["id"]: item for item in settings["generation_presets"]}
 
         self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertIn("collector-only", presets)
         self.assertIn("iphone2deploy", presets)
+        self.assertEqual(presets["collector-only"]["prompt"], COLLECTOR_ONLY_PROMPT)
+        self.assertEqual(presets["collector-only"]["reference_images"], COLLECTOR_ONLY_REFERENCE_IMAGES)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
         self.assertEqual(persisted["generation_presets_version"], GENERATION_PRESETS_VERSION)
+        self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == "collector-only"]), 1)
         self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == "iphone2deploy"]), 1)
 
         persisted["generation_presets"] = [item for item in persisted["generation_presets"] if item["id"] != "iphone2deploy"]

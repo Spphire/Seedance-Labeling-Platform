@@ -1420,7 +1420,13 @@
       if (clip.input_kind === "anchor") {
         const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid);
         const isOfficial = Number(episode?.continuity_anchor_clip_id || 0) === Number(clip.id);
-        values.push(badge(isOfficial ? "ready" : "pending", isOfficial ? "正式锚点" : "候选锚点"));
+        const stage = clip.anchor_stage || "replace_arm";
+        const stageLabel = isOfficial
+          ? "正式锚点"
+          : stage === "replace_collector" || stage === "official"
+            ? "待替换手机"
+            : "待替换机械臂";
+        values.push(badge(isOfficial ? "ready" : "pending", stageLabel));
       } else if (clip.input_kind === "rolling") {
         values.push(badge("stale", clip.direction === "backward" ? "向前滚动" : "向后滚动"));
       }
@@ -2738,10 +2744,13 @@
             if (action === "accept" && clip.input_kind === "anchor") {
               const episode = state.episodes.find((item) => item.uuid === clip.episode_uuid);
               const isOfficial = Number(episode?.continuity_anchor_clip_id || 0) === Number(clip.id);
+              const stage = clip.anchor_stage || "replace_arm";
               const otherCandidates = state.clips.filter((item) =>
                 item.episode_uuid === clip.episode_uuid && item.input_kind === "anchor" && item.id !== clip.id
               ).length;
-              const message = isOfficial
+              const message = stage === "replace_arm"
+                ? "确认保留第一阶段结果？\n\n这个 clip 会进入“待替换手机”阶段，还不会成为正式锚点，也不会删除其它候选。"
+                : isOfficial
                 ? "确认保留这个正式锚点？"
                 : `确认选择这个候选锚点作为正式锚点？\n\n其它 ${otherCandidates} 个候选锚点会从当前候选列表移除；它们的输入和生成结果会先归档到后台，episode 会进入双向串行生成阶段。`;
               if (!window.confirm(message)) return;

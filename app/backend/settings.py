@@ -19,9 +19,17 @@ DEFAULT_PROMPT = (
 )
 IPHONE2DEPLOY_PROMPT = (
     "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2@图片3@图片4的机械臂和摄像头，"
-    "根据爪夹上的绿点对齐形态、动作、画面、背景保持不变"
+    "夹爪形态、动作、画面、背景保持不变"
+)
+COLLECTOR_ONLY_PROMPT = (
+    "把@视频1里面的左右手机采集器替换为@图片1@图片2中夹爪上安装的摄像头，"
+    "机械臂形态、动作、画面、背景保持不变"
 )
 LEGACY_IPHONE2DEPLOY_PROMPTS = {
+    (
+        "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2@图片3@图片4的机械臂和摄像头，"
+        "根据爪夹上的绿点对齐形态、动作、画面、背景保持不变"
+    ),
     (
         "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2的机械臂和摄像头，"
         "爪夹形态、动作、画面、背景保持不变"
@@ -47,6 +55,10 @@ IPHONE2DEPLOY_REFERENCE_IMAGES = [
     "app/reference_images/l-near-deploy-v2.png",
     "app/reference_images/r-near-deploy-v2.png",
 ]
+COLLECTOR_ONLY_REFERENCE_IMAGES = [
+    "app/reference_images/l-nn-deploy.png",
+    "app/reference_images/r-nn-deploy.png",
+]
 LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
     (
         "app/reference_images/l-near-deploy-v2.png",
@@ -66,7 +78,9 @@ LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
     ),
 }
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
-GENERATION_PRESETS_VERSION = 7
+COLLECTOR_ONLY_PRESET_ID = "collector-only"
+IPHONE2DEPLOY_PRESET_ID = "iphone2deploy"
+GENERATION_PRESETS_VERSION = 8
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -75,7 +89,13 @@ DEFAULT_GENERATION_PRESETS = [
         "reference_images": DEFAULT_REFERENCE_IMAGES,
     },
     {
-        "id": "iphone2deploy",
+        "id": COLLECTOR_ONLY_PRESET_ID,
+        "name": "仅替换采集器",
+        "prompt": COLLECTOR_ONLY_PROMPT,
+        "reference_images": COLLECTOR_ONLY_REFERENCE_IMAGES,
+    },
+    {
+        "id": IPHONE2DEPLOY_PRESET_ID,
         "name": "iphone2deploy",
         "prompt": IPHONE2DEPLOY_PROMPT,
         "reference_images": IPHONE2DEPLOY_REFERENCE_IMAGES,
@@ -403,6 +423,17 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
         changed = True
     elif data.get("generation_presets_version") != GENERATION_PRESETS_VERSION:
         data["generation_presets_version"] = GENERATION_PRESETS_VERSION
+        changed = True
+
+    required_order = [str(preset["id"]) for preset in DEFAULT_GENERATION_PRESETS]
+    ordered_presets: list[dict[str, Any]] = []
+    for preset_id in required_order:
+        existing = next((preset for preset in presets if preset["id"] == preset_id), None)
+        if existing:
+            ordered_presets.append(existing)
+    ordered_presets.extend(preset for preset in presets if preset["id"] not in required_order)
+    if [preset["id"] for preset in ordered_presets] != [preset["id"] for preset in presets]:
+        presets = ordered_presets
         changed = True
 
     default_id = str(data.get("default_generation_preset_id") or "").strip()
