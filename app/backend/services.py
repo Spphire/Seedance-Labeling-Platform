@@ -305,7 +305,7 @@ def list_clips() -> list[dict[str, Any]]:
             JOIN (
                 SELECT clip_id, MAX(created_at) AS max_created_at
                 FROM generation_jobs
-                WHERE status IN ('running','succeeded','failed')
+                WHERE status IN ('queued','running','succeeded','failed')
                 GROUP BY clip_id
             ) latest ON latest.clip_id = j.clip_id AND latest.max_created_at = j.created_at
             """
@@ -445,7 +445,9 @@ def enrich_job_timing(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if started:
         elapsed = max(0.0, float((completed or now) - started))
     estimate = job.get("estimated_total_sec")
+    queued_elapsed = max(0.0, float(now - float(job["created_at"]))) if job.get("status") == "queued" and job.get("created_at") else None
     job["elapsed_sec"] = elapsed
+    job["queued_elapsed_sec"] = queued_elapsed
     job["remaining_estimated_sec"] = (
         max(0.0, float(estimate) - float(elapsed))
         if estimate is not None and elapsed is not None and job.get("status") == "running"
@@ -2225,12 +2227,12 @@ def claim_async_generation_job(
     now = db.now()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        running = conn.execute(
-            "SELECT id FROM generation_jobs WHERE clip_id=? AND status='running' ORDER BY created_at DESC LIMIT 1",
+        active = conn.execute(
+            "SELECT id FROM generation_jobs WHERE clip_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",
             (clip["id"],),
         ).fetchone()
-        if running:
-            return {"clip_id": clip["id"], "status": "skipped", "reason": "clip already has a running job"}
+        if active:
+            return {"clip_id": clip["id"], "status": "skipped", "reason": "clip already has an active job"}
         current = conn.execute("SELECT status FROM clips WHERE id=?", (clip["id"],)).fetchone()
         if not current:
             return {"clip_id": clip["id"], "status": "skipped", "reason": "clip not found"}
@@ -2244,7 +2246,7 @@ def claim_async_generation_job(
                 prompt, reference_images_json, status, retry_count,
                 started_at, estimated_total_sec, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?, ?)
             """,
             (
                 clip["id"],
@@ -2254,7 +2256,6 @@ def claim_async_generation_job(
                 operator_name,
                 prompt,
                 json_text(reference_images or []),
-                now,
                 estimate,
                 now,
                 now,
@@ -2273,22 +2274,48 @@ def claim_async_generation_job(
     return {"job_id": job_id, "clip_id": clip["id"], "status": "queued", "estimated_total_sec": estimate}
 
 
+def mark_generation_job_running(job_id: int) -> bool:
+    now = db.now()
+    with db.connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE generation_jobs
+            SET status='running',
+                started_at=COALESCE(started_at, ?),
+                error=NULL,
+                completed_at=NULL,
+                updated_at=?
+            WHERE id=? AND status IN ('queued','running')
+            """,
+            (now, now, job_id),
+        )
+    return bool(cur.rowcount)
+
+
 def mock_job_worker(job_id: int) -> None:
-    job = db.one(
-        """
-        SELECT j.*, c.id AS clip_row_id, c.episode_uuid, c.clip_index, c.local_path,
-               c.input_kind, c.direction, c.duration_sec, c.source_start_sec, c.source_duration_sec,
-               c.overlap_sec, c.start_sec, c.updated_at AS clip_updated_at, c.public_url
-        FROM generation_jobs j
-        JOIN clips c ON c.id = j.clip_id
-        WHERE j.id=?
-        """,
-        (job_id,),
-    )
-    if not job or job.get("status") != "running":
+    worker_token = begin_generation_worker(job_id)
+    if not worker_token:
         return
-    out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_mock.mp4"
+    job: dict[str, Any] | None = None
     try:
+        row = db.one(
+            """
+            SELECT j.*, c.id AS clip_row_id, c.episode_uuid, c.clip_index, c.local_path,
+                   c.input_kind, c.direction, c.duration_sec, c.source_start_sec, c.source_duration_sec,
+                   c.overlap_sec, c.start_sec, c.updated_at AS clip_updated_at, c.public_url
+            FROM generation_jobs j
+            JOIN clips c ON c.id = j.clip_id
+            WHERE j.id=?
+            """,
+            (job_id,),
+        )
+        if not row or row.get("status") not in {"queued", "running"}:
+            return
+        if not mark_generation_job_running(job_id):
+            return
+        job = dict(row)
+        job["status"] = "running"
+        out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_mock.mp4"
         remaining = max(0.0, float(job.get("estimated_total_sec") or 0))
         while remaining > 0:
             sleep_for = min(0.5, remaining)
@@ -2311,7 +2338,9 @@ def mock_job_worker(job_id: int) -> None:
             )
             conn.execute("UPDATE clips SET status='generated', updated_at=? WHERE id=? AND status='generating'", (now, job["clip_id"]))
     except Exception as exc:
-        fail_generation_job(job_id, int(job["clip_id"]), str(exc))
+        fail_generation_job(job_id, int(job["clip_id"]) if job else 0, str(exc))
+    finally:
+        end_generation_worker(job_id, worker_token)
 
 
 def seedance_job_worker(job_id: int) -> None:
@@ -2332,7 +2361,7 @@ def seedance_job_worker(job_id: int) -> None:
             """,
             (job_id,),
         )
-        if not row or row.get("status") != "running":
+        if not row or row.get("status") not in {"queued", "running"}:
             return
         job = dict(row)
         job = ensure_continuity_clip_input(job)
@@ -2344,6 +2373,9 @@ def seedance_job_worker(job_id: int) -> None:
         heartbeat = generation_job_heartbeat(job_id)
         key_slot = acquire_seedance_key_slot(settings)
         set_generation_worker_key_slot(job_id, worker_token, key_slot)
+        if not mark_generation_job_running(job_id):
+            return
+        job["status"] = "running"
         client = SeedanceClient({**settings, "seedance_api_key": key_slot["api_key"]})
         job["api_key_id"] = key_slot["id"]
         job["api_key_name"] = key_slot["name"]
@@ -2534,7 +2566,7 @@ def fail_generation_job(job_id: int, clip_id: int, error: str) -> None:
     with db.connect() as conn:
         now = db.now()
         cur = conn.execute(
-            "UPDATE generation_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=? AND status='running'",
+            "UPDATE generation_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=? AND status IN ('queued','running')",
             (error, now, now, job_id),
         )
         if cur.rowcount:
@@ -2547,12 +2579,12 @@ def recover_interrupted_generation_jobs(
     recover_stale_active: bool = False,
 ) -> dict[str, list[int]]:
     now = db.now()
-    running_jobs = db.rows(
+    active_jobs = db.rows(
         """
         SELECT j.*, c.status AS clip_status
         FROM generation_jobs j
         JOIN clips c ON c.id = j.clip_id
-        WHERE j.status='running'
+        WHERE j.status IN ('queued','running')
           AND (? <= 0 OR j.updated_at <= ?)
         ORDER BY j.created_at
         """,
@@ -2583,7 +2615,7 @@ def recover_interrupted_generation_jobs(
     )
     resumed: list[int] = []
     failed: list[int] = []
-    for job in running_jobs:
+    for job in active_jobs:
         job_id = int(job["id"])
         clip_id = int(job["clip_id"])
         if generation_worker_is_active(job_id):
@@ -2596,6 +2628,11 @@ def recover_interrupted_generation_jobs(
                         )
                     _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)
                     resumed.append(job_id)
+            continue
+        if job.get("status") == "queued":
+            worker = mock_job_worker if job.get("mode") == "mock" else seedance_job_worker
+            _GENERATION_EXECUTOR.submit(worker, job_id)
+            resumed.append(job_id)
             continue
         if job.get("mode") == "seedance" and job.get("task_id"):
             _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)

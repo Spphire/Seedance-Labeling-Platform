@@ -2137,6 +2137,9 @@
 
     function jobSummary(job) {
       if (!job) return "";
+      if (job.status === "queued") {
+        return `job ${job.id} · 排队中 ${formatDuration(job.queued_elapsed_sec || 0)}`;
+      }
       if (job.status === "running") {
         return `job ${job.id} · 已耗时 ${formatDuration(job.elapsed_sec)} · 预计剩余 ${formatDuration(job.remaining_estimated_sec)}`;
       }

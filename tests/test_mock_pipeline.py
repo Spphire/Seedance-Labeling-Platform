@@ -1398,7 +1398,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(settings["generation_presets"][0]["reference_images"], DEFAULT_SETTINGS["reference_images"])
         self.assertEqual(persisted["generation_presets"][0]["reference_images"], DEFAULT_SETTINGS["reference_images"])
 
-    def test_seedance_queue_marks_running_and_blocks_duplicate(self) -> None:
+    def test_seedance_queue_marks_queued_and_blocks_duplicate(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000011"
         now = db.now()
         save_settings({"generation_mode": "seedance", "seedance_seconds_per_video_second": 24})
@@ -1426,10 +1426,11 @@ class MockPipelineTest(unittest.TestCase):
         clip = db.one("SELECT * FROM clips WHERE id=?", (clips[0]["id"],))
         self.assertEqual(clip["status"], "generating")
         job = db.one("SELECT * FROM generation_jobs WHERE clip_id=?", (clips[0]["id"],))
-        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["status"], "queued")
+        self.assertIsNone(job["started_at"])
         self.assertEqual(job["estimated_total_sec"], 144)
         listed = [item for item in list_clips() if item["id"] == clips[0]["id"]][0]
-        self.assertEqual(listed["latest_job"]["status"], "running")
+        self.assertEqual(listed["latest_job"]["status"], "queued")
         self.assertIsNone(listed["generated_url"])
 
     def test_bulk_generation_includes_rejected_clips(self) -> None:
@@ -1551,6 +1552,7 @@ class MockPipelineTest(unittest.TestCase):
         submit.assert_called_once()
         job = db.one("SELECT * FROM generation_jobs WHERE clip_id=?", (clips[0]["id"],))
         self.assertEqual(job["mode"], "mock")
+        self.assertEqual(job["status"], "queued")
         self.assertEqual(job["operator_id"], "client-a")
         self.assertEqual(job["operator_name"], "Alice")
 
@@ -1674,8 +1676,6 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(res.json()["status"], "queued")
         running = db.one("SELECT * FROM generation_jobs WHERE id=?", (res.json()["job_id"],))
         self.assertEqual(running["mode"], "mock")
-        self.assertEqual(running["status"], "running")
-        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clip_id,))["status"], "generating")
 
         deadline = time.time() + 5
         job = running
@@ -1877,7 +1877,6 @@ class MockPipelineTest(unittest.TestCase):
         queued = queue_generation(mode="mock")
         self.assertEqual(queued[0]["status"], "queued")
         running = db.one("SELECT * FROM generation_jobs WHERE id=?", (queued[0]["job_id"],))
-        self.assertEqual(running["status"], "running")
         self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generating")
 
         deadline = time.time() + 5
@@ -1890,6 +1889,41 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded")
         self.assertTrue(Path(job["output_path"]).exists())
         self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generated")
+
+    def test_recover_queued_mock_job_resubmits_worker(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000041"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='generating' WHERE id=?", (clips[0]["id"],))
+            cur = conn.execute(
+                """
+                INSERT INTO generation_jobs(
+                    clip_id, mode, requested_duration_sec, status, retry_count,
+                    estimated_total_sec, created_at, updated_at
+                )
+                VALUES (?, 'mock', 5, 'queued', 0, 1, ?, ?)
+                """,
+                (clips[0]["id"], now, now),
+            )
+            job_id = cur.lastrowid
+
+        with patch.object(backend_services._GENERATION_EXECUTOR, "submit") as submit:
+            recovered = backend_services.recover_interrupted_generation_jobs()
+
+        self.assertEqual(recovered, {"resumed": [job_id], "failed": []})
+        submit.assert_called_once_with(backend_services.mock_job_worker, job_id)
+        self.assertEqual(db.one("SELECT status FROM generation_jobs WHERE id=?", (job_id,))["status"], "queued")
 
     def test_recover_interrupted_seedance_job_resumes_existing_task(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000035"
