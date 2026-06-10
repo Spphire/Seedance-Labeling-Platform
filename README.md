@@ -45,7 +45,7 @@ $env:SEEDANCE_RELOAD="1"
 
 默认 `generation_mode=mock`，生成阶段只复制原始 clip 到 `data/generated`，不会调用 Seedance API。
 
-真实 Seedance 生成需要在本次运行模式中显式切到 `seedance`，并由管理员填写 `seedance_api_key`。建议先用 `dry-run` 验证请求 JSON，其中 `duration` 会使用 `ceil(clip_duration_sec)`。
+真实 Seedance 生成需要在本次运行模式中显式切到 `seedance`，并由管理员填写 Seedance API Key。标注页不展示 `dry-run` 按钮，普通标注员只使用“批量生成”和右侧 clip “重跑”。
 
 ## 真实 Seedance 配置
 
@@ -54,15 +54,15 @@ API key 不要提交到 Git。服务器部署后有两种配置方式：
 - 在右上角齿轮的后台管理员设置里填写 `Seedance API Key` 并保存。它会写入服务器本机被 `.gitignore` 忽略的 `config/settings.json`。
 - 或者用环境变量启动服务：`SEEDANCE_API_KEY=... bash run_server.sh`。兼容实验脚本里的 `ARK_API_KEY`，但 `SEEDANCE_API_KEY` 优先级更高。
 
-切到真实生成前，先在标注页选择 Prompt/ref 图组合，必要时做本次临时微调，再点 `dry-run`，确认写出的 payload 里 `content` 顺序是 prompt、当前组合的参考图、视频1，且 `duration` 是当前 clip 秒数的向上取整。确认后再把运行模式切到 `seedance（真实消耗额度）`。
+切到真实生成前，先在标注页选择 Prompt/ref 图组合，必要时做本次临时微调，再确认运行模式为 `seedance（真实消耗额度）`。如需检查请求 payload，由负责人或技术人员通过后端 `dry_run=true` 调用或日志验证；标注页不再暴露独立 dry-run 按钮。
 
 ## 多人协作
 
-- 打开 clip 标签页时会自动锁定该 clip，持锁者才能保留、丢弃、重跑或标记问题。
-- 锁是可续租 lease，页面打开时自动续租，关闭标签页会释放；浏览器异常退出后锁会自动过期。
-- 其他人可以只读查看被锁 clip，也可以显式“接管锁”。
+- 打开 clip 标签页时会自动锁定它所在的 episode，持锁者才能保留、丢弃、重跑或标记问题。
+- 锁是可续租 lease，页面打开时自动续租；关闭同一 episode 的最后一个标签页会释放。浏览器异常退出后锁会自动过期。
+- 其他人可以只读查看被锁 episode，也可以显式“接管锁”。
 - 预处理、导入 head、手动重新合成 final 这类 episode 级操作会拿 episode 锁；若该 episode 内有 clip 正在被别人审核，会被拒绝。
-- 批量生成会跳过正在被人工锁定的 clip，避免覆盖别人正在审核的片段。
+- 批量生成会跳过正在被人工锁定的 episode，避免覆盖别人正在审核的片段。
 - 自动 final 拼接是后台派生产物，不需要人工 episode 锁；它会检查 clip 状态，过期结果不会覆盖新结果。
 
 标注员日常操作请参考 [Seedance 标注员 SOP](docs/ANNOTATOR_SOP.md)。
@@ -75,14 +75,17 @@ API key 不要提交到 Git。服务器部署后有两种配置方式：
 - `data/generated`：mock 或 Seedance 生成结果。
 - `data/accepted_clips`：审核保留后 trim + 30fps 的 clips。
 - `data/final_episodes`：全部 clips accepted 后拼接的完整 episode。
+- `data/final_dataset`：final episode 回写后的 Seedance NEDF 数据集副本。
 - `db.sqlite3`：可恢复状态机数据库。
 - `config/settings.json`：DM3data、public URL、Seedance 后端等配置。
 
 ## Useful API
 
-- `POST /api/episodes/batch`：提交 UUID 文本列表。
-- `POST /api/pipeline/preprocess`：从 DM3data 拉取并提取 head 视频。
-- `POST /api/pipeline/import_head`：导入已有 head MP4，仍会转 760x570、切 clip 并进入状态机。
-- `POST /api/generation/run`：运行 mock 或 Seedance 生成队列。
+- `POST /api/pipeline/submit_preprocess`：导入 episode 并准备 head 视频。
+- `POST /api/pipeline/import_head`：导入已有 head MP4。
+- `POST /api/episodes/{uuid}/anchor_candidates`：按起点创建候选锚点。
+- `POST /api/generation/rolling_run`：批量运行当前可处理的 mock 或 Seedance rolling 生成队列。
+- `POST /api/review/{clip_id}`：保留、丢弃或标记问题。
+- `POST /api/clips/{clip_id}/retry`：重跑当前 clip。
 - `POST /api/locks/acquire`、`POST /api/locks/renew`、`POST /api/locks/release`：多人协作锁。
-- `POST /api/test/auto_accept`：测试用，自动保留全部 mock 结果并触发最终拼接。
+- `POST /api/test/auto_accept`：测试用，自动保留全部 mock 结果并触发最终拼接；标注页不展示这个入口。

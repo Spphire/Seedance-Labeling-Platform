@@ -1109,11 +1109,7 @@
         </div>
         <div id="runSettingsSummary" class="hint"></div>
         <div class="row">
-          <button id="generate">滚动生成</button>
-          <button id="dryRun">dry-run</button>
-        </div>
-        <div class="row">
-          <button id="autoAccept">全部保留</button>
+          <button id="generate">批量生成</button>
         </div>
       </section>
 
@@ -2311,7 +2307,6 @@
           <div class="meta">${episode.uuid}</div>
           <div class="episode-actions">
             <button data-episode-focus="${episode.uuid}" class="${focused ? "active" : ""}">${focused ? "移出专注" : "加入专注"}</button>
-            ${episode.final_url ? `<a href="${episode.final_url}" target="_blank" rel="noreferrer">打开 final</a>` : ""}
             ${episode.preview_status === "ready" && episode.preview_url && episode.final_status !== "ready" ? `<a href="${episode.preview_url}" target="_blank" rel="noreferrer">打开 preview</a>` : ""}
             ${total && accepted === total && episode.final_status !== "stitching" ? `<button data-episode-stitch="${episode.uuid}">重新合成</button>` : ""}
           </div>
@@ -3365,25 +3360,7 @@
       try {
         const mode = $("generationMode").value || "mock";
         const result = await api("/api/generation/rolling_run", { method: "POST", body: { mode, dry_run: false, ...generationContentPayload() } });
-        log(`${mode} rolling generation submitted`, result);
-        await refresh();
-      } catch (err) {
-        log(err.message);
-      }
-    });
-    $("dryRun").addEventListener("click", async () => {
-      try {
-        const result = await api("/api/generation/rolling_run", { method: "POST", body: { mode: "seedance", dry_run: true, ...generationContentPayload() } });
-        log("seedance rolling dry-run payloads written", result);
-        await refresh();
-      } catch (err) {
-        log(err.message);
-      }
-    });
-    $("autoAccept").addEventListener("click", async () => {
-      try {
-        const result = await api("/api/test/auto_accept", { method: "POST", body: { uuid: state.selectedEpisode } });
-        log("auto accept finished", result);
+        log(`${mode} batch generation submitted`, result);
         await refresh();
       } catch (err) {
         log(err.message);
