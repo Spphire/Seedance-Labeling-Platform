@@ -141,6 +141,31 @@ def video_duration(path: Path) -> float:
         raise RuntimeError(f"Cannot read duration for {path}") from exc
 
 
+def validate_video_file(path: Path, expected_duration_sec: float | None = None, tolerance_sec: float = 0.35) -> float:
+    if not path.exists():
+        raise RuntimeError(f"video does not exist: {path}")
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"video is empty: {path}")
+    actual_duration = video_duration(path)
+    if expected_duration_sec is not None and expected_duration_sec > 0:
+        if abs(actual_duration - expected_duration_sec) > tolerance_sec:
+            raise RuntimeError(
+                f"video duration mismatch for {path}: got {actual_duration:.3f}s, expected {expected_duration_sec:.3f}s"
+            )
+    proc = subprocess.run(
+        [ffmpeg_path(), "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or "ffmpeg decode failed"
+        raise RuntimeError(f"video decode validation failed for {path}: {detail}")
+    return actual_duration
+
+
 def transcode_760x570(src: Path, dst: Path, fps: float | None = None) -> None:
     args = ["-i", str(src), "-vf", "scale=760:570,setsar=1"]
     if fps:

@@ -37,6 +37,7 @@ from .video import (
     stitch_videos,
     transcode_760x570,
     trim_video,
+    validate_video_file,
     video_duration,
 )
 from ..seedance.client import SeedanceClient
@@ -513,6 +514,12 @@ def generation_input_url(item: dict[str, Any], job_id: int) -> str:
     )
 
 
+def validate_generation_input_file(item: dict[str, Any]) -> None:
+    path = Path(str(item.get("local_path") or ""))
+    expected = float(item.get("duration_sec") or 0.0)
+    validate_video_file(path, expected if expected > 0 else None)
+
+
 def static_url_from_path(path_value: str | None, root: Path, prefix: str) -> str | None:
     if not path_value:
         return None
@@ -642,12 +649,12 @@ def ensure_continuity_cache_target(clip: dict[str, Any]) -> dict[str, Any]:
 def continuity_input_cache_stale(clip: dict[str, Any], path: Path) -> bool:
     if not path.exists():
         return True
+    expected = float(clip.get("duration_sec") or 0.0)
     try:
-        actual = video_duration(path)
+        validate_video_file(path, expected if expected > 0 else None)
     except Exception:
         return True
-    expected = float(clip.get("duration_sec") or 0.0)
-    return bool(expected > 0 and abs(actual - expected) > 0.35)
+    return False
 
 
 def continuity_input_cache_paths(clip: dict[str, Any]) -> list[Path]:
@@ -1939,15 +1946,23 @@ def build_continuity_clip_input(clip: dict[str, Any]) -> None:
             raise RuntimeError("adjacent accepted output is missing")
     if clip.get("input_kind") == "anchor":
         direction = "forward"
-    compose_continuity_input(
-        head_path,
-        Path(clip["local_path"]),
-        float(clip.get("source_start_sec") if clip.get("source_start_sec") is not None else clip["start_sec"]),
-        float(clip.get("source_duration_sec") if clip.get("source_duration_sec") is not None else clip["duration_sec"]),
-        direction,
-        anchor_path,
-        overlap,
-    )
+    target_path = Path(clip["local_path"])
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f".{target_path.name}.{int(db.now() * 1000)}.{secrets.token_hex(4)}.tmp.mp4")
+    try:
+        compose_continuity_input(
+            head_path,
+            temp_path,
+            float(clip.get("source_start_sec") if clip.get("source_start_sec") is not None else clip["start_sec"]),
+            float(clip.get("source_duration_sec") if clip.get("source_duration_sec") is not None else clip["duration_sec"]),
+            direction,
+            anchor_path,
+            overlap,
+        )
+        validate_video_file(temp_path, float(clip.get("duration_sec") or 0.0))
+        temp_path.replace(target_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
     with db.connect() as conn:
         now = db.now()
         conn.execute(
@@ -2253,6 +2268,7 @@ def mock_job_worker(job_id: int) -> None:
             with db.connect() as conn:
                 conn.execute("UPDATE generation_jobs SET updated_at=? WHERE id=? AND status='running'", (db.now(), job_id))
         job = ensure_continuity_clip_input(dict(job))
+        validate_generation_input_file(job)
         data = SeedanceClient(load_settings()).mock_generate(Path(job["local_path"]), out_path)
         with db.connect() as conn:
             now = db.now()
@@ -2291,6 +2307,7 @@ def seedance_job_worker(job_id: int) -> None:
             return
         job = dict(row)
         job = ensure_continuity_clip_input(job)
+        validate_generation_input_file(job)
         input_url = generation_input_url(job, job_id)
         settings = load_settings()
         job_prompt, job_refs = generation_values_from_job(job, settings)
@@ -2912,6 +2929,7 @@ def run_generation_for_clip(
         if not latest_clip:
             raise RuntimeError("clip disappeared before generation")
         clip = ensure_continuity_clip_input(latest_clip)
+        validate_generation_input_file(clip)
         input_url = generation_input_url(clip, job_id)
         episode_uuid = clip["episode_uuid"]
         suffix = "dryrun" if dry_run else mode

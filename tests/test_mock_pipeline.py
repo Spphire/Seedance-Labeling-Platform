@@ -51,7 +51,7 @@ from app.backend.settings import (
     public_settings,
     save_settings,
 )
-from app.backend.video import black_video, ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg
+from app.backend.video import black_video, ffmpeg_probe_fallback, ffprobe_json, run_ffmpeg, validate_video_file
 from app.seedance.client import SeedanceClient, resolve_image_value
 
 
@@ -208,6 +208,16 @@ class MockPipelineTest(unittest.TestCase):
             return create_anchor_candidates(uuid, starts, token)
         finally:
             self.client.post("/api/locks/release", json={"token": token, "owner_id": "alice"})
+
+    def corrupt_mp4_mdat(self, path: Path) -> None:
+        data = bytearray(path.read_bytes())
+        offset = data.find(b"mdat")
+        self.assertNotEqual(offset, -1)
+        start = min(len(data), offset + 8)
+        end = min(len(data), start + 4096)
+        self.assertGreater(end, start)
+        data[start:end] = b"\x00" * (end - start)
+        path.write_bytes(data)
 
     def accept_single_anchor_candidate_to_official(self, uuid: str) -> tuple[dict, dict]:
         first_result = queue_rolling_generation(mode="mock")
@@ -479,6 +489,33 @@ class MockPipelineTest(unittest.TestCase):
         )
         self.assertIsNotNone(next_backward)
         self.assertTrue(Path(next_backward["local_path"]).exists())
+
+    def test_generation_rebuilds_corrupt_continuity_input_cache(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000041"
+        save_settings({"mock_async": False})
+        self.make_head_ready_episode(uuid, 32)
+        self.create_anchor_candidates_with_lock(uuid, [14])
+        self.accept_single_anchor_candidate_to_official(uuid)
+        backward = db.one(
+            "SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' AND direction='backward'",
+            (uuid,),
+        )
+        self.assertIsNotNone(backward)
+        input_path = Path(backward["local_path"])
+        validate_video_file(input_path, backward["duration_sec"])
+
+        self.corrupt_mp4_mdat(input_path)
+        with self.assertRaises(RuntimeError):
+            validate_video_file(input_path, backward["duration_sec"])
+
+        result = queue_rolling_generation(mode="mock")
+
+        backward_job = next(item for item in result if item.get("clip_id") == backward["id"])
+        self.assertEqual(backward_job["status"], "succeeded")
+        rebuilt = db.one("SELECT * FROM clips WHERE id=?", (backward["id"],))
+        self.assertIsNotNone(rebuilt)
+        validate_video_file(Path(rebuilt["local_path"]), rebuilt["duration_sec"])
+        self.assertGreater(Path(rebuilt["local_path"]).stat().st_size, 0)
 
     def test_rolling_prefer_input_length_controls_non_anchor_clip_size(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000033"
