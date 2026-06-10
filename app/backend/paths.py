@@ -16,6 +16,7 @@ GENERATED_DIR = DATA_DIR / "generated"
 ACCEPTED_DIR = DATA_DIR / "accepted_clips"
 ARCHIVED_ANCHORS_DIR = DATA_DIR / "archived_anchor_candidates"
 FINAL_DIR = DATA_DIR / "final_episodes"
+FINAL_DATASET_DIR = DATA_DIR / "final_dataset"
 LOGS_DIR = ROOT / "logs"
 REFERENCE_IMAGES_DIR = ROOT / "app" / "reference_images"
 
@@ -30,6 +31,7 @@ def ensure_dirs() -> None:
         ACCEPTED_DIR,
         ARCHIVED_ANCHORS_DIR,
         FINAL_DIR,
+        FINAL_DATASET_DIR,
         LOGS_DIR,
     ]:
         path.mkdir(parents=True, exist_ok=True)

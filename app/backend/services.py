@@ -15,8 +15,17 @@ from urllib.parse import urlencode
 from . import db
 from .ids import parse_uuids
 from .locks import LockError, active_lock, locks_by_resource, require_lock, require_no_active_lock
-from .nedf import extract_head_video, fetch_episode
-from .paths import ACCEPTED_DIR, ARCHIVED_ANCHORS_DIR, CLIPS_DIR, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
+from .nedf import export_seedance_dataset, extract_head_video, fetch_episode
+from .paths import (
+    ACCEPTED_DIR,
+    ARCHIVED_ANCHORS_DIR,
+    CLIPS_DIR,
+    EPISODES_DIR,
+    FINAL_DATASET_DIR,
+    FINAL_DIR,
+    GENERATED_DIR,
+    HEAD_VIDEOS_DIR,
+)
 from .settings import (
     COLLECTOR_ONLY_PRESET_ID,
     DEFAULT_GENERATION_PRESET_ID,
@@ -859,6 +868,7 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
                 conn.execute(
                     """
                     UPDATE episodes SET status='preprocessed', head_video_path=?, final_status='missing',
+                    final_dataset_path=NULL, final_dataset_status='missing', final_dataset_error=NULL,
                     continuity_state='select_anchor', anchor_clip_id=NULL,
                     error=NULL, updated_at=? WHERE uuid=?
                     """,
@@ -880,6 +890,7 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
             conn.execute(
                 """
                 UPDATE episodes SET status='preprocessed', head_video_path=?, final_status='missing',
+                final_dataset_path=NULL, final_dataset_status='missing', final_dataset_error=NULL,
                 continuity_state='select_anchor', anchor_clip_id=NULL,
                 local_path=?, error=NULL, updated_at=? WHERE uuid=?
                 """,
@@ -906,7 +917,8 @@ def clear_episode_clip_state(uuid: str) -> None:
             UPDATE episodes
             SET anchor_clip_id=NULL, continuity_state='select_anchor',
                 final_status='missing', preview_video_path=NULL, preview_status='missing',
-                preview_error=NULL, updated_at=?
+                preview_error=NULL, final_dataset_path=NULL, final_dataset_status='missing',
+                final_dataset_error=NULL, updated_at=?
             WHERE uuid=?
             """,
             (db.now(), uuid),
@@ -1143,7 +1155,7 @@ def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
                     """
                     UPDATE episodes
                     SET anchor_clip_id=NULL, continuity_state='anchor_candidates',
-                        final_status='stale', updated_at=?
+                        final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
                     WHERE uuid=?
                     """,
                     (db.now(), uuid),
@@ -1223,12 +1235,19 @@ def import_head_video(uuid: str, source_path: str, lock_token: str | None = None
     with db.connect() as conn:
         conn.execute(
             """
-            INSERT INTO episodes(uuid, remote_path, local_path, status, head_video_path, final_status, created_at, updated_at)
-            VALUES (?, ?, ?, 'preprocessed', ?, 'missing', ?, ?)
+            INSERT INTO episodes(
+                uuid, remote_path, local_path, status, head_video_path, final_status,
+                final_dataset_path, final_dataset_status, final_dataset_error,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'preprocessed', ?, 'missing', NULL, 'missing', NULL, ?, ?)
             ON CONFLICT(uuid) DO UPDATE SET
                 status='preprocessed',
                 head_video_path=excluded.head_video_path,
                 final_status='missing',
+                final_dataset_path=NULL,
+                final_dataset_status='missing',
+                final_dataset_error=NULL,
                 continuity_state='select_anchor',
                 anchor_clip_id=NULL,
                 error=NULL,
@@ -1396,7 +1415,8 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
             conn.execute(
                 """
                 UPDATE episodes
-                SET continuity_state='anchor_candidates', final_status='stale', updated_at=?
+                SET continuity_state='anchor_candidates', final_status='stale',
+                    final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
                 WHERE uuid=?
                 """,
                 (db.now(), uuid),
@@ -1722,7 +1742,8 @@ def maybe_prepare_next_continuity_clips_after_accept(
             conn.execute(
                 """
                 UPDATE episodes
-                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale', updated_at=?
+                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale',
+                    final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
                 WHERE uuid=?
                 """,
                 (accepted_clip_id, db.now(), uuid),
@@ -1900,7 +1921,11 @@ def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, An
             (str(path.resolve()), public_url, now, int(clip_id)),
         )
         conn.execute(
-            "UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=? AND final_status IN ('ready','stitching')",
+            """
+            UPDATE episodes
+            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=? AND final_status IN ('ready','stitching')
+            """,
             (now, uuid),
         )
     return db.one("SELECT * FROM clips WHERE id=?", (clip_id,)) or {"id": clip_id, "episode_uuid": uuid}
@@ -2238,7 +2263,11 @@ def claim_async_generation_job(
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
         conn.execute(
-            "UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=? AND final_status IN ('ready','stitching')",
+            """
+            UPDATE episodes
+            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=? AND final_status IN ('ready','stitching')
+            """,
             (now, clip["episode_uuid"]),
         )
     return {"job_id": job_id, "clip_id": clip["id"], "status": "queued", "estimated_total_sec": estimate}
@@ -2921,7 +2950,11 @@ def run_generation_for_clip(
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
         conn.execute(
-            "UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=? AND final_status IN ('ready','stitching')",
+            """
+            UPDATE episodes
+            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=? AND final_status IN ('ready','stitching')
+            """,
             (now, clip["episode_uuid"]),
         )
     try:
@@ -3236,7 +3269,14 @@ def review_clip(
             )
         else:
             conn.execute("UPDATE clips SET status=?, updated_at=? WHERE id=?", (status, now, clip_id))
-        conn.execute("UPDATE episodes SET final_status='stale', updated_at=? WHERE uuid=?", (now, clip["episode_uuid"]))
+        conn.execute(
+            """
+            UPDATE episodes
+            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=?
+            """,
+            (now, clip["episode_uuid"]),
+        )
     deleted_future_clip_count = (
         delete_dependent_continuity_clips(clip)
         if decision in {"reject", "rerun"} and clip.get("input_kind") in CONTINUITY_INPUT_KINDS
@@ -3538,11 +3578,64 @@ def _stitch_episode_worker(uuid: str, lock_tokens: list[str]) -> None:
         stitch_episode(uuid)
     except Exception as exc:
         with db.connect() as conn:
-            conn.execute("UPDATE episodes SET final_status='failed', error=?, updated_at=? WHERE uuid=?", (str(exc), db.now(), uuid))
+            conn.execute(
+                """
+                UPDATE episodes
+                SET final_status='failed', error=?,
+                    final_dataset_status=CASE
+                        WHEN final_dataset_status='exporting' THEN 'failed'
+                        ELSE final_dataset_status
+                    END,
+                    final_dataset_error=CASE
+                        WHEN final_dataset_status='exporting' THEN ?
+                        ELSE final_dataset_error
+                    END,
+                    updated_at=?
+                WHERE uuid=?
+                """,
+                (str(exc), str(exc), db.now(), uuid),
+            )
     finally:
         release_stitch_locks(lock_tokens)
         with _STITCH_LOCK:
             _STITCHING_EPISODES.discard(uuid)
+
+
+def episode_source_dir_for_export(episode: dict[str, Any]) -> Path:
+    uuid = str(episode["uuid"])
+    candidates: list[Path] = []
+    local_value = str(episode.get("local_path") or "").strip()
+    if local_value:
+        candidates.append(Path(local_value))
+    settings = load_settings()
+    root_value = str(settings.get("dm3_nedf_root") or "").strip()
+    if root_value:
+        candidates.append(Path(root_value) / uuid)
+    candidates.append(EPISODES_DIR / uuid)
+    for candidate in candidates:
+        if (candidate / "preprocessed" / "metadata.json").exists():
+            return candidate
+        if candidate.name == "preprocessed" and (candidate / "metadata.json").exists():
+            return candidate.parent
+    raise RuntimeError(f"source episode folder with preprocessed metadata not found for {uuid}")
+
+
+def export_final_seedance_dataset(uuid: str, final_video_path: Path) -> dict[str, Any]:
+    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    if not episode:
+        raise RuntimeError(f"episode not found: {uuid}")
+    source_dir = episode_source_dir_for_export(episode)
+    output_dir = FINAL_DATASET_DIR / uuid
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE episodes
+            SET final_dataset_status='exporting', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=?
+            """,
+            (db.now(), uuid),
+        )
+    return export_seedance_dataset(source_dir, final_video_path, output_dir)
 
 
 def stitch_episode(uuid: str) -> dict[str, Any]:
@@ -3583,12 +3676,24 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
             tmp.unlink(missing_ok=True)
             return {"uuid": uuid, "final_status": episode.get("final_status") if episode else "missing", "stale": True}
         tmp.replace(out)
+        dataset_path = None
+        dataset_status = "failed"
+        dataset_error = None
+        try:
+            dataset = export_final_seedance_dataset(uuid, out)
+            dataset_path = dataset["output_path"]
+            dataset_status = "ready"
+        except Exception as exc:
+            dataset_error = str(exc)
         with db.connect() as conn:
             conn.execute(
                 """
                 UPDATE episodes
                 SET final_video_path=?,
                     final_status='ready',
+                    final_dataset_path=?,
+                    final_dataset_status=?,
+                    final_dataset_error=?,
                     continuity_state=CASE
                         WHEN EXISTS (
                             SELECT 1 FROM clips
@@ -3601,14 +3706,36 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
                     updated_at=?
                 WHERE uuid=?
                 """,
-                (str(out.resolve()), uuid, db.now(), uuid),
+                (str(out.resolve()), dataset_path, dataset_status, dataset_error, uuid, db.now(), uuid),
             )
         update_continuity_state(uuid)
-        return {"uuid": uuid, "final_video_path": str(out.resolve()), "final_status": "ready"}
+        return {
+            "uuid": uuid,
+            "final_video_path": str(out.resolve()),
+            "final_status": "ready",
+            "final_dataset_path": dataset_path,
+            "final_dataset_status": dataset_status,
+        }
     except Exception as exc:
         tmp.unlink(missing_ok=True)
         with db.connect() as conn:
-            conn.execute("UPDATE episodes SET final_status='failed', error=?, updated_at=? WHERE uuid=?", (str(exc), db.now(), uuid))
+            conn.execute(
+                """
+                UPDATE episodes
+                SET final_status='failed', error=?,
+                    final_dataset_status=CASE
+                        WHEN final_dataset_status='exporting' THEN 'failed'
+                        ELSE final_dataset_status
+                    END,
+                    final_dataset_error=CASE
+                        WHEN final_dataset_status='exporting' THEN ?
+                        ELSE final_dataset_error
+                    END,
+                    updated_at=?
+                WHERE uuid=?
+                """,
+                (str(exc), str(exc), db.now(), uuid),
+            )
         raise
 
 

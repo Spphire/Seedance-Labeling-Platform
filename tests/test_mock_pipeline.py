@@ -11,12 +11,26 @@ from unittest.mock import patch
 os.environ["SEEDANCE_PLATFORM_ROOT"] = str(Path(__file__).resolve().parent / "_tmp_platform")
 
 from fastapi.testclient import TestClient
+from mcap.writer import Writer
+from nmx_msg.Image_pb2 import RGBD
+from nmx_msg.Metadata_pb2 import Metadata
 
 from app.backend import db
 from app.backend import services as backend_services
 from app.backend.main import FRONTEND_DIR, app
-from app.backend.nedf import fetch_episode
-from app.backend.paths import ACCEPTED_DIR, CLIPS_DIR, DATA_DIR, DB_PATH, EPISODES_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR
+from app.backend.nedf import extract_head_video, fetch_episode
+from app.backend.paths import (
+    ACCEPTED_DIR,
+    CLIPS_DIR,
+    DATA_DIR,
+    DB_PATH,
+    EPISODES_DIR,
+    FINAL_DATASET_DIR,
+    FINAL_DIR,
+    GENERATED_DIR,
+    HEAD_VIDEOS_DIR,
+    REFERENCE_IMAGES_DIR,
+)
 from app.backend.services import (
     chronological_accepted_output_path,
     create_anchor_candidates,
@@ -71,7 +85,7 @@ class MockPipelineTest(unittest.TestCase):
             backend_services._GENERATION_WORKER_KEY_SLOTS.clear()
         save_settings(dict(DEFAULT_SETTINGS))
         self.unlink_with_retry(DB_PATH)
-        for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR]:
+        for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR, FINAL_DATASET_DIR]:
             self.rmtree_with_retry(directory)
             directory.mkdir(parents=True, exist_ok=True)
         db.init_db()
@@ -197,6 +211,65 @@ class MockPipelineTest(unittest.TestCase):
             )
         return head
 
+    def write_minimal_nedf_episode(self, uuid: str, frame_count: int = 12) -> Path:
+        source_root = DATA_DIR / "source_nedf" / uuid
+        self.rmtree_with_retry(source_root)
+        preprocessed = source_root / "preprocessed"
+        data_dir = preprocessed / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        head_topic = "nmx/hal/camera/camera_2/rgbd"
+        metadata = {
+            "data_format": "NEDF3",
+            "camera_info": {"camera_2": "head"},
+            "record_topic_list": ["nmx/nedf/metadata", head_topic],
+            "extra": {
+                "camera_position": ["head"],
+                "device_type": ["UMI3.0"],
+                "video": [{"frames": frame_count, "width": 1280, "height": 960}],
+            },
+        }
+        (preprocessed / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        timestamps = [index * 33_333_333 for index in range(frame_count)]
+        (preprocessed / "timestamps.json").write_text(json.dumps({head_topic: timestamps}), encoding="utf-8")
+        (preprocessed / "qc.json").write_text("{}", encoding="utf-8")
+        mcap_path = data_dir / "data_0.mcap"
+        with mcap_path.open("wb") as output:
+            writer = Writer(output)
+            writer.start()
+            metadata_schema = writer.register_schema(
+                "nmx.msg.Metadata",
+                "protobuf",
+                Metadata.DESCRIPTOR.file.serialized_pb,
+            )
+            rgbd_schema = writer.register_schema(
+                "nmx.msg.RGBD",
+                "protobuf",
+                RGBD.DESCRIPTOR.file.serialized_pb,
+            )
+            metadata_channel = writer.register_channel("nmx/nedf/metadata", "protobuf", metadata_schema)
+            rgbd_channel = writer.register_channel(head_topic, "protobuf", rgbd_schema)
+            metadata_message = Metadata(version="nedf3", metadata=json.dumps(metadata, ensure_ascii=False).encode("utf-8"))
+            writer.add_message(metadata_channel, log_time=0, publish_time=0, sequence=0, data=metadata_message.SerializeToString())
+            for index, timestamp in enumerate(timestamps):
+                rgbd = RGBD()
+                rgbd.rgb.data = b"old-rgb"
+                rgbd.rgb.encoded_format = "h264"
+                rgbd.rgb.cols = 1280
+                rgbd.rgb.rows = 960
+                writer.add_message(
+                    rgbd_channel,
+                    log_time=timestamp,
+                    publish_time=timestamp,
+                    sequence=index,
+                    data=rgbd.SerializeToString(),
+                )
+            writer.finish()
+        (data_dir / "mcap_index.json").write_text(
+            json.dumps([{"filename": mcap_path.name, "start_time_ns": 0}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return source_root
+
     def create_anchor_candidates_with_lock(self, uuid: str, starts: list[float]) -> dict:
         lock = self.client.post(
             "/api/locks/acquire",
@@ -266,6 +339,46 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(stream["height"], 570)
         self.assertEqual(stream["avg_frame_rate"], "30/1")
         self.assertAlmostEqual(float(info["format"]["duration"]), 8.0, delta=0.25)
+
+    def test_stitch_exports_seedance_nedf_dataset(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000042"
+        source_root = self.write_minimal_nedf_episode(uuid, frame_count=12)
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 4)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, head_video_path, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, ?)
+                """,
+                (uuid, "mock", str(source_root.resolve()), str(head.resolve()), now, now),
+            )
+        clips = create_clips(uuid, head, 4)
+        results = run_generation(mode="mock")
+        self.assertEqual(results[0]["status"], "succeeded")
+        review_clip(clips[0]["id"], "accept", results[0]["job_id"], require_lock_token=False)
+
+        episode = self.wait_for_final_ready(uuid)
+
+        self.assertEqual(episode["final_dataset_status"], "ready")
+        dataset_root = Path(episode["final_dataset_path"])
+        self.assertTrue(dataset_root.exists())
+        metadata = json.loads((dataset_root / "preprocessed" / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["devicetype"], "seedance")
+        self.assertEqual(metadata["device_type"], "seedance")
+        self.assertEqual(metadata["extra"]["device_type"], ["seedance"])
+        self.assertEqual(metadata["extra"]["video"][0]["frames"], 12)
+        self.assertEqual(metadata["extra"]["video"][0]["width"], 760)
+        self.assertEqual(metadata["extra"]["video"][0]["height"], 570)
+
+        exported_mp4 = DATA_DIR / f"{uuid}_exported_head.mp4"
+        extracted = extract_head_video(dataset_root / "preprocessed", exported_mp4)
+        self.assertEqual(extracted["frame_count"], 12)
+        info = ffprobe_json(exported_mp4) or ffmpeg_probe_fallback(exported_mp4)
+        self.assertEqual(info["streams"][0]["codec_name"], "h264")
+        self.assertEqual(info["streams"][0]["width"], 760)
+        self.assertEqual(info["streams"][0]["height"], 570)
 
     def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"

@@ -48,6 +48,9 @@ def init_db() -> None:
                 head_video_path TEXT,
                 final_video_path TEXT,
                 final_status TEXT NOT NULL DEFAULT 'missing',
+                final_dataset_path TEXT,
+                final_dataset_status TEXT NOT NULL DEFAULT 'missing',
+                final_dataset_error TEXT,
                 preview_video_path TEXT,
                 preview_status TEXT NOT NULL DEFAULT 'missing',
                 preview_version INTEGER NOT NULL DEFAULT 0,
@@ -220,11 +223,15 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "episodes", "preview_video_path", "TEXT")
+        _ensure_column(conn, "episodes", "final_dataset_path", "TEXT")
+        _ensure_column(conn, "episodes", "final_dataset_status", "TEXT NOT NULL DEFAULT 'missing'")
+        _ensure_column(conn, "episodes", "final_dataset_error", "TEXT")
         _ensure_column(conn, "episodes", "preview_status", "TEXT NOT NULL DEFAULT 'missing'")
         _ensure_column(conn, "episodes", "preview_version", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "episodes", "preview_error", "TEXT")
         _ensure_column(conn, "episodes", "continuity_state", "TEXT NOT NULL DEFAULT 'select_anchor'")
         _ensure_column(conn, "episodes", "anchor_clip_id", "INTEGER")
+        conn.execute("UPDATE episodes SET final_dataset_status='missing' WHERE final_dataset_status IS NULL OR final_dataset_status=''")
         conn.execute("UPDATE episodes SET preview_status='missing' WHERE preview_status IS NULL OR preview_status=''")
         conn.execute("UPDATE episodes SET preview_version=0 WHERE preview_version IS NULL")
         conn.execute(

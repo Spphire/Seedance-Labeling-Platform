@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 from mcap.reader import make_reader
+from mcap.writer import Writer
 from nmx_msg.Image_pb2 import Image, RGBD
+from nmx_msg.Metadata_pb2 import Metadata
 
 from .video import run_ffmpeg
 
@@ -48,6 +53,33 @@ def estimate_fps(preprocessed_dir: Path, topic: str) -> float:
     return 30.0
 
 
+def set_seedance_device_type(metadata: dict[str, Any], frame_count: int | None = None) -> dict[str, Any]:
+    metadata = dict(metadata)
+    metadata["devicetype"] = "seedance"
+    metadata["device_type"] = "seedance"
+    extra = metadata.get("extra")
+    if isinstance(extra, dict):
+        extra = dict(extra)
+        value = extra.get("device_type")
+        if isinstance(value, list):
+            extra["device_type"] = ["seedance" for _ in value]
+        else:
+            extra["device_type"] = "seedance"
+        positions = extra.get("camera_position")
+        videos = extra.get("video")
+        if frame_count is not None and isinstance(positions, list) and isinstance(videos, list):
+            updated_videos = []
+            for index, item in enumerate(videos):
+                next_item = dict(item) if isinstance(item, dict) else item
+                if isinstance(next_item, dict) and index < len(positions):
+                    if "head" in str(positions[index]).lower() or "ego" in str(positions[index]).lower():
+                        next_item.update({"frames": frame_count, "width": 760, "height": 570})
+                updated_videos.append(next_item)
+            extra["video"] = updated_videos
+        metadata["extra"] = extra
+    return metadata
+
+
 def parse_rgb_message(data: bytes, schema_name: str) -> Image:
     if schema_name == "nmx.msg.RGBD":
         rgbd = RGBD()
@@ -62,6 +94,210 @@ def parse_rgb_message(data: bytes, schema_name: str) -> Image:
     if rgbd.rgb.data:
         return rgbd.rgb
     return image
+
+
+def count_topic_messages(preprocessed_dir: Path, topic: str) -> int:
+    count = 0
+    for mcap_path in mcap_files(preprocessed_dir):
+        with mcap_path.open("rb") as f:
+            reader = make_reader(f)
+            for _, _, _ in reader.iter_messages(topics=[topic]):
+                count += 1
+    return count
+
+
+def h264_start_codes(data: bytes) -> list[tuple[int, int]]:
+    positions: list[tuple[int, int]] = []
+    index = 0
+    limit = len(data) - 3
+    while index < limit:
+        if data[index : index + 4] == b"\x00\x00\x00\x01":
+            positions.append((index, 4))
+            index += 4
+            continue
+        if data[index : index + 3] == b"\x00\x00\x01":
+            positions.append((index, 3))
+            index += 3
+            continue
+        index += 1
+    return positions
+
+
+def split_h264_access_units(data: bytes) -> list[bytes]:
+    starts = h264_start_codes(data)
+    aud_positions = [
+        position
+        for position, size in starts
+        if position + size < len(data) and data[position + size] & 0x1F == 9
+    ]
+    if not aud_positions:
+        raise RuntimeError("encoded h264 stream does not contain access unit delimiters")
+    chunks = []
+    for index, position in enumerate(aud_positions):
+        start = 0 if index == 0 and position > 0 else position
+        end = aud_positions[index + 1] if index + 1 < len(aud_positions) else len(data)
+        chunk = data[start:end]
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def encode_video_access_units(final_video: Path, frame_count: int, fps: float, tmp_dir: Path) -> list[bytes]:
+    if frame_count <= 0:
+        raise RuntimeError("head topic has no frames to replace")
+    raw_h264 = tmp_dir / "seedance_final.raw.h264"
+    stop_duration = max(1.0, frame_count / max(fps, 1.0) + 1.0)
+    run_ffmpeg(
+        [
+            "-i",
+            str(final_video),
+            "-vf",
+            f"scale=760:570,setsar=1,fps={fps:.6f},tpad=stop_mode=clone:stop_duration={stop_duration:.6f}",
+            "-frames:v",
+            str(frame_count),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-x264-params",
+            "aud=1",
+            "-f",
+            "h264",
+            str(raw_h264),
+        ]
+    )
+    units = split_h264_access_units(raw_h264.read_bytes())
+    if len(units) < frame_count:
+        raise RuntimeError(f"encoded final video produced {len(units)} frames, expected {frame_count}")
+    return units[:frame_count]
+
+
+def update_metadata_payload(data: bytes, frame_count: int) -> bytes:
+    message = Metadata()
+    message.ParseFromString(data)
+    try:
+        payload = json.loads(message.metadata.decode("utf-8"))
+    except Exception:
+        return data
+    message.metadata = json.dumps(set_seedance_device_type(payload, frame_count), ensure_ascii=False).encode("utf-8")
+    return message.SerializeToString()
+
+
+def replace_rgb_payload(data: bytes, schema_name: str, frame_data: bytes) -> bytes:
+    if schema_name == "nmx.msg.RGBD":
+        rgbd = RGBD()
+        rgbd.ParseFromString(data)
+        rgbd.rgb.data = frame_data
+        rgbd.rgb.encoded_format = "h264"
+        rgbd.rgb.cols = 760
+        rgbd.rgb.rows = 570
+        rgbd.rgb.channels = 3
+        return rgbd.SerializeToString()
+    image = Image()
+    image.ParseFromString(data)
+    image.data = frame_data
+    image.encoded_format = "h264"
+    image.cols = 760
+    image.rows = 570
+    image.channels = 3
+    return image.SerializeToString()
+
+
+def rewrite_mcap_rgb_topic(mcap_path: Path, head_topic: str, frames: list[bytes], start_index: int, frame_count: int) -> int:
+    temp_path = mcap_path.with_name(f".{mcap_path.name}.seedance-{int(time.time() * 1000)}.mcap")
+    schema_ids: dict[int, int] = {}
+    channel_ids: dict[int, int] = {}
+    frame_index = start_index
+    try:
+        with mcap_path.open("rb") as source, temp_path.open("wb") as output:
+            reader = make_reader(source)
+            writer = Writer(output)
+            writer.start()
+            for schema, channel, message in reader.iter_messages():
+                if schema and schema.id not in schema_ids:
+                    schema_ids[schema.id] = writer.register_schema(schema.name, schema.encoding, schema.data)
+                if channel.id not in channel_ids:
+                    schema_id = schema_ids.get(channel.schema_id, 0)
+                    channel_ids[channel.id] = writer.register_channel(
+                        channel.topic,
+                        channel.message_encoding,
+                        schema_id,
+                        dict(channel.metadata or {}),
+                    )
+                data = message.data
+                schema_name = schema.name if schema else ""
+                if channel.topic == head_topic:
+                    if frame_index >= len(frames):
+                        raise RuntimeError(f"not enough encoded frames for {head_topic}")
+                    data = replace_rgb_payload(data, schema_name, frames[frame_index])
+                    frame_index += 1
+                elif channel.topic == "nmx/nedf/metadata" and schema_name == "nmx.msg.Metadata":
+                    data = update_metadata_payload(data, frame_count)
+                writer.add_message(
+                    channel_ids[channel.id],
+                    log_time=message.log_time,
+                    publish_time=message.publish_time,
+                    sequence=message.sequence,
+                    data=data,
+                )
+            writer.finish()
+        temp_path.replace(mcap_path)
+        return frame_index
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def resolve_episode_root(path: Path) -> Path:
+    if (path / "preprocessed" / "metadata.json").exists():
+        return path
+    if path.name == "preprocessed" and (path / "metadata.json").exists():
+        return path.parent
+    raise RuntimeError(f"cannot find preprocessed metadata under {path}")
+
+
+def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, output_episode_dir: Path) -> dict[str, Any]:
+    source_root = resolve_episode_root(source_episode_dir)
+    source_preprocessed = source_root / "preprocessed"
+    if not final_video_path.exists():
+        raise RuntimeError(f"final video does not exist: {final_video_path}")
+    metadata = load_json(source_preprocessed / "metadata.json")
+    head_topic, camera_id = choose_head_topic(metadata)
+    frame_count = count_topic_messages(source_preprocessed, head_topic)
+    fps = estimate_fps(source_preprocessed, head_topic)
+    output_episode_dir.parent.mkdir(parents=True, exist_ok=True)
+    temp_root = output_episode_dir.parent / f".{output_episode_dir.name}.exporting-{int(time.time() * 1000)}"
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    try:
+        shutil.copytree(source_root, temp_root, symlinks=True)
+        output_preprocessed = temp_root / "preprocessed"
+        metadata_path = output_preprocessed / "metadata.json"
+        metadata_path.write_text(
+            json.dumps(set_seedance_device_type(metadata, frame_count), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frames = encode_video_access_units(final_video_path, frame_count, fps, Path(tmpdir))
+        next_index = 0
+        for mcap_path in mcap_files(output_preprocessed):
+            next_index = rewrite_mcap_rgb_topic(mcap_path, head_topic, frames, next_index, frame_count)
+        if next_index != frame_count:
+            raise RuntimeError(f"replaced {next_index} head frames, expected {frame_count}")
+        if output_episode_dir.exists():
+            shutil.rmtree(output_episode_dir)
+        temp_root.rename(output_episode_dir)
+    except Exception:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    return {
+        "output_path": str(output_episode_dir.resolve()),
+        "preprocessed_path": str((output_episode_dir / "preprocessed").resolve()),
+        "head_topic": head_topic,
+        "camera_id": camera_id,
+        "frame_count": frame_count,
+        "fps": fps,
+    }
 
 
 def extract_head_video(preprocessed_dir: Path, output_mp4: Path) -> dict:
