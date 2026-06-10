@@ -1026,12 +1026,13 @@ class MockPipelineTest(unittest.TestCase):
             COLLECTOR_ONLY_PRESET_ID,
             IPHONE2DEPLOY_PRESET_ID,
         ])
+        self.assertEqual(presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
         self.assertEqual(presets["iphone-default"]["prompt"], DEFAULT_PROMPT)
         self.assertEqual(presets["iphone-default"]["reference_images"], settings["reference_images"])
-        self.assertEqual(presets["collector-only"]["name"], "仅替换采集器")
+        self.assertEqual(presets["collector-only"]["name"], "头部视角-iphone-仅替换采集器")
         self.assertEqual(presets["collector-only"]["prompt"], COLLECTOR_ONLY_PROMPT)
         self.assertEqual(presets["collector-only"]["reference_images"], COLLECTOR_ONLY_REFERENCE_IMAGES)
-        self.assertEqual(presets["iphone2deploy"]["name"], "iphone2deploy")
+        self.assertEqual(presets["iphone2deploy"]["name"], "头部视角-iphone-参考overlap全替换")
         self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
         self.assertEqual(len(presets["iphone2deploy"]["reference_images"]), 4)
@@ -1065,6 +1066,9 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
         self.assertIn("collector-only", presets)
         self.assertIn("iphone2deploy", presets)
+        self.assertEqual(presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
+        self.assertEqual(presets["collector-only"]["name"], "头部视角-iphone-仅替换采集器")
+        self.assertEqual(presets["iphone2deploy"]["name"], "头部视角-iphone-参考overlap全替换")
         self.assertEqual(presets["collector-only"]["prompt"], COLLECTOR_ONLY_PROMPT)
         self.assertEqual(presets["collector-only"]["reference_images"], COLLECTOR_ONLY_REFERENCE_IMAGES)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
@@ -1293,10 +1297,59 @@ class MockPipelineTest(unittest.TestCase):
 
         self.assertEqual(settings["default_prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(settings["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
+        self.assertEqual(presets["iphone2deploy"]["name"], "头部视角-iphone-参考overlap全替换")
         self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
         self.assertEqual(persisted["default_prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(persisted["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+
+    def test_legacy_generation_preset_names_are_migrated(self) -> None:
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "default_prompt": DEFAULT_PROMPT,
+                    "reference_images": DEFAULT_SETTINGS["reference_images"],
+                    "default_generation_preset_id": "iphone-default",
+                    "generation_presets_version": GENERATION_PRESETS_VERSION,
+                    "generation_presets": [
+                        {
+                            "id": "iphone-default",
+                            "name": "iPhone 默认组合",
+                            "prompt": DEFAULT_PROMPT,
+                            "reference_images": DEFAULT_SETTINGS["reference_images"],
+                        },
+                        {
+                            "id": "collector-only",
+                            "name": "仅替换采集器",
+                            "prompt": COLLECTOR_ONLY_PROMPT,
+                            "reference_images": COLLECTOR_ONLY_REFERENCE_IMAGES,
+                        },
+                        {
+                            "id": "iphone2deploy",
+                            "name": "iphone2deploy",
+                            "prompt": IPHONE2DEPLOY_PROMPT,
+                            "reference_images": IPHONE2DEPLOY_REFERENCE_IMAGES,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        settings = load_settings()
+        persisted = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        presets = {item["id"]: item for item in settings["generation_presets"]}
+        persisted_presets = {item["id"]: item for item in persisted["generation_presets"]}
+
+        self.assertEqual(presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
+        self.assertEqual(presets["collector-only"]["name"], "头部视角-iphone-仅替换采集器")
+        self.assertEqual(presets["iphone2deploy"]["name"], "头部视角-iphone-参考overlap全替换")
+        self.assertEqual(persisted_presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
+        self.assertEqual(persisted_presets["collector-only"]["name"], "头部视角-iphone-仅替换采集器")
+        self.assertEqual(persisted_presets["iphone2deploy"]["name"], "头部视角-iphone-参考overlap全替换")
 
     def test_old_reference_image_names_are_migrated_to_iphone_names(self) -> None:
         save_settings(

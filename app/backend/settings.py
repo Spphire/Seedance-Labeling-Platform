@@ -80,27 +80,32 @@ LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
 COLLECTOR_ONLY_PRESET_ID = "collector-only"
 IPHONE2DEPLOY_PRESET_ID = "iphone2deploy"
-GENERATION_PRESETS_VERSION = 8
+GENERATION_PRESETS_VERSION = 9
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
-        "name": "iPhone 默认组合",
+        "name": "头部视角-iphone-仅替换机械臂",
         "prompt": DEFAULT_PROMPT,
         "reference_images": DEFAULT_REFERENCE_IMAGES,
     },
     {
         "id": COLLECTOR_ONLY_PRESET_ID,
-        "name": "仅替换采集器",
+        "name": "头部视角-iphone-仅替换采集器",
         "prompt": COLLECTOR_ONLY_PROMPT,
         "reference_images": COLLECTOR_ONLY_REFERENCE_IMAGES,
     },
     {
         "id": IPHONE2DEPLOY_PRESET_ID,
-        "name": "iphone2deploy",
+        "name": "头部视角-iphone-参考overlap全替换",
         "prompt": IPHONE2DEPLOY_PROMPT,
         "reference_images": IPHONE2DEPLOY_REFERENCE_IMAGES,
     },
 ]
+LEGACY_GENERATION_PRESET_NAMES = {
+    DEFAULT_GENERATION_PRESET_ID: {"iPhone 默认组合", "iphone默认组合"},
+    COLLECTOR_ONLY_PRESET_ID: {"仅替换采集器"},
+    IPHONE2DEPLOY_PRESET_ID: {"iphone2deploy"},
+}
 REFERENCE_IMAGE_RENAMES = {
     "app/reference_images/l-near.png": "app/reference_images/l-near-iphone.png",
     "app/reference_images/r-near.png": "app/reference_images/r-near-iphone.png",
@@ -319,6 +324,20 @@ def _migrate_iphone2deploy_preset(preset: dict[str, Any]) -> bool:
     return changed
 
 
+def _migrate_generation_preset_name(preset: dict[str, Any]) -> bool:
+    default_preset = _default_preset_by_id(str(preset.get("id") or ""))
+    if not default_preset:
+        return False
+    current = str(preset.get("name") or "").strip()
+    legacy_names = LEGACY_GENERATION_PRESET_NAMES.get(str(preset.get("id")), set())
+    if current and current not in legacy_names:
+        return False
+    if current == default_preset["name"]:
+        return False
+    preset["name"] = str(default_preset["name"])
+    return True
+
+
 def _normalize_generation_presets(data: dict[str, Any]) -> bool:
     changed = False
     default_prompt_present = "default_prompt" in data
@@ -360,6 +379,8 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
             "reference_images": refs,
         }
         if normalized != item:
+            changed = True
+        if _migrate_generation_preset_name(normalized):
             changed = True
         if _migrate_iphone2deploy_preset(normalized):
             changed = True

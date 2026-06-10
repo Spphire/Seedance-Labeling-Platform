@@ -997,7 +997,7 @@
         </div>
         <div class="field">
           <label for="presetName">组合名称</label>
-          <input id="presetName" placeholder="iPhone 默认组合">
+          <input id="presetName" placeholder="头部视角-iphone-仅替换机械臂">
         </div>
         <div class="field">
           <label for="defaultPrompt">组合 Prompt</label>
@@ -1483,7 +1483,7 @@
       const presets = Array.isArray(state.settings.generation_presets) ? state.settings.generation_presets : [];
       const fallback = [{
         id: "iphone-default",
-        name: "iPhone 默认组合",
+        name: "头部视角-iphone-仅替换机械臂",
         prompt: state.settings.default_prompt || "",
         reference_images: state.settings.reference_images || [],
       }];
