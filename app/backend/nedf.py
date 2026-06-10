@@ -73,7 +73,7 @@ def set_seedance_device_type(metadata: dict[str, Any], frame_count: int | None =
                 next_item = dict(item) if isinstance(item, dict) else item
                 if isinstance(next_item, dict) and index < len(positions):
                     if "head" in str(positions[index]).lower() or "ego" in str(positions[index]).lower():
-                        next_item.update({"frames": frame_count, "width": 760, "height": 570})
+                        next_item["frames"] = frame_count
                 updated_videos.append(next_item)
             extra["video"] = updated_videos
         metadata["extra"] = extra
@@ -104,6 +104,25 @@ def count_topic_messages(preprocessed_dir: Path, topic: str) -> int:
             for _, _, _ in reader.iter_messages(topics=[topic]):
                 count += 1
     return count
+
+
+def head_rgb_format(preprocessed_dir: Path, topic: str) -> dict[str, Any]:
+    for mcap_path in mcap_files(preprocessed_dir):
+        with mcap_path.open("rb") as f:
+            reader = make_reader(f)
+            for schema, _, message in reader.iter_messages(topics=[topic]):
+                image = parse_rgb_message(message.data, schema.name if schema else "")
+                if image.data or image.cols or image.rows:
+                    encoded_format = image.encoded_format or "h264"
+                    if encoded_format.lower() not in {"h264", "h.264"}:
+                        raise RuntimeError(f"unsupported head rgb encoding for export: {encoded_format}")
+                    return {
+                        "cols": int(image.cols or 760),
+                        "rows": int(image.rows or 570),
+                        "channels": int(image.channels or 3),
+                        "encoded_format": encoded_format,
+                    }
+    raise RuntimeError(f"cannot infer head rgb format for {topic}")
 
 
 def h264_start_codes(data: bytes) -> list[tuple[int, int]]:
@@ -142,9 +161,17 @@ def split_h264_access_units(data: bytes) -> list[bytes]:
     return chunks
 
 
-def encode_video_access_units(final_video: Path, frame_count: int, fps: float, tmp_dir: Path) -> list[bytes]:
+def encode_video_access_units(
+    final_video: Path,
+    frame_count: int,
+    fps: float,
+    tmp_dir: Path,
+    rgb_format: dict[str, Any],
+) -> list[bytes]:
     if frame_count <= 0:
         raise RuntimeError("head topic has no frames to replace")
+    width = int(rgb_format.get("cols") or 760)
+    height = int(rgb_format.get("rows") or 570)
     raw_h264 = tmp_dir / "seedance_final.raw.h264"
     stop_duration = max(1.0, frame_count / max(fps, 1.0) + 1.0)
     run_ffmpeg(
@@ -152,7 +179,7 @@ def encode_video_access_units(final_video: Path, frame_count: int, fps: float, t
             "-i",
             str(final_video),
             "-vf",
-            f"scale=760:570,setsar=1,fps={fps:.6f},tpad=stop_mode=clone:stop_duration={stop_duration:.6f}",
+            f"scale={width}:{height},setsar=1,fps={fps:.6f},tpad=stop_mode=clone:stop_duration={stop_duration:.6f}",
             "-frames:v",
             str(frame_count),
             "-an",
@@ -184,27 +211,38 @@ def update_metadata_payload(data: bytes, frame_count: int) -> bytes:
     return message.SerializeToString()
 
 
-def replace_rgb_payload(data: bytes, schema_name: str, frame_data: bytes) -> bytes:
+def replace_rgb_payload(data: bytes, schema_name: str, frame_data: bytes, rgb_format: dict[str, Any]) -> bytes:
+    cols = int(rgb_format.get("cols") or 760)
+    rows = int(rgb_format.get("rows") or 570)
+    channels = int(rgb_format.get("channels") or 3)
+    encoded_format = str(rgb_format.get("encoded_format") or "h264")
     if schema_name == "nmx.msg.RGBD":
         rgbd = RGBD()
         rgbd.ParseFromString(data)
         rgbd.rgb.data = frame_data
-        rgbd.rgb.encoded_format = "h264"
-        rgbd.rgb.cols = 760
-        rgbd.rgb.rows = 570
-        rgbd.rgb.channels = 3
+        rgbd.rgb.encoded_format = encoded_format
+        rgbd.rgb.cols = cols
+        rgbd.rgb.rows = rows
+        rgbd.rgb.channels = channels
         return rgbd.SerializeToString()
     image = Image()
     image.ParseFromString(data)
     image.data = frame_data
-    image.encoded_format = "h264"
-    image.cols = 760
-    image.rows = 570
-    image.channels = 3
+    image.encoded_format = encoded_format
+    image.cols = cols
+    image.rows = rows
+    image.channels = channels
     return image.SerializeToString()
 
 
-def rewrite_mcap_rgb_topic(mcap_path: Path, head_topic: str, frames: list[bytes], start_index: int, frame_count: int) -> int:
+def rewrite_mcap_rgb_topic(
+    mcap_path: Path,
+    head_topic: str,
+    frames: list[bytes],
+    start_index: int,
+    frame_count: int,
+    rgb_format: dict[str, Any],
+) -> int:
     temp_path = mcap_path.with_name(f".{mcap_path.name}.seedance-{int(time.time() * 1000)}.mcap")
     schema_ids: dict[int, int] = {}
     channel_ids: dict[int, int] = {}
@@ -230,7 +268,7 @@ def rewrite_mcap_rgb_topic(mcap_path: Path, head_topic: str, frames: list[bytes]
                 if channel.topic == head_topic:
                     if frame_index >= len(frames):
                         raise RuntimeError(f"not enough encoded frames for {head_topic}")
-                    data = replace_rgb_payload(data, schema_name, frames[frame_index])
+                    data = replace_rgb_payload(data, schema_name, frames[frame_index], rgb_format)
                     frame_index += 1
                 elif channel.topic == "nmx/nedf/metadata" and schema_name == "nmx.msg.Metadata":
                     data = update_metadata_payload(data, frame_count)
@@ -265,6 +303,7 @@ def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, ou
     head_topic, camera_id = choose_head_topic(metadata)
     frame_count = count_topic_messages(source_preprocessed, head_topic)
     fps = estimate_fps(source_preprocessed, head_topic)
+    rgb_format = head_rgb_format(source_preprocessed, head_topic)
     output_episode_dir.parent.mkdir(parents=True, exist_ok=True)
     temp_root = output_episode_dir.parent / f".{output_episode_dir.name}.exporting-{int(time.time() * 1000)}"
     if temp_root.exists():
@@ -278,10 +317,10 @@ def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, ou
             encoding="utf-8",
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            frames = encode_video_access_units(final_video_path, frame_count, fps, Path(tmpdir))
+            frames = encode_video_access_units(final_video_path, frame_count, fps, Path(tmpdir), rgb_format)
         next_index = 0
         for mcap_path in mcap_files(output_preprocessed):
-            next_index = rewrite_mcap_rgb_topic(mcap_path, head_topic, frames, next_index, frame_count)
+            next_index = rewrite_mcap_rgb_topic(mcap_path, head_topic, frames, next_index, frame_count, rgb_format)
         if next_index != frame_count:
             raise RuntimeError(f"replaced {next_index} head frames, expected {frame_count}")
         if output_episode_dir.exists():
@@ -297,6 +336,7 @@ def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, ou
         "camera_id": camera_id,
         "frame_count": frame_count,
         "fps": fps,
+        "rgb_format": rgb_format,
     }
 
 

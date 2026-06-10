@@ -369,8 +369,8 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(metadata["device_type"], "seedance")
         self.assertEqual(metadata["extra"]["device_type"], ["seedance"])
         self.assertEqual(metadata["extra"]["video"][0]["frames"], 12)
-        self.assertEqual(metadata["extra"]["video"][0]["width"], 760)
-        self.assertEqual(metadata["extra"]["video"][0]["height"], 570)
+        self.assertEqual(metadata["extra"]["video"][0]["width"], 1280)
+        self.assertEqual(metadata["extra"]["video"][0]["height"], 960)
 
         exported_mp4 = DATA_DIR / f"{uuid}_exported_head.mp4"
         extracted = extract_head_video(dataset_root / "preprocessed", exported_mp4)
@@ -379,6 +379,8 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(info["streams"][0]["codec_name"], "h264")
         self.assertEqual(info["streams"][0]["width"], 760)
         self.assertEqual(info["streams"][0]["height"], 570)
+        self.assertEqual(extracted["source_width"], 1280)
+        self.assertEqual(extracted["source_height"], 960)
 
     def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"
