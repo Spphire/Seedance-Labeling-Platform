@@ -334,6 +334,67 @@
       font-weight: 650;
     }
 
+    .block-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .block-head h2 {
+      margin: 0;
+    }
+
+    .filter-toggle {
+      min-height: 28px;
+      padding: 0 10px;
+      font-size: 12px;
+    }
+
+    .filter-toggle.active {
+      border-color: var(--accent);
+      background: var(--focus);
+      color: var(--accent);
+    }
+
+    .episode-filter-panel {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 10px;
+      padding: 9px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+
+    .episode-filter-panel.hidden {
+      display: none;
+    }
+
+    .episode-filter-panel input,
+    .episode-filter-panel select {
+      width: 100%;
+    }
+
+    .episode-filter-summary {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .episode-empty {
+      min-height: 88px;
+      display: grid;
+      place-items: center;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      padding: 12px;
+    }
+
     .row {
       display: flex;
       gap: 8px;
@@ -379,6 +440,11 @@
     .item.needs-attention {
       border-color: #f3c26b;
       background: #fffaf0;
+    }
+
+    .item.focused {
+      border-color: var(--accent);
+      box-shadow: inset 3px 0 0 var(--accent);
     }
 
     .item-title {
@@ -460,6 +526,12 @@
     .episode-actions a:hover,
     .episode-actions button:hover {
       border-color: var(--accent);
+    }
+
+    .episode-actions button.active {
+      border-color: var(--accent);
+      background: var(--focus);
+      color: var(--accent);
     }
 
     .tabs {
@@ -621,6 +693,20 @@
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
+    }
+
+    .playback-control {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .playback-control select {
+      min-width: 68px;
+      padding: 7px 9px;
     }
 
     .videos {
@@ -1032,7 +1118,29 @@
       </section>
 
       <section class="block">
-        <h2>Episodes</h2>
+        <div class="block-head">
+          <h2>Episodes</h2>
+          <button id="episodeFilterToggle" class="filter-toggle" type="button">筛选</button>
+        </div>
+        <div id="episodeFilterPanel" class="episode-filter-panel hidden">
+          <input id="episodeSearch" placeholder="搜索 episode UUID">
+          <select id="episodeFilterMode">
+            <option value="all">全部 episode</option>
+            <option value="focused">我的专注批次</option>
+            <option value="mine">我锁定的</option>
+            <option value="available">可处理</option>
+            <option value="review">待审核</option>
+            <option value="pending">待生成</option>
+            <option value="running">生成/合成中</option>
+            <option value="attention">失败/需处理</option>
+            <option value="complete">已完成</option>
+          </select>
+          <div id="episodeFilterSummary" class="episode-filter-summary"></div>
+          <div class="row">
+            <button id="episodeFocusOnly" type="button">只看专注批次</button>
+            <button id="episodeFilterClear" type="button">清空筛选</button>
+          </div>
+        </div>
         <div id="episodeList" class="episode-list"></div>
       </section>
 
@@ -1077,10 +1185,17 @@
       runPresetId: "",
       anchorDrafts: {},
       anchorStatus: {},
+      playbackSpeed: 2,
+      episodeFilterOpen: false,
+      episodeFilterMode: "all",
+      episodeSearch: "",
+      focusedEpisodeUuids: [],
     };
 
     const $ = (id) => document.getElementById(id);
     const statusEl = $("status");
+    const PLAYBACK_SPEEDS = [1, 2, 3, 5, 10];
+    const FOCUSED_EPISODES_STORAGE_PREFIX = "seedance_focused_episodes_";
     window.__seedanceState = state;
 
     function initIdentity() {
@@ -1097,6 +1212,7 @@
       state.clientId = clientId;
       state.reviewerName = reviewerName;
       $("reviewerName").value = reviewerName;
+      loadFocusedEpisodes();
     }
 
     function updateReviewerName(value) {
@@ -1108,6 +1224,54 @@
 
     function operatorPayload() {
       return { operator_id: state.clientId, operator_name: state.reviewerName };
+    }
+
+    function focusedEpisodesStorageKey() {
+      return `${FOCUSED_EPISODES_STORAGE_PREFIX}${state.clientId || "anonymous"}`;
+    }
+
+    function normalizeUuidList(values) {
+      return [...new Set((values || [])
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean))];
+    }
+
+    function loadFocusedEpisodes() {
+      try {
+        state.focusedEpisodeUuids = normalizeUuidList(JSON.parse(localStorage.getItem(focusedEpisodesStorageKey()) || "[]"));
+      } catch {
+        state.focusedEpisodeUuids = [];
+      }
+    }
+
+    function saveFocusedEpisodes() {
+      try {
+        localStorage.setItem(focusedEpisodesStorageKey(), JSON.stringify(state.focusedEpisodeUuids));
+      } catch {
+        // Local storage can be unavailable in restrictive browser modes; filtering still works in memory.
+      }
+    }
+
+    function focusedEpisodeSet() {
+      return new Set(state.focusedEpisodeUuids);
+    }
+
+    function isFocusedEpisode(uuid) {
+      return focusedEpisodeSet().has(String(uuid || "").toLowerCase());
+    }
+
+    function toggleFocusedEpisode(uuid) {
+      const normalized = String(uuid || "").toLowerCase();
+      if (!normalized) return;
+      const focused = focusedEpisodeSet();
+      if (focused.has(normalized)) {
+        focused.delete(normalized);
+      } else {
+        focused.add(normalized);
+      }
+      state.focusedEpisodeUuids = [...focused];
+      saveFocusedEpisodes();
+      renderEpisodes();
     }
 
     function generationContentPayload() {
@@ -1439,6 +1603,13 @@
 
     function episodeBadges(episode) {
       const values = [badge(episode.status || "unknown")];
+      if (isFocusedEpisode(episode.uuid)) {
+        values.push(badge("ready", "专注"));
+      }
+      const lock = episodeLock(episode);
+      if (lock) {
+        values.push(badge(isMine(lock) ? "generated" : "locked", isMine(lock) ? "我锁定" : `${lock.owner_name || "其他人"}锁定`));
+      }
       if (episode.preprocess_health === "damaged") {
         values.push(badge("damaged", "损坏"));
       }
@@ -1990,6 +2161,7 @@
     function episodeClass(episode) {
       const classes = ["item"];
       if (state.selectedEpisode === episode.uuid) classes.push("active");
+      if (isFocusedEpisode(episode.uuid)) classes.push("focused");
       if (episode.final_status === "stitching" || episode.preview_status === "stitching") classes.push("stitching");
       if (episode.final_status === "ready") classes.push("final-ready");
       if (episode.generated_failed_clip_count || episode.flagged_clip_count || episode.rejected_clip_count || episode.preprocess_health === "damaged") {
@@ -2035,13 +2207,100 @@
       }, delay);
     }
 
+    function episodeLock(episode) {
+      if (episode.lock) return episode.lock;
+      return (state.locks || []).find((lock) =>
+        lock.resource_type === "episode" && String(lock.resource_id) === String(episode.uuid)
+      ) || null;
+    }
+
+    function episodeLockedByOther(episode) {
+      const lock = episodeLock(episode);
+      return !!lock && !isMine(lock);
+    }
+
+    function episodeMatchesSearch(episode) {
+      const query = state.episodeSearch.trim().toLowerCase();
+      if (!query) return true;
+      return [
+        episode.uuid,
+        shortUuid(episode.uuid),
+        episodeStage(episode),
+        episode.status,
+        episode.final_status,
+        episode.preview_status,
+        episode.continuity_state,
+      ].some((value) => String(value || "").toLowerCase().includes(query));
+    }
+
+    function episodeMatchesFilter(episode) {
+      const mode = state.episodeFilterMode || "all";
+      const mine = isMine(episodeLock(episode)) || !!myEpisodeLock(episode.uuid);
+      const reviewCount = Number(episode.generated_clip_count || 0)
+        + Number(episode.flagged_clip_count || 0)
+        + Number(episode.rejected_clip_count || 0);
+      if (mode === "focused") return isFocusedEpisode(episode.uuid);
+      if (mode === "mine") return mine;
+      if (mode === "available") {
+        return episode.status === "preprocessed" && episode.final_status !== "ready" && !episodeLockedByOther(episode);
+      }
+      if (mode === "review") return reviewCount > 0;
+      if (mode === "pending") return Number(episode.pending_clip_count || 0) > 0;
+      if (mode === "running") {
+        return episode.status === "preprocessing"
+          || Number(episode.generating_clip_count || 0) > 0
+          || episode.final_status === "stitching"
+          || episode.preview_status === "stitching";
+      }
+      if (mode === "attention") {
+        return Number(episode.generated_failed_clip_count || 0) > 0
+          || Number(episode.flagged_clip_count || 0) > 0
+          || Number(episode.rejected_clip_count || 0) > 0
+          || episode.preprocess_health === "damaged"
+          || episode.final_status === "failed"
+          || episode.preview_status === "failed";
+      }
+      if (mode === "complete") return episode.final_status === "ready";
+      return true;
+    }
+
+    function filteredEpisodes() {
+      return state.episodes.filter((episode) => episodeMatchesSearch(episode) && episodeMatchesFilter(episode));
+    }
+
+    function renderEpisodeFilterControls(filteredCount) {
+      const toggle = $("episodeFilterToggle");
+      const panel = $("episodeFilterPanel");
+      const search = $("episodeSearch");
+      const mode = $("episodeFilterMode");
+      const summary = $("episodeFilterSummary");
+      const total = state.episodes.length;
+      const focusedInList = state.focusedEpisodeUuids.filter((uuid) =>
+        state.episodes.some((episode) => String(episode.uuid).toLowerCase() === uuid)
+      ).length;
+      const hasFilter = state.episodeFilterMode !== "all" || !!state.episodeSearch.trim();
+      toggle.classList.toggle("active", state.episodeFilterOpen || hasFilter);
+      toggle.textContent = hasFilter ? `筛选 ${filteredCount}/${total}` : "筛选";
+      panel.classList.toggle("hidden", !state.episodeFilterOpen);
+      search.value = state.episodeSearch;
+      mode.value = state.episodeFilterMode;
+      summary.textContent = `当前显示 ${filteredCount}/${total} 个 episode；专注批次 ${focusedInList} 个。`;
+    }
+
     function renderEpisodes() {
       const target = $("episodeList");
       target.innerHTML = "";
-      state.episodes.forEach((episode) => {
+      const episodes = filteredEpisodes();
+      renderEpisodeFilterControls(episodes.length);
+      if (!episodes.length) {
+        target.innerHTML = `<div class="episode-empty">没有符合条件的 episode。可以清空筛选，或把目标 episode 加入专注批次。</div>`;
+        return;
+      }
+      episodes.forEach((episode) => {
         const accepted = episode.accepted_clip_count || 0;
         const total = episode.clip_count || 0;
         const progress = pct(accepted, total);
+        const focused = isFocusedEpisode(episode.uuid);
         const div = document.createElement("div");
         div.className = episodeClass(episode);
         div.innerHTML = `
@@ -2051,6 +2310,7 @@
           <div class="episode-facts">${episodeFacts(episode).map((fact) => `<span class="badge">${fact}</span>`).join("")}</div>
           <div class="meta">${episode.uuid}</div>
           <div class="episode-actions">
+            <button data-episode-focus="${episode.uuid}" class="${focused ? "active" : ""}">${focused ? "移出专注" : "加入专注"}</button>
             ${episode.final_url ? `<a href="${episode.final_url}" target="_blank" rel="noreferrer">打开 final</a>` : ""}
             ${episode.preview_status === "ready" && episode.preview_url && episode.final_status !== "ready" ? `<a href="${episode.preview_url}" target="_blank" rel="noreferrer">打开 preview</a>` : ""}
             ${total && accepted === total && episode.final_status !== "stitching" ? `<button data-episode-stitch="${episode.uuid}">重新合成</button>` : ""}
@@ -2060,6 +2320,12 @@
           state.selectedEpisode = state.selectedEpisode === episode.uuid ? null : episode.uuid;
           state.activeClipId = null;
           render({ forceWorkspace: true });
+        });
+        div.querySelectorAll("[data-episode-focus]").forEach((button) => {
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            toggleFocusedEpisode(button.dataset.episodeFocus);
+          });
         });
         div.querySelectorAll("[data-episode-stitch]").forEach((button) => {
           button.addEventListener("click", async (event) => {
@@ -2502,6 +2768,7 @@
             <div class="meta" data-live="workspace-meta">${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
           </div>
           <div class="actions">
+            ${renderPlaybackSpeedControl()}
             <button class="good" data-action="accept" ${generated && canEdit && !isGenerating ? "" : "disabled"}>保留</button>
             <button class="bad" data-action="reject" ${canEdit && !isGenerating ? "" : "disabled"}>丢弃</button>
             <button data-action="rerun" ${canEdit && !isGenerating ? "" : "disabled"}>重跑</button>
@@ -2568,6 +2835,9 @@
             <h2>${shortUuid(episode.uuid)} · episode</h2>
             <div class="meta">${episode.uuid} · ${episodeStage(episode)}</div>
           </div>
+          <div class="actions">
+            ${renderPlaybackSpeedControl()}
+          </div>
         </div>
         <div class="videos">
           <div class="video-pane">
@@ -2598,6 +2868,46 @@
       if (runningText && job && job.status === "running") {
         runningText.textContent = `Seedance 处理中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。`;
       }
+    }
+
+    function renderPlaybackSpeedControl() {
+      const options = PLAYBACK_SPEEDS.map((speed) => (
+        `<option value="${speed}" ${speed === state.playbackSpeed ? "selected" : ""}>x${speed}</option>`
+      )).join("");
+      return `
+        <label class="playback-control">
+          播放速度
+          <select id="playbackSpeedSelect" aria-label="播放速度">${options}</select>
+        </label>
+      `;
+    }
+
+    function updatePlaybackSpeedControl(speed) {
+      const select = $("playbackSpeedSelect");
+      if (select && PLAYBACK_SPEEDS.includes(speed)) {
+        select.value = String(speed);
+      }
+    }
+
+    function applyPlaybackSpeed(videos, speed = state.playbackSpeed) {
+      videos.forEach((video) => {
+        if (video.playbackRate !== speed) {
+          video.playbackRate = speed;
+        }
+      });
+      updatePlaybackSpeedControl(speed);
+    }
+
+    function wirePlaybackSpeedControl(videos) {
+      const select = $("playbackSpeedSelect");
+      if (!select) return;
+      updatePlaybackSpeedControl(state.playbackSpeed);
+      select.addEventListener("change", () => {
+        const speed = Number.parseFloat(select.value);
+        if (!PLAYBACK_SPEEDS.includes(speed)) return;
+        state.playbackSpeed = speed;
+        applyPlaybackSpeed(videos, speed);
+      });
     }
 
     function renderClipLockNotice(clip, canEdit) {
@@ -2667,7 +2977,10 @@
     function wireSync() {
       const original = $("originalVideo");
       const generated = $("generatedVideo");
-      const pair = [original, generated].filter((video) => video && (video.currentSrc || video.getAttribute("src")));
+      const videos = [original, generated].filter(Boolean);
+      wirePlaybackSpeedControl(videos);
+      applyPlaybackSpeed(videos);
+      const pair = videos.filter((video) => video.currentSrc || video.getAttribute("src"));
       if (pair.length < 2) return;
 
       let syncing = false;
@@ -2739,6 +3052,10 @@
           if (syncing) return;
           syncing = true;
           syncPlaybackRate(video);
+          if (PLAYBACK_SPEEDS.includes(video.playbackRate)) {
+            state.playbackSpeed = video.playbackRate;
+            updatePlaybackSpeedControl(video.playbackRate);
+          }
           unlock();
         });
         video.addEventListener("timeupdate", () => {
@@ -2831,6 +3148,28 @@
 
     $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
+    $("episodeFilterToggle").addEventListener("click", () => {
+      state.episodeFilterOpen = !state.episodeFilterOpen;
+      renderEpisodes();
+    });
+    $("episodeSearch").addEventListener("input", () => {
+      state.episodeSearch = $("episodeSearch").value;
+      renderEpisodes();
+    });
+    $("episodeFilterMode").addEventListener("change", () => {
+      state.episodeFilterMode = $("episodeFilterMode").value || "all";
+      renderEpisodes();
+    });
+    $("episodeFocusOnly").addEventListener("click", () => {
+      state.episodeFilterOpen = true;
+      state.episodeFilterMode = "focused";
+      renderEpisodes();
+    });
+    $("episodeFilterClear").addEventListener("click", () => {
+      state.episodeSearch = "";
+      state.episodeFilterMode = "all";
+      renderEpisodes();
+    });
     $("generationMode").addEventListener("change", updateRunSettingsSummary);
     $("runPrompt").addEventListener("input", updateRunSettingsSummary);
     $("runPresetSelect").addEventListener("change", () => applyRunPreset($("runPresetSelect").value));
