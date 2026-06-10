@@ -63,7 +63,12 @@ class MockPipelineTest(unittest.TestCase):
             backend_services._STITCHING_EPISODES.clear()
         with backend_services._GENERATION_CONDITION:
             backend_services._SEEDANCE_KEY_ACTIVE.clear()
+            backend_services._SEEDANCE_KEY_LEASES.clear()
             backend_services._GENERATION_ACTIVE = 0
+        with backend_services._GENERATION_WORKER_LOCK:
+            backend_services._GENERATION_WORKER_JOB_IDS.clear()
+            backend_services._GENERATION_WORKER_TOKENS.clear()
+            backend_services._GENERATION_WORKER_KEY_SLOTS.clear()
         save_settings(dict(DEFAULT_SETTINGS))
         self.unlink_with_retry(DB_PATH)
         for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR]:
@@ -1552,6 +1557,25 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {})
         self.assertEqual(backend_services._GENERATION_ACTIVE, 0)
 
+    def test_seedance_key_slot_lease_ignores_late_double_release(self) -> None:
+        settings = {
+            "seedance_api_key_pool": [
+                {"id": "key-a", "name": "A", "api_key": "secret-a", "concurrency": 1, "enabled": True},
+            ]
+        }
+
+        old_slot = backend_services.acquire_seedance_key_slot(settings)
+        backend_services.release_seedance_key_slot(old_slot)
+        new_slot = backend_services.acquire_seedance_key_slot(settings)
+
+        backend_services.release_seedance_key_slot(old_slot)
+
+        self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {"key-a": 1})
+        self.assertEqual(backend_services._GENERATION_ACTIVE, 1)
+        backend_services.release_seedance_key_slot(new_slot)
+        self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {})
+        self.assertEqual(backend_services._GENERATION_ACTIVE, 0)
+
     def test_old_mock_timing_is_migrated_to_fast_default(self) -> None:
         SETTINGS_PATH.write_text(json.dumps({"mock_seconds_per_video_second": 24}, ensure_ascii=False), encoding="utf-8")
 
@@ -1696,6 +1720,106 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(db.one("SELECT status FROM generation_jobs WHERE id=?", (job_id,))["status"], "running")
         self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generating")
 
+    def test_watchdog_recovers_stale_active_seedance_job_with_existing_task(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000038"
+        now = db.now()
+        stale_at = now - backend_services.GENERATION_STALE_RUNNING_SEC - 10
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='generating' WHERE id=?", (clips[0]["id"],))
+            cur = conn.execute(
+                """
+                INSERT INTO generation_jobs(
+                    clip_id, mode, requested_duration_sec, task_id, status, retry_count,
+                    started_at, created_at, updated_at
+                )
+                VALUES (?, 'seedance', 5, 'cgt-existing', 'running', 0, ?, ?, ?)
+                """,
+                (clips[0]["id"], now, now, stale_at),
+            )
+            job_id = cur.lastrowid
+
+        worker_token = backend_services.begin_generation_worker(job_id)
+        self.assertIsNotNone(worker_token)
+        settings = {
+            "seedance_api_key_pool": [
+                {"id": "key-a", "name": "A", "api_key": "secret-a", "concurrency": 1, "enabled": True},
+            ]
+        }
+        key_slot = backend_services.acquire_seedance_key_slot(settings)
+        backend_services.set_generation_worker_key_slot(job_id, worker_token or "", key_slot)
+
+        with patch.object(backend_services._GENERATION_EXECUTOR, "submit") as submit:
+            recovered = backend_services.recover_interrupted_generation_jobs(
+                stale_after_sec=backend_services.GENERATION_STALE_RUNNING_SEC,
+                recover_stale_active=True,
+            )
+
+        self.assertEqual(recovered, {"resumed": [job_id], "failed": []})
+        submit.assert_called_once_with(backend_services.seedance_job_worker, job_id)
+        self.assertFalse(backend_services.generation_worker_is_active(job_id))
+        self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {})
+        self.assertEqual(backend_services._GENERATION_ACTIVE, 0)
+        self.assertGreater(db.one("SELECT updated_at FROM generation_jobs WHERE id=?", (job_id,))["updated_at"], stale_at)
+        backend_services.release_seedance_key_slot(key_slot)
+        self.assertEqual(backend_services._SEEDANCE_KEY_ACTIVE, {})
+        self.assertEqual(backend_services._GENERATION_ACTIVE, 0)
+
+    def test_watchdog_does_not_resubmit_active_seedance_job_without_task_id(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000039"
+        now = db.now()
+        stale_at = now - backend_services.GENERATION_STALE_RUNNING_SEC - 10
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='generating' WHERE id=?", (clips[0]["id"],))
+            cur = conn.execute(
+                """
+                INSERT INTO generation_jobs(
+                    clip_id, mode, requested_duration_sec, status, retry_count,
+                    started_at, created_at, updated_at
+                )
+                VALUES (?, 'seedance', 5, 'running', 0, ?, ?, ?)
+                """,
+                (clips[0]["id"], now, now, stale_at),
+            )
+            job_id = cur.lastrowid
+
+        worker_token = backend_services.begin_generation_worker(job_id)
+        self.assertIsNotNone(worker_token)
+        try:
+            with patch.object(backend_services._GENERATION_EXECUTOR, "submit") as submit:
+                recovered = backend_services.recover_interrupted_generation_jobs(
+                    stale_after_sec=backend_services.GENERATION_STALE_RUNNING_SEC,
+                    recover_stale_active=True,
+                )
+
+            self.assertEqual(recovered, {"resumed": [], "failed": []})
+            submit.assert_not_called()
+            self.assertTrue(backend_services.generation_worker_is_active(job_id))
+            self.assertEqual(db.one("SELECT status FROM generation_jobs WHERE id=?", (job_id,))["status"], "running")
+        finally:
+            backend_services.end_generation_worker(job_id, worker_token)
+
     def test_recover_interrupted_unsubmitted_job_marks_failed(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000036"
         now = db.now()
@@ -1776,6 +1900,39 @@ class MockPipelineTest(unittest.TestCase):
         self.assertIsNone(job["completed_at"])
         self.assertEqual(job["retry_count"], 1)
         self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generating")
+
+    def test_fail_generation_job_does_not_overwrite_succeeded_job(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000040"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5.0)
+        clips = create_clips(uuid, head, 5.0)
+        with db.connect() as conn:
+            conn.execute("UPDATE clips SET status='generated' WHERE id=?", (clips[0]["id"],))
+            cur = conn.execute(
+                """
+                INSERT INTO generation_jobs(
+                    clip_id, mode, requested_duration_sec, task_id, status, retry_count,
+                    started_at, completed_at, created_at, updated_at
+                )
+                VALUES (?, 'seedance', 5, 'cgt-existing', 'succeeded', 0, ?, ?, ?, ?)
+                """,
+                (clips[0]["id"], now, now, now, now),
+            )
+            job_id = cur.lastrowid
+
+        backend_services.fail_generation_job(job_id, int(clips[0]["id"]), "late stale worker error")
+
+        self.assertEqual(db.one("SELECT status FROM generation_jobs WHERE id=?", (job_id,))["status"], "succeeded")
+        self.assertEqual(db.one("SELECT status FROM clips WHERE id=?", (clips[0]["id"],))["status"], "generated")
 
     def test_fetch_episode_uses_local_mount_without_copying(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000010"

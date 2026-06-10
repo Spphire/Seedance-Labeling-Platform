@@ -55,8 +55,11 @@ _GENERATION_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="se
 _GENERATION_CONDITION = threading.Condition()
 _GENERATION_ACTIVE = 0
 _SEEDANCE_KEY_ACTIVE: dict[str, int] = {}
+_SEEDANCE_KEY_LEASES: dict[str, str] = {}
 _GENERATION_WORKER_LOCK = threading.Lock()
 _GENERATION_WORKER_JOB_IDS: set[int] = set()
+_GENERATION_WORKER_TOKENS: dict[int, str] = {}
+_GENERATION_WORKER_KEY_SLOTS: dict[int, dict[str, Any]] = {}
 _GENERATION_WATCHDOG_STARTED = False
 GENERATION_CANDIDATE_STATUSES = ("pending", "generated_failed", "rejected")
 GENERATION_CANDIDATE_STATUS_PLACEHOLDERS = ",".join("?" for _ in GENERATION_CANDIDATE_STATUSES)
@@ -2267,7 +2270,8 @@ def mock_job_worker(job_id: int) -> None:
 
 
 def seedance_job_worker(job_id: int) -> None:
-    if not begin_generation_worker(job_id):
+    worker_token = begin_generation_worker(job_id)
+    if not worker_token:
         return
     key_slot: dict[str, Any] | None = None
     job: dict[str, Any] | None = None
@@ -2293,6 +2297,7 @@ def seedance_job_worker(job_id: int) -> None:
         out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
         heartbeat = generation_job_heartbeat(job_id)
         key_slot = acquire_seedance_key_slot(settings)
+        set_generation_worker_key_slot(job_id, worker_token, key_slot)
         client = SeedanceClient({**settings, "seedance_api_key": key_slot["api_key"]})
         job["api_key_id"] = key_slot["id"]
         job["api_key_name"] = key_slot["name"]
@@ -2328,40 +2333,83 @@ def seedance_job_worker(job_id: int) -> None:
         )
         with db.connect() as conn:
             now = db.now()
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE generation_jobs
                 SET status='succeeded', output_url=?, output_path=?, error=NULL, completed_at=?, updated_at=?
-                WHERE id=?
+                WHERE id=? AND status='running'
                 """,
                 (data["output_url"], str(out_path.resolve()), now, now, job_id),
             )
-            conn.execute("UPDATE clips SET status='generated', updated_at=? WHERE id=? AND status='generating'", (now, job["clip_id"]))
+            if cur.rowcount:
+                conn.execute("UPDATE clips SET status='generated', updated_at=? WHERE id=? AND status='generating'", (now, job["clip_id"]))
     except Exception as exc:
         if job and job.get("task_id"):
             update_seedance_api_call(job, "failed", task_id=job.get("task_id"), error=str(exc))
         fail_generation_job(job_id, int(job["clip_id"]) if job else 0, str(exc))
     finally:
         release_seedance_key_slot(key_slot)
-        end_generation_worker(job_id)
+        clear_generation_worker_key_slot(job_id, worker_token, key_slot)
+        end_generation_worker(job_id, worker_token)
 
 
-def begin_generation_worker(job_id: int) -> bool:
+def begin_generation_worker(job_id: int) -> str | None:
     with _GENERATION_WORKER_LOCK:
         if job_id in _GENERATION_WORKER_JOB_IDS:
-            return False
+            return None
+        worker_token = secrets.token_hex(12)
         _GENERATION_WORKER_JOB_IDS.add(job_id)
-        return True
+        _GENERATION_WORKER_TOKENS[job_id] = worker_token
+        return worker_token
 
 
-def end_generation_worker(job_id: int) -> None:
+def end_generation_worker(job_id: int, worker_token: str | None = None) -> None:
     with _GENERATION_WORKER_LOCK:
+        if worker_token is not None and _GENERATION_WORKER_TOKENS.get(job_id) != worker_token:
+            return
         _GENERATION_WORKER_JOB_IDS.discard(job_id)
+        _GENERATION_WORKER_TOKENS.pop(job_id, None)
+        _GENERATION_WORKER_KEY_SLOTS.pop(job_id, None)
 
 
 def generation_worker_is_active(job_id: int) -> bool:
     with _GENERATION_WORKER_LOCK:
         return job_id in _GENERATION_WORKER_JOB_IDS
+
+
+def set_generation_worker_key_slot(job_id: int, worker_token: str, key_slot: dict[str, Any]) -> None:
+    with _GENERATION_WORKER_LOCK:
+        if _GENERATION_WORKER_TOKENS.get(job_id) != worker_token:
+            return
+        _GENERATION_WORKER_KEY_SLOTS[job_id] = {
+            "id": key_slot.get("id"),
+            "name": key_slot.get("name"),
+            "__lease_id": key_slot.get("__lease_id"),
+        }
+
+
+def clear_generation_worker_key_slot(job_id: int, worker_token: str, key_slot: dict[str, Any] | None = None) -> None:
+    with _GENERATION_WORKER_LOCK:
+        if _GENERATION_WORKER_TOKENS.get(job_id) != worker_token:
+            return
+        if key_slot is None:
+            _GENERATION_WORKER_KEY_SLOTS.pop(job_id, None)
+            return
+        current = _GENERATION_WORKER_KEY_SLOTS.get(job_id)
+        if current and current.get("__lease_id") == key_slot.get("__lease_id"):
+            _GENERATION_WORKER_KEY_SLOTS.pop(job_id, None)
+
+
+def revoke_generation_worker(job_id: int) -> bool:
+    key_slot: dict[str, Any] | None = None
+    with _GENERATION_WORKER_LOCK:
+        if job_id not in _GENERATION_WORKER_JOB_IDS:
+            return False
+        _GENERATION_WORKER_JOB_IDS.discard(job_id)
+        _GENERATION_WORKER_TOKENS.pop(job_id, None)
+        key_slot = _GENERATION_WORKER_KEY_SLOTS.pop(job_id, None)
+    release_seedance_key_slot(key_slot)
+    return True
 
 
 def generation_job_heartbeat(job_id: int, min_interval_sec: float = 5.0) -> Callable[[], None]:
@@ -2405,9 +2453,11 @@ def acquire_seedance_key_slot(settings: dict[str, Any]) -> dict[str, Any]:
             if available:
                 _, _, chosen = min(available, key=lambda value: (value[0], value[1], str(value[2]["id"])))
                 key_id = str(chosen["id"])
+                lease_id = secrets.token_hex(12)
+                _SEEDANCE_KEY_LEASES[lease_id] = key_id
                 _SEEDANCE_KEY_ACTIVE[key_id] = _SEEDANCE_KEY_ACTIVE.get(key_id, 0) + 1
                 _GENERATION_ACTIVE += 1
-                return dict(chosen)
+                return {**dict(chosen), "__lease_id": lease_id}
             _GENERATION_CONDITION.wait(timeout=5)
 
 
@@ -2418,6 +2468,12 @@ def release_seedance_key_slot(key_slot: dict[str, Any] | None) -> None:
             _GENERATION_CONDITION.notify_all()
             return
         key_id = str(key_slot.get("id") or "")
+        lease_id = str(key_slot.get("__lease_id") or "")
+        if lease_id:
+            if _SEEDANCE_KEY_LEASES.get(lease_id) != key_id:
+                _GENERATION_CONDITION.notify_all()
+                return
+            _SEEDANCE_KEY_LEASES.pop(lease_id, None)
         if key_id:
             next_active = max(0, _SEEDANCE_KEY_ACTIVE.get(key_id, 0) - 1)
             if next_active:
@@ -2431,14 +2487,19 @@ def release_seedance_key_slot(key_slot: dict[str, Any] | None) -> None:
 def fail_generation_job(job_id: int, clip_id: int, error: str) -> None:
     with db.connect() as conn:
         now = db.now()
-        conn.execute(
-            "UPDATE generation_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=?",
+        cur = conn.execute(
+            "UPDATE generation_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=? AND status='running'",
             (error, now, now, job_id),
         )
-        conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=? AND status='generating'", (now, clip_id))
+        if cur.rowcount:
+            conn.execute("UPDATE clips SET status='generated_failed', updated_at=? WHERE id=? AND status='generating'", (now, clip_id))
 
 
-def recover_interrupted_generation_jobs(stale_after_sec: float = 0.0, include_download_failures: bool = False) -> dict[str, list[int]]:
+def recover_interrupted_generation_jobs(
+    stale_after_sec: float = 0.0,
+    include_download_failures: bool = False,
+    recover_stale_active: bool = False,
+) -> dict[str, list[int]]:
     now = db.now()
     running_jobs = db.rows(
         """
@@ -2480,6 +2541,15 @@ def recover_interrupted_generation_jobs(stale_after_sec: float = 0.0, include_do
         job_id = int(job["id"])
         clip_id = int(job["clip_id"])
         if generation_worker_is_active(job_id):
+            if recover_stale_active and job.get("mode") == "seedance" and job.get("task_id"):
+                if revoke_generation_worker(job_id):
+                    with db.connect() as conn:
+                        conn.execute(
+                            "UPDATE generation_jobs SET updated_at=? WHERE id=? AND status='running'",
+                            (db.now(), job_id),
+                        )
+                    _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)
+                    resumed.append(job_id)
             continue
         if job.get("mode") == "seedance" and job.get("task_id"):
             _GENERATION_EXECUTOR.submit(seedance_job_worker, job_id)
@@ -2529,6 +2599,7 @@ def generation_watchdog_loop() -> None:
             recover_interrupted_generation_jobs(
                 stale_after_sec=GENERATION_STALE_RUNNING_SEC,
                 include_download_failures=True,
+                recover_stale_active=True,
             )
         except Exception:
             pass
