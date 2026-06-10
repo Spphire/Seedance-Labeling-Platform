@@ -53,30 +53,9 @@ def estimate_fps(preprocessed_dir: Path, topic: str) -> float:
     return 30.0
 
 
-def set_seedance_device_type(metadata: dict[str, Any], frame_count: int | None = None) -> dict[str, Any]:
+def set_seedance_collection_mode(metadata: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(metadata)
-    metadata["devicetype"] = "seedance"
-    metadata["device_type"] = "seedance"
-    extra = metadata.get("extra")
-    if isinstance(extra, dict):
-        extra = dict(extra)
-        value = extra.get("device_type")
-        if isinstance(value, list):
-            extra["device_type"] = ["seedance" for _ in value]
-        else:
-            extra["device_type"] = "seedance"
-        positions = extra.get("camera_position")
-        videos = extra.get("video")
-        if frame_count is not None and isinstance(positions, list) and isinstance(videos, list):
-            updated_videos = []
-            for index, item in enumerate(videos):
-                next_item = dict(item) if isinstance(item, dict) else item
-                if isinstance(next_item, dict) and index < len(positions):
-                    if "head" in str(positions[index]).lower() or "ego" in str(positions[index]).lower():
-                        next_item["frames"] = frame_count
-                updated_videos.append(next_item)
-            extra["video"] = updated_videos
-        metadata["extra"] = extra
+    metadata["collection_mode"] = "seedance"
     return metadata
 
 
@@ -207,7 +186,7 @@ def update_metadata_payload(data: bytes, frame_count: int) -> bytes:
         payload = json.loads(message.metadata.decode("utf-8"))
     except Exception:
         return data
-    message.metadata = json.dumps(set_seedance_device_type(payload, frame_count), ensure_ascii=False).encode("utf-8")
+    message.metadata = json.dumps(set_seedance_collection_mode(payload), ensure_ascii=False).encode("utf-8")
     return message.SerializeToString()
 
 
@@ -313,7 +292,7 @@ def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, ou
         output_preprocessed = temp_root / "preprocessed"
         metadata_path = output_preprocessed / "metadata.json"
         metadata_path.write_text(
-            json.dumps(set_seedance_device_type(metadata, frame_count), ensure_ascii=False, indent=2),
+            json.dumps(set_seedance_collection_mode(metadata), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         with tempfile.TemporaryDirectory() as tmpdir:

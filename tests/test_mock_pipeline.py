@@ -220,6 +220,7 @@ class MockPipelineTest(unittest.TestCase):
         head_topic = "nmx/hal/camera/camera_2/rgbd"
         metadata = {
             "data_format": "NEDF3",
+            "collection_mode": "teleop",
             "camera_info": {"camera_2": "head"},
             "record_topic_list": ["nmx/nedf/metadata", head_topic],
             "extra": {
@@ -365,9 +366,10 @@ class MockPipelineTest(unittest.TestCase):
         dataset_root = Path(episode["final_dataset_path"])
         self.assertTrue(dataset_root.exists())
         metadata = json.loads((dataset_root / "preprocessed" / "metadata.json").read_text(encoding="utf-8"))
-        self.assertEqual(metadata["devicetype"], "seedance")
-        self.assertEqual(metadata["device_type"], "seedance")
-        self.assertEqual(metadata["extra"]["device_type"], ["seedance"])
+        self.assertEqual(metadata["collection_mode"], "seedance")
+        self.assertNotIn("devicetype", metadata)
+        self.assertNotIn("device_type", metadata)
+        self.assertEqual(metadata["extra"]["device_type"], ["UMI3.0"])
         self.assertEqual(metadata["extra"]["video"][0]["frames"], 12)
         self.assertEqual(metadata["extra"]["video"][0]["width"], 1280)
         self.assertEqual(metadata["extra"]["video"][0]["height"], 960)
