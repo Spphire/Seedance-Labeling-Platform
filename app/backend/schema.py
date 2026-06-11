@@ -32,6 +32,7 @@ class GenerationRunRequest(BaseModel):
     clip_ids: list[int] | None = None
     dry_run: bool = False
     lock_token: str | None = None
+    lock_tokens: dict[str, str] | None = None
     operator_id: str | None = None
     operator_name: str | None = None
     prompt: str | None = None

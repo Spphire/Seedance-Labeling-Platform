@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from volcenginesdkarkruntime import Ark
 
-from app.backend.paths import ROOT
+from app.backend.paths import REFERENCE_IMAGES_DIR, ROOT
 
 
 def image_uri(path: Path) -> str:
@@ -22,10 +22,16 @@ def image_uri(path: Path) -> str:
 
 def resolve_image_value(value: str) -> str:
     if value.startswith(("http://", "https://", "data:")):
-        return value
+        raise ValueError("reference image must be selected from the project library")
     path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("reference image must stay inside app/reference_images")
     if not path.is_absolute():
         path = ROOT / path
+    try:
+        path.resolve().relative_to(REFERENCE_IMAGES_DIR.resolve())
+    except ValueError as exc:
+        raise ValueError("reference image must stay inside app/reference_images") from exc
     if not path.is_file():
         raise FileNotFoundError(f"reference image not found: {value}")
     return image_uri(path)

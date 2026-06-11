@@ -3,13 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .auth import dev_mode_enabled, require_admin, require_reviewer, security_enabled
 from .locks import LockError, acquire_lock, list_locks, release_lock, renew_lock
+from .media import resolve_media_token
 from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, REFERENCE_IMAGES_DIR, ROOT, ensure_dirs
 from .schema import (
     AnchorCandidatesRequest,
@@ -94,6 +96,44 @@ def _public_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+def _media_response(path: Path, media_type: str, request: Request) -> Response:
+    file_size = path.stat().st_size
+    range_header = request.headers.get("range")
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
+    if not range_header:
+        return FileResponse(path, media_type=media_type, headers=headers)
+    unit, _, value = range_header.partition("=")
+    if unit.strip().lower() != "bytes" or "-" not in value:
+        raise HTTPException(status_code=416, detail="invalid range")
+    start_text, _, end_text = value.partition("-")
+    try:
+        start = int(start_text) if start_text else 0
+        end = int(end_text) if end_text else file_size - 1
+    except ValueError as exc:
+        raise HTTPException(status_code=416, detail="invalid range") from exc
+    start = max(0, start)
+    end = min(file_size - 1, end)
+    if start > end or start >= file_size:
+        raise HTTPException(status_code=416, detail="range not satisfiable")
+
+    def iter_file() -> Any:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers |= {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Content-Length": str(end - start + 1),
+    }
+    return StreamingResponse(iter_file(), status_code=206, media_type=media_type, headers=headers)
+
+
 def frontend_index() -> FileResponse:
     _init()
     index_path = FRONTEND_DIR / "index.html"
@@ -120,7 +160,7 @@ def admin_index() -> FileResponse:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     _init()
-    return {"ok": True, "root": str(ROOT), "settings": public_settings()}
+    return {"ok": True, "auth_required": security_enabled(), "settings": public_settings()}
 
 
 @app.get("/api/settings")
@@ -129,7 +169,8 @@ def get_settings() -> dict[str, Any]:
 
 
 @app.post("/api/settings")
-def post_settings(payload: dict[str, Any]) -> dict[str, Any]:
+def post_settings(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    require_admin(request)
     values = payload.get("values", payload)
     save_settings(values)
     if "public_base_url" in values:
@@ -138,7 +179,8 @@ def post_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/episodes/batch")
-def post_episodes_batch(payload: EpisodeBatchRequest) -> list[dict[str, Any]]:
+def post_episodes_batch(payload: EpisodeBatchRequest, request: Request) -> list[dict[str, Any]]:
+    require_reviewer(request)
     try:
         return submit_episodes(payload.episodes_text)
     except Exception as exc:
@@ -146,7 +188,8 @@ def post_episodes_batch(payload: EpisodeBatchRequest) -> list[dict[str, Any]]:
 
 
 @app.post("/api/pipeline/submit_preprocess")
-def post_submit_preprocess(payload: SubmitPreprocessRequest) -> dict[str, Any]:
+def post_submit_preprocess(payload: SubmitPreprocessRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return submit_and_preprocess_episodes(payload.episodes_text, payload.fetch_remote, payload.lock_tokens)
     except Exception as exc:
@@ -154,7 +197,8 @@ def post_submit_preprocess(payload: SubmitPreprocessRequest) -> dict[str, Any]:
 
 
 @app.post("/api/pipeline/preprocess")
-def post_preprocess(payload: PreprocessRequest) -> list[dict[str, Any]]:
+def post_preprocess(payload: PreprocessRequest, request: Request) -> list[dict[str, Any]]:
+    require_reviewer(request)
     try:
         return preprocess(payload.uuids, payload.fetch_remote, payload.lock_tokens)
     except Exception as exc:
@@ -162,7 +206,8 @@ def post_preprocess(payload: PreprocessRequest) -> list[dict[str, Any]]:
 
 
 @app.post("/api/pipeline/import_head")
-def post_import_head(payload: ImportHeadVideoRequest) -> dict[str, Any]:
+def post_import_head(payload: ImportHeadVideoRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return import_head_video(payload.uuid, payload.path, payload.lock_token)
     except Exception as exc:
@@ -170,7 +215,8 @@ def post_import_head(payload: ImportHeadVideoRequest) -> dict[str, Any]:
 
 
 @app.post("/api/episodes/{uuid}/anchor_candidates")
-def post_anchor_candidates(uuid: str, payload: AnchorCandidatesRequest) -> dict[str, Any]:
+def post_anchor_candidates(uuid: str, payload: AnchorCandidatesRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return create_anchor_candidates(uuid.lower(), payload.start_secs, payload.lock_token)
     except Exception as exc:
@@ -178,7 +224,8 @@ def post_anchor_candidates(uuid: str, payload: AnchorCandidatesRequest) -> dict[
 
 
 @app.post("/api/generation/run")
-def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
+def post_generation_run(payload: GenerationRunRequest, request: Request) -> list[dict[str, Any]]:
+    require_reviewer(request)
     try:
         lock_tokens = {}
         if payload.clip_ids and payload.lock_token:
@@ -186,6 +233,8 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
             placeholders = ",".join("?" for _ in payload.clip_ids)
             rows = db.rows(f"SELECT id, episode_uuid FROM clips WHERE id IN ({placeholders})", payload.clip_ids)
             lock_tokens.update({str(row["episode_uuid"]): payload.lock_token for row in rows})
+        if payload.lock_tokens:
+            lock_tokens.update({str(key): str(value) for key, value in payload.lock_tokens.items()})
         return queue_generation(
             payload.mode,
             payload.clip_ids,
@@ -201,11 +250,13 @@ def post_generation_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
 
 
 @app.post("/api/generation/rolling_run")
-def post_generation_rolling_run(payload: GenerationRunRequest) -> list[dict[str, Any]]:
+def post_generation_rolling_run(payload: GenerationRunRequest, request: Request) -> list[dict[str, Any]]:
+    require_reviewer(request)
     try:
         return queue_rolling_generation(
             payload.mode,
             payload.dry_run,
+            payload.lock_tokens,
             operator_id=payload.operator_id,
             operator_name=payload.operator_name,
             prompt=payload.prompt,
@@ -216,7 +267,8 @@ def post_generation_rolling_run(payload: GenerationRunRequest) -> list[dict[str,
 
 
 @app.post("/api/generation/{job_id}/retry")
-def post_generation_retry(job_id: int, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+def post_generation_retry(job_id: int, request: Request, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return retry_job(
             job_id,
@@ -231,7 +283,8 @@ def post_generation_retry(job_id: int, payload: LockTokenRequest | None = None) 
 
 
 @app.post("/api/clips/{clip_id}/retry")
-def post_clip_retry(clip_id: int, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+def post_clip_retry(clip_id: int, request: Request, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return retry_clip(
             clip_id,
@@ -247,7 +300,8 @@ def post_clip_retry(clip_id: int, payload: LockTokenRequest | None = None) -> di
 
 
 @app.post("/api/review/{clip_id}")
-def post_review(clip_id: int, payload: ReviewRequest) -> dict[str, Any]:
+def post_review(clip_id: int, payload: ReviewRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return review_clip(
             clip_id,
@@ -265,7 +319,8 @@ def post_review(clip_id: int, payload: ReviewRequest) -> dict[str, Any]:
 
 
 @app.post("/api/episodes/{uuid}/stitch")
-def post_stitch(uuid: str, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+def post_stitch(uuid: str, request: Request, payload: LockTokenRequest | None = None) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return queue_stitch_episode(uuid.lower(), payload.lock_token if payload else None, require_lock_token=True)
     except Exception as exc:
@@ -273,7 +328,10 @@ def post_stitch(uuid: str, payload: LockTokenRequest | None = None) -> dict[str,
 
 
 @app.post("/api/test/auto_accept")
-def post_auto_accept(payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def post_auto_accept(request: Request, payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if not dev_mode_enabled():
+        raise HTTPException(status_code=404, detail="not found")
+    require_admin(request)
     try:
         uuid = None
         if payload:
@@ -299,22 +357,26 @@ def get_jobs() -> list[dict[str, Any]]:
 
 
 @app.get("/api/usage/seedance")
-def get_seedance_usage(limit: int = 100) -> dict[str, Any]:
+def get_seedance_usage(request: Request, limit: int = 100) -> dict[str, Any]:
+    require_admin(request)
     return list_seedance_usage(limit)
 
 
 @app.get("/api/reviews/activity")
-def get_reviewer_activity(limit: int = 100) -> dict[str, Any]:
+def get_reviewer_activity(request: Request, limit: int = 100) -> dict[str, Any]:
+    require_admin(request)
     return list_reviewer_activity(limit)
 
 
 @app.get("/api/locks")
-def get_locks() -> list[dict[str, Any]]:
+def get_locks(request: Request) -> list[dict[str, Any]]:
+    require_admin(request)
     return list_locks()
 
 
 @app.post("/api/locks/acquire")
-def post_lock_acquire(payload: LockRequest) -> dict[str, Any]:
+def post_lock_acquire(payload: LockRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return acquire_lock(
             payload.resource_type,
@@ -329,7 +391,8 @@ def post_lock_acquire(payload: LockRequest) -> dict[str, Any]:
 
 
 @app.post("/api/locks/renew")
-def post_lock_renew(payload: LockRenewRequest) -> dict[str, Any]:
+def post_lock_renew(payload: LockRenewRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return renew_lock(payload.token, payload.owner_id, payload.ttl_sec)
     except Exception as exc:
@@ -337,7 +400,8 @@ def post_lock_renew(payload: LockRenewRequest) -> dict[str, Any]:
 
 
 @app.post("/api/locks/release")
-def post_lock_release(payload: LockReleaseRequest) -> dict[str, Any]:
+def post_lock_release(payload: LockReleaseRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     try:
         return release_lock(payload.token, payload.owner_id)
     except Exception as exc:
@@ -345,7 +409,8 @@ def post_lock_release(payload: LockReleaseRequest) -> dict[str, Any]:
 
 
 @app.get("/api/state")
-def get_state() -> dict[str, Any]:
+def get_state(request: Request) -> dict[str, Any]:
+    require_reviewer(request)
     return {
         "episodes": list_episodes(),
         "clips": list_clips(),
@@ -355,15 +420,24 @@ def get_state() -> dict[str, Any]:
     }
 
 
+@app.get("/media/{token}")
+def get_media(token: str, request: Request) -> Response:
+    row = resolve_media_token(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="media not found")
+    return _media_response(row["path_obj"], row["media_type"], request)
+
+
 def _mount_static(prefix: str, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     app.mount(prefix, NoCacheStaticFiles(directory=directory), name=prefix.strip("/"))
 
 
-_mount_static("/clips", CLIPS_DIR)
-_mount_static("/head_videos", HEAD_VIDEOS_DIR)
-_mount_static("/generated", GENERATED_DIR)
-_mount_static("/accepted", ACCEPTED_DIR)
-_mount_static("/final", FINAL_DIR)
+if not security_enabled() or dev_mode_enabled():
+    _mount_static("/clips", CLIPS_DIR)
+    _mount_static("/head_videos", HEAD_VIDEOS_DIR)
+    _mount_static("/generated", GENERATED_DIR)
+    _mount_static("/accepted", ACCEPTED_DIR)
+    _mount_static("/final", FINAL_DIR)
 _mount_static("/reference_images", REFERENCE_IMAGES_DIR)
 _mount_static("/assets", FRONTEND_DIR)

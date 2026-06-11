@@ -18,6 +18,7 @@ from nmx_msg.Metadata_pb2 import Metadata
 from app.backend import db
 from app.backend import services as backend_services
 from app.backend.main import FRONTEND_DIR, app
+from app.backend.media import resolve_media_token
 from app.backend.nedf import extract_head_video, fetch_episode
 from app.backend.paths import (
     ACCEPTED_DIR,
@@ -30,6 +31,7 @@ from app.backend.paths import (
     GENERATED_DIR,
     HEAD_VIDEOS_DIR,
     REFERENCE_IMAGES_DIR,
+    ROOT,
 )
 from app.backend.services import (
     chronological_accepted_output_path,
@@ -172,14 +174,21 @@ class MockPipelineTest(unittest.TestCase):
         for index in range(4):
             path = REFERENCE_IMAGES_DIR / f"ref-{index + 1}.png"
             path.write_bytes(f"fake-png-{index + 1}".encode("ascii"))
-            result.append(path)
-        return [str(path) for path in result]
+            result.append(path.resolve().relative_to(ROOT).as_posix())
+        return result
 
     def make_reference_files_for(self, refs: list[str]) -> None:
         REFERENCE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         for ref in refs:
             path = REFERENCE_IMAGES_DIR / Path(ref).name
             path.write_bytes(f"fake-{path.name}".encode("ascii"))
+
+    def media_path_for_url(self, url: str) -> Path:
+        self.assertTrue(url.startswith("/media/"), url)
+        token = url.split("/media/", 1)[1].split("?", 1)[0]
+        row = resolve_media_token(token)
+        self.assertIsNotNone(row, url)
+        return Path(row["path_obj"]).resolve()
 
     def make_episode_with_generated_clip(self, uuid: str, duration: float = 5.0) -> tuple[list[dict], list[dict]]:
         now = db.now()
@@ -326,7 +335,8 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(jobs[0]["mode"], "mock")
         self.assertTrue(Path(jobs[0]["output_path"]).exists())
 
-        res = self.client.post("/api/test/auto_accept", json={"uuid": uuid})
+        with patch.dict(os.environ, {"SEEDANCE_DEV_MODE": "1"}):
+            res = self.client.post("/api/test/auto_accept", json={"uuid": uuid})
         self.assertEqual(res.status_code, 200, res.text)
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertEqual(episode["final_status"], "stitching")
@@ -461,11 +471,10 @@ class MockPipelineTest(unittest.TestCase):
         self.assertTrue(stage2_anchor["public_url"].endswith("/accepted/%s/clip_0000_stage1_input.mp4" % uuid))
         self.assertTrue(Path(stage2_anchor["local_path"]).exists())
         stage2_view = next(clip for clip in list_clips() if clip["id"] == anchor["id"])
-        self.assertTrue(stage2_view["input_video_url"].endswith("/accepted/%s/clip_0000_stage1_input.mp4" % uuid))
+        self.assertEqual(self.media_path_for_url(stage2_view["input_video_url"]), Path(stage2_anchor["local_path"]).resolve())
         self.assertTrue(
-            stage2_view["raw_video_url"].endswith(
-                f"/clips/{uuid}/clip_{int(anchor['clip_index']):04d}_anchor_input_{anchor['id']}.mp4"
-            )
+            self.media_path_for_url(stage2_view["raw_video_url"]).name
+            == f"clip_{int(anchor['clip_index']):04d}_anchor_input_{anchor['id']}.mp4"
         )
         self.assertEqual(stage2_view["video_url"], stage2_view["input_video_url"])
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
@@ -484,11 +493,10 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(db.one("SELECT COUNT(*) AS count FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))["count"], 1)
         official_view = next(clip for clip in list_clips() if clip["id"] == anchor["id"])
         self.assertEqual(official_view["anchor_stage"], "official")
-        self.assertTrue(official_view["input_video_url"].endswith("/accepted/%s/clip_0000_stage1_input.mp4" % uuid))
+        self.assertEqual(self.media_path_for_url(official_view["input_video_url"]), Path(stage2_anchor["local_path"]).resolve())
         self.assertTrue(
-            official_view["video_url"].endswith(
-                f"/clips/{uuid}/clip_{int(anchor['clip_index']):04d}_anchor_input_{anchor['id']}.mp4"
-            )
+            self.media_path_for_url(official_view["video_url"]).name
+            == f"clip_{int(anchor['clip_index']):04d}_anchor_input_{anchor['id']}.mp4"
         )
 
         rolling = db.rows("SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY direction", (uuid,))
@@ -579,11 +587,7 @@ class MockPipelineTest(unittest.TestCase):
         )
         self.assertIsNotNone(backward)
         backward_view = next(clip for clip in list_clips() if clip["id"] == backward["id"])
-        self.assertTrue(
-            backward_view["input_video_url"].endswith(
-                f"/clips/{uuid}/clip_{int(backward['clip_index']):04d}_backward_input_{backward['id']}.mp4"
-            )
-        )
+        self.assertEqual(self.media_path_for_url(backward_view["input_video_url"]), Path(backward["local_path"]).resolve())
         self.assertEqual(backward_view["video_url"], backward_view["input_video_url"])
         self.assertTrue(Path(backward["local_path"]).exists())
 
@@ -706,7 +710,7 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(episode["preprocess_health"], "ok")
         rebuilt_view = next(clip for clip in list_clips() if Path(clip["local_path"]) == cache_path)
         self.assertTrue(cache_path.exists())
-        self.assertIn(f"_input_{rebuilt_view['id']}.mp4", rebuilt_view["video_url"])
+        self.assertIn(f"_input_{rebuilt_view['id']}.mp4", self.media_path_for_url(rebuilt_view["video_url"]).name)
 
     def test_list_clips_returns_bidirectional_clips_in_timeline_order(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000032"
@@ -795,7 +799,11 @@ class MockPipelineTest(unittest.TestCase):
         self.make_reference_files_for(DEFAULT_SETTINGS["reference_images"])
         self.make_reference_files_for(COLLECTOR_ONLY_REFERENCE_IMAGES)
         self.make_reference_files_for(IPHONE2DEPLOY_REFERENCE_IMAGES)
-        save_settings({"mock_async": False, "reference_images": ["data:image/png;base64,AA=="], "default_prompt": "custom default"})
+        save_settings({
+            "mock_async": False,
+            "reference_images": list(reversed(DEFAULT_SETTINGS["reference_images"])),
+            "default_prompt": "custom default",
+        })
         self.make_head_ready_episode(uuid, 32)
         self.create_anchor_candidates_with_lock(uuid, [14])
 
@@ -917,7 +925,8 @@ class MockPipelineTest(unittest.TestCase):
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
         self.make_video(head, 5.2)
         create_clips(uuid, head, 5.2)
-        save_settings({"reference_images": ["data:image/png;base64,AA=="]})
+        self.make_reference_files_for(DEFAULT_SETTINGS["reference_images"])
+        save_settings({"reference_images": DEFAULT_SETTINGS["reference_images"]})
         result = run_generation(mode="seedance", dry_run=True)
         payload_path = Path(result[0]["output_path"])
         self.assertEqual(payload_path.suffix, ".json")
@@ -1414,9 +1423,15 @@ class MockPipelineTest(unittest.TestCase):
         self.make_video(head, 5.2)
         clips = create_clips(uuid, head, 5.2)
 
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        tokens = {uuid: lock.json()["token"]}
         with patch("app.backend.services._GENERATION_EXECUTOR.submit") as submit:
-            first = queue_generation(mode="seedance")
-            second = queue_generation(mode="seedance")
+            first = queue_generation(mode="seedance", lock_tokens=tokens)
+            second = queue_generation(mode="seedance", lock_tokens=tokens)
 
         self.assertEqual(first[0]["status"], "queued")
         self.assertEqual(first[0]["estimated_total_sec"], 144)
@@ -1697,6 +1712,115 @@ class MockPipelineTest(unittest.TestCase):
         self.assertNotIn("secret-token", json.dumps(data, ensure_ascii=False))
         self.assertNotIn("api_key", data["seedance_api_key_pool"][0])
         self.assertTrue(data["seedance_api_key_pool"][0]["key_set"])
+
+    def test_auth_tokens_gate_reviewer_and_admin_routes(self) -> None:
+        env = {
+            "SEEDANCE_REQUIRE_AUTH": "1",
+            "SEEDANCE_REVIEWER_TOKEN": "review-token",
+            "SEEDANCE_ADMIN_TOKEN": "admin-token",
+        }
+        with patch.dict(os.environ, env):
+            missing = self.client.get("/api/state")
+            reviewer = self.client.get("/api/state", headers={"Authorization": "Bearer review-token"})
+            forbidden = self.client.post(
+                "/api/settings",
+                headers={"Authorization": "Bearer review-token"},
+                json={"values": {"mock_async": False}},
+            )
+            admin = self.client.post(
+                "/api/settings",
+                headers={"Authorization": "Bearer admin-token"},
+                json={"values": {"mock_async": False}},
+            )
+
+        self.assertEqual(missing.status_code, 401, missing.text)
+        self.assertEqual(reviewer.status_code, 200, reviewer.text)
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+        self.assertEqual(admin.status_code, 200, admin.text)
+
+    def test_settings_reject_external_reference_images(self) -> None:
+        with self.assertRaisesRegex(ValueError, "project reference image ids"):
+            save_settings({"reference_images": ["data:image/png;base64,AA=="]})
+        with self.assertRaisesRegex(ValueError, "inside app/reference_images"):
+            save_settings(
+                {
+                    "generation_presets": [
+                        {
+                            "id": "bad",
+                            "name": "bad",
+                            "prompt": "bad",
+                            "reference_images": ["../secret.png"],
+                        }
+                    ]
+                }
+            )
+
+    def test_media_token_urls_hide_paths_and_support_range(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000037"
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5)
+        clips = create_clips(uuid, head, 5)
+
+        view = next(clip for clip in list_clips() if clip["id"] == clips[0]["id"])
+        self.assertTrue(view["video_url"].startswith("/media/"))
+        self.assertNotIn(uuid, view["video_url"])
+        self.assertEqual(self.media_path_for_url(view["video_url"]), Path(clips[0]["path"]).resolve())
+        ranged = self.client.get(view["video_url"], headers={"Range": "bytes=0-15"})
+
+        self.assertEqual(ranged.status_code, 206, ranged.text)
+        self.assertEqual(ranged.headers["accept-ranges"], "bytes")
+        self.assertEqual(len(ranged.content), 16)
+
+    def test_seedance_generation_api_requires_episode_lock_token(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000038"
+        now = db.now()
+        save_settings({"generation_mode": "seedance", "seedance_seconds_per_video_second": 24})
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?)
+                """,
+                (uuid, "mock", "mock", now, now),
+            )
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 5)
+        create_clips(uuid, head, 5)
+
+        missing = self.client.post(
+            "/api/generation/run",
+            json={"mode": "seedance", "operator_id": "alice", "operator_name": "Alice"},
+        )
+        self.assertEqual(missing.status_code, 423, missing.text)
+
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        with patch("app.backend.services._GENERATION_EXECUTOR.submit") as submit:
+            queued = self.client.post(
+                "/api/generation/run",
+                json={
+                    "mode": "seedance",
+                    "operator_id": "alice",
+                    "operator_name": "Alice",
+                    "lock_tokens": {uuid: lock.json()["token"]},
+                },
+            )
+
+        self.assertEqual(queued.status_code, 200, queued.text)
+        self.assertEqual(queued.json()[0]["status"], "queued")
+        submit.assert_called_once()
 
     def test_seedance_api_key_pool_preserves_blank_existing_keys_and_sanitizes_response(self) -> None:
         save_settings(

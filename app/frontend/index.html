@@ -1192,6 +1192,7 @@
     const statusEl = $("status");
     const PLAYBACK_SPEEDS = [1, 2, 3, 5, 10];
     const FOCUSED_EPISODES_STORAGE_PREFIX = "seedance_focused_episodes_";
+    const AUTH_TOKEN_STORAGE_KEY = "seedance_auth_token";
     window.__seedanceState = state;
 
     function initIdentity() {
@@ -1278,6 +1279,14 @@
       };
     }
 
+    function generationLockTokens() {
+      return Object.fromEntries(
+        Object.entries(state.episodeLocks || {})
+          .filter(([, lock]) => lock && lock.token)
+          .map(([uuid, lock]) => [uuid, lock.token])
+      );
+    }
+
     function applyRouteMode() {
       $("appShell").classList.toggle("admin-route", state.route === "admin");
       $("labelRoute").classList.toggle("active", state.route === "label");
@@ -1293,9 +1302,35 @@
       statusEl.textContent = `${new Date().toLocaleTimeString()}  ${message}${suffix}`;
     }
 
-    async function api(path, options = {}) {
+    function authToken() {
+      return sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+    }
+
+    function setAuthToken(token) {
+      const value = String(token || "").trim();
+      if (value) {
+        sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, value);
+      } else {
+        sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+        localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      }
+    }
+
+    function authHeaders() {
+      const token = authToken();
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    }
+
+    async function promptForAuthToken() {
+      const token = window.prompt("请输入 Seedance 平台访问 token", authToken());
+      if (token === null) return "";
+      setAuthToken(token);
+      return authToken();
+    }
+
+    async function api(path, options = {}, retryAuth = true) {
       const opts = { ...options };
-      opts.headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+      opts.headers = { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) };
       if (opts.body && typeof opts.body !== "string") {
         opts.body = JSON.stringify(opts.body);
       }
@@ -1310,6 +1345,12 @@
         }
       }
       if (!res.ok) {
+        if (res.status === 401 && retryAuth) {
+          const token = await promptForAuthToken();
+          if (token) {
+            return api(path, options, false);
+          }
+        }
         const detail = data && data.detail ? data.detail : text;
         const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
         err.status = res.status;
@@ -3362,7 +3403,15 @@
     $("generate").addEventListener("click", async () => {
       try {
         const mode = $("generationMode").value || "mock";
-        const result = await api("/api/generation/rolling_run", { method: "POST", body: { mode, dry_run: false, ...generationContentPayload() } });
+        const result = await api("/api/generation/rolling_run", {
+          method: "POST",
+          body: {
+            mode,
+            dry_run: false,
+            lock_tokens: generationLockTokens(),
+            ...generationContentPayload(),
+          },
+        });
         log(`${mode} batch generation submitted`, result);
         await refresh();
       } catch (err) {

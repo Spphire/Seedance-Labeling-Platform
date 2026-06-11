@@ -160,8 +160,19 @@ def init_db() -> None:
                 UNIQUE(resource_type, resource_id)
             );
 
+            CREATE TABLE IF NOT EXISTS media_tokens (
+                token TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_resource_locks_expires_at
             ON resource_locks(expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_media_tokens_expires_at
+            ON media_tokens(expires_at);
 
             CREATE INDEX IF NOT EXISTS idx_seedance_api_calls_operator
             ON seedance_api_calls(operator_id, created_at);

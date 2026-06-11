@@ -15,16 +15,19 @@ from urllib.parse import urlencode
 from . import db
 from .ids import parse_uuids
 from .locks import LockError, active_lock, locks_by_resource, require_lock, require_no_active_lock
+from .media import media_url_for_known_roots, media_url_for_path
 from .nedf import export_seedance_dataset, extract_head_video, fetch_episode
 from .paths import (
     ACCEPTED_DIR,
     ARCHIVED_ANCHORS_DIR,
     CLIPS_DIR,
+    DATA_DIR,
     EPISODES_DIR,
     FINAL_DATASET_DIR,
     FINAL_DIR,
     GENERATED_DIR,
     HEAD_VIDEOS_DIR,
+    ROOT,
 )
 from .settings import (
     COLLECTOR_ONLY_PRESET_ID,
@@ -171,11 +174,11 @@ def list_episodes() -> list[dict[str, Any]]:
         episode["episode_stage"] = describe_episode_stage(episode)
         episode["lock"] = episode_locks.get(episode["uuid"])
         head_path = episode.get("head_video_path")
-        episode["head_video_url"] = static_url_from_path(head_path, HEAD_VIDEOS_DIR, "head_videos") if head_path else None
+        episode["head_video_url"] = media_url_for_path(head_path, HEAD_VIDEOS_DIR, "head_videos") if head_path else None
         final_path = episode.get("final_video_path")
-        episode["final_url"] = static_url_from_path(final_path, FINAL_DIR, "final") if final_path else None
+        episode["final_url"] = media_url_for_path(final_path, FINAL_DIR, "final") if final_path else None
         preview_path = episode.get("preview_video_path")
-        episode["preview_url"] = static_url_from_path(preview_path, FINAL_DIR, "final") if preview_path else None
+        episode["preview_url"] = media_url_for_path(preview_path, FINAL_DIR, "preview") if preview_path else None
     return episodes
 
 
@@ -322,7 +325,7 @@ def list_clips() -> list[dict[str, Any]]:
         clip["lock"] = clip_locks.get(str(clip["id"]))
         clip["latest_job"] = enrich_job_timing(latest_job) if latest_job else None
         clip["generated_url"] = (
-            static_url_from_path(latest_job.get("output_path"), GENERATED_DIR, "generated")
+            media_url_for_path(latest_job.get("output_path"), GENERATED_DIR, "generated")
             if latest_job and latest_job.get("status") == "succeeded"
             else None
         )
@@ -339,7 +342,7 @@ def list_jobs() -> list[dict[str, Any]]:
         """
     )
     for job in jobs:
-        job["generated_url"] = static_url_from_path(job.get("output_path"), GENERATED_DIR, "generated")
+        job["generated_url"] = media_url_for_path(job.get("output_path"), GENERATED_DIR, "generated")
         enrich_job_timing(job)
     return jobs
 
@@ -515,6 +518,16 @@ def url_with_query(url: str, params: dict[str, Any]) -> str:
 
 
 def generation_input_url(item: dict[str, Any], job_id: int) -> str:
+    media_url = media_url_for_known_roots(item.get("local_path"), "seedance_input", absolute=True)
+    if media_url:
+        return url_with_query(
+            media_url,
+            {
+                "job": int(job_id),
+                "clip": clip_record_id(item),
+                "v": int(float(item.get("clip_updated_at") or item.get("updated_at") or db.now()) * 1000),
+            },
+        )
     return url_with_query(
         str(item["public_url"]),
         {
@@ -731,12 +744,12 @@ def raw_clip_video_url(clip: dict[str, Any]) -> str | None:
                 clip = ensure_continuity_clip_input(clip, verify_duration=False)
             except Exception:
                 pass
-        return static_url_from_path(clip.get("local_path"), CLIPS_DIR, "clips")
+        return media_url_for_known_roots(clip.get("local_path"), "clip_raw")
     try:
         path = ensure_anchor_raw_input(clip)
     except Exception:
         path = raw_clip_path(clip)
-    return static_url_from_path(str(path), CLIPS_DIR, "clips")
+    return media_url_for_path(str(path), CLIPS_DIR, "clip_raw")
 
 
 def clip_input_video_url(clip: dict[str, Any]) -> str | None:
@@ -745,7 +758,7 @@ def clip_input_video_url(clip: dict[str, Any]) -> str | None:
             clip = ensure_continuity_clip_input(clip, verify_duration=False)
         except Exception:
             pass
-    return static_url_from_clip_input_path(clip.get("local_path")) or clip.get("public_url")
+    return media_url_for_known_roots(clip.get("local_path"), "clip_input") or clip.get("public_url")
 
 
 def clip_display_video_url(clip: dict[str, Any], input_video_url: str | None, raw_video_url: str | None) -> str | None:
@@ -763,6 +776,36 @@ def require_episode_mutation_lock(uuid: str, lock_token: str | None) -> None:
             raise LockError(409, "episode is currently stitching", episode_lock)
         return
     raise LockError(423, "episode mutation requires an active episode lock", episode_lock)
+
+
+def ensure_import_head_source_allowed(source: Path) -> None:
+    resolved = source.resolve()
+    settings = load_settings()
+    roots = [
+        DATA_DIR,
+        EPISODES_DIR,
+        HEAD_VIDEOS_DIR,
+    ]
+    dm3_root = str(settings.get("dm3_nedf_root") or "").strip()
+    if dm3_root:
+        roots.append(Path(dm3_root))
+        roots.append(Path(dm3_root).parent)
+    allowed = []
+    for root in roots:
+        try:
+            if not str(root):
+                continue
+            allowed.append(root.resolve())
+        except OSError:
+            continue
+    allowed.append(ROOT.resolve())
+    for root in allowed:
+        try:
+            resolved.relative_to(root)
+            return
+        except ValueError:
+            continue
+    raise ValueError("head video path is outside allowed project or dataset roots")
 
 
 def acquire_stitch_locks(uuid: str, clips: list[dict[str, Any]]) -> list[str]:
@@ -1226,6 +1269,7 @@ def import_head_video(uuid: str, source_path: str, lock_token: str | None = None
     source = Path(source_path)
     if not source.exists():
         raise FileNotFoundError(f"head video not found: {source}")
+    ensure_import_head_source_allowed(source)
     now = db.now()
     head_path = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
     if source.resolve() == head_path.resolve():
@@ -1275,6 +1319,7 @@ def import_head_video(uuid: str, source_path: str, lock_token: str | None = None
 def queue_rolling_generation(
     mode: str | None = None,
     dry_run: bool = False,
+    lock_tokens: dict[str, str] | None = None,
     operator_id: str | None = None,
     operator_name: str | None = None,
     prompt: str | None = None,
@@ -1286,6 +1331,7 @@ def queue_rolling_generation(
         clips=prepared,
         dry_run=dry_run,
         force=False,
+        lock_tokens=lock_tokens,
         operator_id=operator_id,
         operator_name=operator_name,
         prompt=prompt,
@@ -2046,6 +2092,7 @@ def queue_generation_for_selected_clips(
     clips: list[dict[str, Any]],
     dry_run: bool,
     force: bool,
+    lock_tokens: dict[str, str] | None,
     operator_id: str | None,
     operator_name: str | None,
     prompt: str | None,
@@ -2055,8 +2102,16 @@ def queue_generation_for_selected_clips(
     mode = mode or DEFAULT_REQUEST_MODE
     if mode not in {"mock", "seedance"}:
         raise ValueError("mode must be mock or seedance")
+    requires_episode_lock = mode == "seedance" and not dry_run
     operator_id, operator_name = normalize_operator(operator_id, operator_name)
-    available = filter_generation_clips(clips, {}, strict=False, operator_id=operator_id)
+    available = filter_generation_clips(
+        clips,
+        lock_tokens or {},
+        strict=requires_episode_lock,
+        operator_id=operator_id,
+        require_episode_lock=requires_episode_lock,
+        allow_owner_bypass=not requires_episode_lock,
+    )
     if not available:
         return []
     if dry_run or (mode == "mock" and not settings.get("mock_async")):
@@ -2123,11 +2178,15 @@ def run_generation(
             GENERATION_CANDIDATE_STATUSES,
         )
     operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    strict_locks = clip_ids is not None or (mode == "seedance" and not dry_run)
+    requires_episode_lock = mode == "seedance" and not dry_run
     clips = filter_generation_clips(
         clips,
         lock_tokens or {},
-        strict=clip_ids is not None,
+        strict=strict_locks,
         operator_id=operator_id,
+        require_episode_lock=requires_episode_lock,
+        allow_owner_bypass=not requires_episode_lock,
     )
     if not clips:
         return []
@@ -2186,11 +2245,15 @@ def queue_generation(
             GENERATION_CANDIDATE_STATUSES,
         )
     operator_id, operator_name = normalize_operator(operator_id, operator_name)
+    strict_locks = clip_ids is not None or (mode == "seedance" and not dry_run)
+    requires_episode_lock = mode == "seedance" and not dry_run
     clips = filter_generation_clips(
         clips,
         lock_tokens or {},
-        strict=clip_ids is not None,
+        strict=strict_locks,
         operator_id=operator_id,
+        require_episode_lock=requires_episode_lock,
+        allow_owner_bypass=not requires_episode_lock,
     )
     if not clips:
         return []
@@ -2694,6 +2757,8 @@ def filter_generation_clips(
     lock_tokens: dict[str, str],
     strict: bool,
     operator_id: str = "",
+    require_episode_lock: bool = False,
+    allow_owner_bypass: bool = True,
 ) -> list[dict[str, Any]]:
     active_clip_locks = locks_by_resource("clip")
     active_episode_locks = locks_by_resource("episode")
@@ -2703,11 +2768,13 @@ def filter_generation_clips(
         episode_uuid = str(clip["episode_uuid"])
         clip_token = lock_tokens.get(clip_id)
         episode_token = lock_tokens.get(episode_uuid)
+        if require_episode_lock:
+            require_lock("episode", episode_uuid, episode_token)
         if episode_uuid in active_episode_locks:
             lock = active_episode_locks[episode_uuid]
             if episode_token:
                 require_lock("episode", episode_uuid, episode_token)
-            elif operator_id and lock.get("owner_id") == operator_id:
+            elif allow_owner_bypass and operator_id and lock.get("owner_id") == operator_id:
                 pass
             elif strict:
                 require_lock("episode", episode_uuid, None)

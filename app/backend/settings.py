@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .paths import CONFIG_DIR, REFERENCE_IMAGES_DIR, ROOT
 
@@ -153,6 +154,31 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "generation_presets": DEFAULT_GENERATION_PRESETS,
 }
 
+SETTINGS_WRITE_ALLOWLIST = {
+    "dm3_host",
+    "dm3_nedf_root",
+    "public_base_url",
+    "generation_mode",
+    "mock_concurrency",
+    "mock_async",
+    "mock_seconds_per_video_second",
+    "seedance_concurrency",
+    "seedance_model",
+    "seedance_base_url",
+    "seedance_resolution",
+    "seedance_ratio",
+    "seedance_seconds_per_video_second",
+    "continuity_overlap_sec",
+    "continuity_prefer_input_sec",
+    "default_prompt",
+    "reference_images",
+    "default_generation_preset_id",
+    "generation_presets",
+    "generation_presets_version",
+    "seedance_api_key",
+    "seedance_api_key_pool",
+}
+
 
 def _env_api_key() -> str:
     return os.environ.get("SEEDANCE_API_KEY") or os.environ.get("ARK_API_KEY") or ""
@@ -283,11 +309,43 @@ def _renamed_reference_images(values: tuple[Any, ...]) -> list[str]:
     return [REFERENCE_IMAGE_RENAMES.get(str(item), str(item)) for item in values]
 
 
+def valid_reference_image_ids() -> set[str]:
+    if not REFERENCE_IMAGES_DIR.exists():
+        return set()
+    return {
+        path.resolve().relative_to(ROOT).as_posix()
+        for path in REFERENCE_IMAGES_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+    }
+
+
+def validate_reference_images(values: list[str]) -> list[str]:
+    available = valid_reference_image_ids()
+    result = []
+    for value in values:
+        item = REFERENCE_IMAGE_RENAMES.get(str(value), str(value)).strip()
+        if not item:
+            continue
+        if item.startswith(("http://", "https://", "data:")):
+            raise ValueError("reference_images must use project reference image ids")
+        path = Path(item)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("reference_images must stay inside app/reference_images")
+        if not available:
+            candidate = (ROOT / item).resolve()
+            try:
+                candidate.relative_to(REFERENCE_IMAGES_DIR.resolve())
+            except ValueError as exc:
+                raise ValueError("reference_images must stay inside app/reference_images") from exc
+        result.append(item)
+    return result
+
+
 def _normalized_reference_images(value: Any) -> list[str]:
     refs = tuple(value or [])
     if (not refs or refs in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
         return list(DEFAULT_REFERENCE_IMAGES)
-    return _renamed_reference_images(refs)
+    return validate_reference_images(_renamed_reference_images(refs))
 
 
 def _preset_copy(preset: dict[str, Any]) -> dict[str, Any]:
@@ -346,10 +404,13 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
     if _prompt_needs_repair(normalized_default_prompt):
         normalized_default_prompt = DEFAULT_PROMPT
         changed = True
-    normalized_reference_images = _renamed_reference_images(tuple(data.get("reference_images") or [])) if reference_images_present else None
-    if reference_images_present and (not data.get("reference_images") or tuple(data.get("reference_images") or []) in LEGACY_REFERENCE_IMAGE_ORDERS) and REFERENCE_IMAGES_DIR.exists():
-        normalized_reference_images = list(DEFAULT_REFERENCE_IMAGES)
-        changed = True
+    normalized_reference_images = None
+    if reference_images_present:
+        try:
+            normalized_reference_images = _normalized_reference_images(data.get("reference_images"))
+        except ValueError:
+            normalized_reference_images = list(DEFAULT_REFERENCE_IMAGES)
+            changed = True
     raw_presets = data.get("generation_presets")
     if not isinstance(raw_presets, list) or not raw_presets:
         raw_presets = [_preset_copy(preset) for preset in DEFAULT_GENERATION_PRESETS]
@@ -371,7 +432,12 @@ def _normalize_generation_presets(data: dict[str, Any]) -> bool:
         if _prompt_needs_repair(prompt):
             prompt = DEFAULT_PROMPT
             changed = True
-        refs = _normalized_reference_images(item.get("reference_images"))
+        try:
+            refs = _normalized_reference_images(item.get("reference_images"))
+        except ValueError:
+            default_preset = _default_preset_by_id(preset_id)
+            refs = list(default_preset["reference_images"] if default_preset else DEFAULT_REFERENCE_IMAGES)
+            changed = True
         normalized = {
             "id": preset_id,
             "name": name,
@@ -501,7 +567,11 @@ def _settings_from_disk() -> dict[str, Any]:
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2), encoding="utf-8")
         return dict(DEFAULT_SETTINGS)
-    data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = dict(DEFAULT_SETTINGS)
+        SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     changed = False
     try:
         mock_seconds = float(data.get("mock_seconds_per_video_second", DEFAULT_MOCK_SECONDS_PER_VIDEO_SECOND))
@@ -525,6 +595,9 @@ def _settings_from_disk() -> dict[str, Any]:
         SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data)
+    env_base_url = os.environ.get("SEEDANCE_BASE_URL", "").strip()
+    if env_base_url:
+        merged["seedance_base_url"] = env_base_url
     return merged
 
 
@@ -545,6 +618,25 @@ def load_settings() -> dict[str, Any]:
 def save_settings(data: dict[str, Any]) -> dict[str, Any]:
     merged = _settings_from_disk()
     incoming = dict(data)
+    unknown = set(incoming) - SETTINGS_WRITE_ALLOWLIST
+    if unknown:
+        raise ValueError(f"unsupported settings fields: {', '.join(sorted(unknown))}")
+    incoming.pop("seedance_base_url", None)
+    if "public_base_url" in incoming:
+        parsed = urlparse(str(incoming["public_base_url"]))
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("public_base_url must be an http(s) URL")
+    if "reference_images" in incoming:
+        incoming["reference_images"] = _normalized_reference_images(incoming["reference_images"])
+    if "generation_presets" in incoming:
+        presets = incoming["generation_presets"] if isinstance(incoming["generation_presets"], list) else []
+        normalized_presets = []
+        for item in presets:
+            preset = dict(item) if isinstance(item, dict) else {}
+            if "reference_images" in preset:
+                preset["reference_images"] = _normalized_reference_images(preset["reference_images"])
+            normalized_presets.append(preset)
+        incoming["generation_presets"] = normalized_presets
     pool_submitted = "seedance_api_key_pool" in incoming
     if "seedance_api_key_pool" in incoming:
         incoming["seedance_api_key_pool"] = _merge_seedance_api_key_pool(merged, incoming["seedance_api_key_pool"])
