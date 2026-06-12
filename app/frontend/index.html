@@ -1338,7 +1338,7 @@
       activeLabExperimentId: null,
       seedanceUsage: null,
       reviewerActivity: null,
-      route: location.pathname.startsWith("/admin") ? "admin" : location.pathname.startsWith("/lab") ? "lab" : "label",
+      route: routeFromPath(),
       tabs: [],
       activeClipId: null,
       selectedEpisode: null,
@@ -1368,6 +1368,39 @@
     const FOCUSED_EPISODES_STORAGE_PREFIX = "seedance_focused_episodes_";
     const AUTH_TOKEN_STORAGE_KEY = "seedance_auth_token";
     window.__seedanceState = state;
+
+    function routeFromPath(pathname = location.pathname) {
+      if (pathname.startsWith("/admin")) return "admin";
+      if (pathname.startsWith("/lab")) return "lab";
+      return "label";
+    }
+
+    function syncRouteFromLocation() {
+      const nextRoute = routeFromPath();
+      const changed = state.route !== nextRoute;
+      state.route = nextRoute;
+      applyRouteMode();
+      return changed;
+    }
+
+    function navigateRoute(path) {
+      if (location.pathname !== path) {
+        history.pushState({}, "", path);
+      }
+      syncRouteFromLocation();
+      $("workspace").dataset.signature = "";
+      refresh({ silent: true, forceWorkspace: true }).catch((err) => log(formatApiError(err)));
+    }
+
+    function wireRouteLink(id, path) {
+      const link = $(id);
+      if (!link) return;
+      link.addEventListener("click", (event) => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        navigateRoute(path);
+      });
+    }
 
     function initIdentity() {
       let clientId = localStorage.getItem("seedance_client_id");
@@ -1540,6 +1573,7 @@
     async function refresh(options = {}) {
       let refreshed = false;
       try {
+        syncRouteFromLocation();
         const data = await api("/api/state");
         state.episodes = data.episodes || [];
         state.clips = data.clips || [];
@@ -3756,6 +3790,7 @@
     }
 
     function render(options = {}) {
+      syncRouteFromLocation();
       if (state.route === "lab") {
         renderLab();
         return;
@@ -3770,7 +3805,10 @@
     }
 
     initIdentity();
-    applyRouteMode();
+    syncRouteFromLocation();
+    wireRouteLink("labelRoute", "/label");
+    wireRouteLink("adminRoute", "/admin");
+    wireRouteLink("labRoute", "/lab");
 
     $("reviewerName").addEventListener("change", () => updateReviewerName($("reviewerName").value));
     $("reviewerName").addEventListener("blur", () => updateReviewerName($("reviewerName").value));
@@ -3870,7 +3908,20 @@
         schedulePolling();
         return;
       }
+      syncRouteFromLocation();
       refresh({ silent: true }).catch((err) => log(formatApiError(err)));
+    });
+    window.addEventListener("pageshow", () => {
+      if (syncRouteFromLocation()) {
+        $("workspace").dataset.signature = "";
+        refresh({ silent: true, forceWorkspace: true }).catch((err) => log(formatApiError(err)));
+      }
+    });
+    window.addEventListener("popstate", () => {
+      if (syncRouteFromLocation()) {
+        $("workspace").dataset.signature = "";
+        refresh({ silent: true, forceWorkspace: true }).catch((err) => log(formatApiError(err)));
+      }
     });
 
     $("refresh").addEventListener("click", () => refresh().catch((err) => log(formatApiError(err))));
