@@ -1386,6 +1386,7 @@
       episodeLocks: {},
       workspaceSignature: "",
       settingsDirty: false,
+      labSettingsDirty: false,
       runDefaultsInitialized: false,
       adminPresets: [],
       activeAdminPresetId: "",
@@ -2000,6 +2001,15 @@
       state.settingsDirty = true;
     }
 
+    function markLabSettingsDirty() {
+      state.labSettingsDirty = true;
+    }
+
+    function labSettingsHasFocus() {
+      const panel = $("labSettingsBody");
+      return !!panel && panel.contains(document.activeElement);
+    }
+
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (char) => ({
         "&": "&amp;",
@@ -2375,6 +2385,7 @@
       target.querySelectorAll("[data-lab-experiment-id]").forEach((item) => {
         item.addEventListener("click", () => {
           state.activeLabExperimentId = Number(item.dataset.labExperimentId);
+          state.labSettingsDirty = false;
           render({ forceWorkspace: true });
         });
       });
@@ -2540,7 +2551,7 @@
         || (!experiment.preset_id && preset.prompt === experiment.prompt && JSON.stringify(preset.reference_images || []) === JSON.stringify(refs))
       );
       $("labPresetSelect").value = matchedPreset ? matchedPreset.id : "";
-      renderReferenceImageSelectors("labReferenceImageOrder", refs, "lab", () => {});
+      renderReferenceImageSelectors("labReferenceImageOrder", refs, "lab", markLabSettingsDirty);
       wireLabSettingsActions(experiment);
     }
 
@@ -2571,9 +2582,12 @@
       `;
     }
 
-    function renderLab() {
+    function renderLab(options = {}) {
       renderLabSidebar();
       renderLabWorkspace();
+      if (options.preserveLabSettings && (state.labSettingsDirty || labSettingsHasFocus())) {
+        return;
+      }
       renderLabSettings();
     }
 
@@ -2597,6 +2611,7 @@
         body: payload,
       });
       state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(saved.id) ? saved : item);
+      state.labSettingsDirty = false;
       return saved;
     }
 
@@ -2640,6 +2655,7 @@
       form.append("duration_sec", durationInput ? durationInput.value || "4" : String(experiment.clip_duration_sec || 4));
       const updated = await api(`/api/lab/experiments/${experiment.id}/video`, { method: "POST", body: form });
       state.activeLabExperimentId = updated.id;
+      state.labSettingsDirty = false;
       await refresh({ silent: true, forceWorkspace: true });
       log("lab reference video uploaded");
     }
@@ -2652,6 +2668,7 @@
       imageFiles.forEach((file) => form.append("files", file));
       const updated = await api(`/api/lab/experiments/${experiment.id}/images`, { method: "POST", body: form });
       state.activeLabExperimentId = updated.id;
+      state.labSettingsDirty = false;
       await refresh({ silent: true, forceWorkspace: true });
       log(`${imageFiles.length} 张参考图已加入 lab`);
     }
@@ -2706,14 +2723,21 @@
     }
 
     function wireLabSettingsActions(experiment) {
+      ["labTitle", "labMode", "labPresetSelect", "labNote", "labPrompt"].forEach((id) => {
+        const element = $(id);
+        if (!element) return;
+        element.addEventListener("input", markLabSettingsDirty);
+        element.addEventListener("change", markLabSettingsDirty);
+      });
       $("labPresetSelect").addEventListener("change", () => {
         const preset = normalizedGenerationPresets().find((item) => item.id === $("labPresetSelect").value);
         if (!preset) return;
         $("labPrompt").value = preset.prompt || "";
-        renderReferenceImageSelectors("labReferenceImageOrder", preset.reference_images || [], "lab", () => {});
+        renderReferenceImageSelectors("labReferenceImageOrder", preset.reference_images || [], "lab", markLabSettingsDirty);
+        markLabSettingsDirty();
       });
-      $("addLabReferenceImageSlot").addEventListener("click", () => addReferenceImageSlot("labReferenceImageOrder", "lab", () => {}));
-      $("removeLabReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("labReferenceImageOrder", "lab", () => {}));
+      $("addLabReferenceImageSlot").addEventListener("click", () => addReferenceImageSlot("labReferenceImageOrder", "lab", markLabSettingsDirty));
+      $("removeLabReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("labReferenceImageOrder", "lab", markLabSettingsDirty));
       $("saveLabSettings").addEventListener("click", async () => {
         try {
           await saveActiveLabSettings();
@@ -2963,7 +2987,7 @@
         || state.labExperiments.some((experiment) => experiment.status === "generating");
       const delay = document.hidden ? 30000 : hasActiveWork ? 1500 : 15000;
       state.pollTimer = setTimeout(() => {
-        refresh({ silent: true }).catch((err) => log(formatApiError(err)));
+        refresh({ silent: true, preserveLabSettings: true }).catch((err) => log(formatApiError(err)));
       }, delay);
     }
 
@@ -3895,7 +3919,7 @@
     function render(options = {}) {
       syncRouteFromLocation();
       if (state.route === "lab") {
-        renderLab();
+        renderLab(options);
         return;
       }
       renderEpisodes();
@@ -3951,6 +3975,7 @@
           body: { ...operatorPayload() },
         });
         state.activeLabExperimentId = created.id;
+        state.labSettingsDirty = false;
         await refresh({ silent: true, forceWorkspace: true });
         log(`lab experiment created: ${created.title}`);
       } catch (err) {
