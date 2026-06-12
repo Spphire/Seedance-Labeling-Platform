@@ -171,9 +171,13 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS lab_experiments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                preset_id TEXT,
+                preset_name TEXT,
                 prompt TEXT NOT NULL,
                 reference_images_json TEXT NOT NULL DEFAULT '[]',
                 source_video_path TEXT,
+                source_video_name TEXT,
                 source_duration_sec REAL,
                 input_video_path TEXT,
                 clip_start_sec REAL NOT NULL DEFAULT 0,
@@ -195,8 +199,16 @@ def init_db() -> None:
                 requested_duration_sec INTEGER NOT NULL,
                 operator_id TEXT,
                 operator_name TEXT,
+                preset_id TEXT,
+                preset_name TEXT,
                 prompt TEXT,
                 reference_images_json TEXT,
+                source_video_path TEXT,
+                source_video_name TEXT,
+                input_video_path TEXT,
+                clip_start_sec REAL,
+                clip_duration_sec REAL,
+                source_duration_sec REAL,
                 task_id TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 output_url TEXT,
@@ -235,6 +247,18 @@ def init_db() -> None:
         _ensure_column(conn, "generation_jobs", "operator_name", "TEXT")
         _ensure_column(conn, "generation_jobs", "prompt", "TEXT")
         _ensure_column(conn, "generation_jobs", "reference_images_json", "TEXT")
+        _ensure_column(conn, "lab_experiments", "note", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "lab_experiments", "preset_id", "TEXT")
+        _ensure_column(conn, "lab_experiments", "preset_name", "TEXT")
+        _ensure_column(conn, "lab_experiments", "source_video_name", "TEXT")
+        _ensure_column(conn, "lab_generation_jobs", "preset_id", "TEXT")
+        _ensure_column(conn, "lab_generation_jobs", "preset_name", "TEXT")
+        _ensure_column(conn, "lab_generation_jobs", "source_video_path", "TEXT")
+        _ensure_column(conn, "lab_generation_jobs", "source_video_name", "TEXT")
+        _ensure_column(conn, "lab_generation_jobs", "input_video_path", "TEXT")
+        _ensure_column(conn, "lab_generation_jobs", "clip_start_sec", "REAL")
+        _ensure_column(conn, "lab_generation_jobs", "clip_duration_sec", "REAL")
+        _ensure_column(conn, "lab_generation_jobs", "source_duration_sec", "REAL")
         _ensure_column(conn, "seedance_api_calls", "api_key_id", "TEXT")
         _ensure_column(conn, "seedance_api_calls", "api_key_name", "TEXT")
         _ensure_column(conn, "seedance_api_calls", "lab_job_id", "INTEGER")

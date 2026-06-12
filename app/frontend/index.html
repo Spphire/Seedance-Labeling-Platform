@@ -548,6 +548,43 @@
       margin-top: 8px;
     }
 
+    .lab-history {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .lab-history details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px;
+    }
+
+    .lab-history summary {
+      cursor: pointer;
+      font-weight: 650;
+      color: #354252;
+    }
+
+    .lab-history dl {
+      display: grid;
+      grid-template-columns: 84px minmax(0, 1fr);
+      gap: 5px 8px;
+      margin: 8px 0 0;
+      font-size: 12px;
+    }
+
+    .lab-history dt {
+      color: var(--muted);
+      font-weight: 650;
+    }
+
+    .lab-history dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+
     .lab-ref-thumb {
       display: grid;
       grid-template-columns: 48px minmax(0, 1fr);
@@ -2278,6 +2315,23 @@
       return mode === "seedance" ? "seedance" : "mock";
     }
 
+    function labPresetLabel(item) {
+      return item?.preset_name || item?.preset_id || "自定义";
+    }
+
+    function labClipWindowText(item) {
+      return `${Number(item?.clip_start_sec || 0).toFixed(1)}s + ${Number(item?.clip_duration_sec || 0).toFixed(1)}s`;
+    }
+
+    function labElapsedText(job) {
+      if (!job) return "-";
+      const elapsed = job.elapsed_sec !== null && job.elapsed_sec !== undefined
+        ? job.elapsed_sec
+        : (job.started_at && job.completed_at ? Number(job.completed_at) - Number(job.started_at) : null);
+      const speed = job.seconds_per_video_second ? ` · ${Number(job.seconds_per_video_second).toFixed(1)}s/视频秒` : "";
+      return `${formatDuration(elapsed)}${speed}`;
+    }
+
     function labJobNotice(experiment) {
       const job = experiment.latest_job;
       if (experiment.status === "generating" && job) {
@@ -2303,9 +2357,10 @@
           const job = experiment.latest_job;
           const facts = [
             labModeLabel(experiment.mode),
-            `${Number(experiment.clip_start_sec || 0).toFixed(1)}s + ${Number(experiment.clip_duration_sec || 0).toFixed(1)}s`,
+            labPresetLabel(experiment),
+            labClipWindowText(experiment),
           ];
-          if (job) facts.push(`job ${job.id} ${job.status}`);
+          if (job) facts.push(`job ${job.id} ${job.status} ${labElapsedText(job)}`);
           return `
             <div class="item lab-item ${active ? "active" : ""}" data-lab-experiment-id="${experiment.id}">
               <div class="item-title">
@@ -2357,7 +2412,7 @@
           <div class="review-head">
             <div class="review-title">
               <h2>${escapeHtml(experiment.title || `实验 ${experiment.id}`)}</h2>
-              <div class="meta">Lab #${experiment.id} · ${labStatusLabel(experiment.status)} · ${Number(experiment.reference_images?.length || 0)} 张 ref 图</div>
+              <div class="meta">Lab #${experiment.id} · ${labStatusLabel(experiment.status)} · ${labPresetLabel(experiment)} · ${Number(experiment.reference_images?.length || 0)} 张 ref 图</div>
             </div>
             <div class="actions">
               ${renderPlaybackSpeedControl()}
@@ -2424,6 +2479,7 @@
         ...presets.map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.name)}</option>`),
       ].join("");
       const refs = experiment.reference_images || [];
+      const jobHistory = experiment.jobs || [];
       target.innerHTML = `
         <div class="field">
           <label for="labTitle">实验名称</label>
@@ -2439,6 +2495,10 @@
         <div class="field">
           <label for="labPresetSelect">Prompt/ref 组合</label>
           <select id="labPresetSelect">${presetOptions}</select>
+        </div>
+        <div class="field">
+          <label for="labNote">备注</label>
+          <textarea id="labNote" spellcheck="false" placeholder="记录本次实验目的、观察结论或待比较点">${escapeHtml(experiment.note || "")}</textarea>
         </div>
         <div class="field">
           <label for="labPrompt">Prompt</label>
@@ -2468,9 +2528,47 @@
           <button id="saveLabSettings">保存设置</button>
           <button id="runLabExperiment" class="primary" ${experiment.input_video_url && experiment.status !== "generating" ? "" : "disabled"}>重跑</button>
         </div>
+        <div class="field">
+          <label>运行历史</label>
+          <div class="lab-history">
+            ${jobHistory.length ? jobHistory.map((job) => renderLabJobHistory(job)).join("") : `<div class="hint">还没有生成记录。</div>`}
+          </div>
+        </div>
       `;
+      const matchedPreset = presets.find((preset) =>
+        (experiment.preset_id && preset.id === experiment.preset_id)
+        || (!experiment.preset_id && preset.prompt === experiment.prompt && JSON.stringify(preset.reference_images || []) === JSON.stringify(refs))
+      );
+      $("labPresetSelect").value = matchedPreset ? matchedPreset.id : "";
       renderReferenceImageSelectors("labReferenceImageOrder", refs, "lab", () => {});
       wireLabSettingsActions(experiment);
+    }
+
+    function renderLabJobHistory(job) {
+      const refNames = (job.reference_image_items || []).map((item, index) => `图片${index + 1}:${item.name || item.id}`).join("；");
+      const output = job.generated_url ? `<a href="${escapeAttr(job.generated_url)}" target="_blank" rel="noreferrer">打开生成视频</a>` : "-";
+      const apiCalls = (job.api_calls || []).map((call) => {
+        const usage = call.usage ? JSON.stringify(call.usage) : "-";
+        return `#${call.id} ${call.status || "-"} ${call.model || ""} ${call.api_key_name || call.api_key_id || ""} usage=${usage}`;
+      }).join("；");
+      return `
+        <details ${job.status === "running" ? "open" : ""}>
+          <summary>#${job.id} · ${escapeHtml(job.status || "-")} · ${escapeHtml(labModeLabel(job.mode))} · ${escapeHtml(formatTimestamp(job.created_at))}</summary>
+          <dl>
+            <dt>组合</dt><dd>${escapeHtml(labPresetLabel(job))}</dd>
+            <dt>生成时间</dt><dd>${escapeHtml(formatTimestamp(job.started_at || job.created_at))} → ${escapeHtml(formatTimestamp(job.completed_at))}</dd>
+            <dt>耗时</dt><dd>${escapeHtml(labElapsedText(job))}</dd>
+            <dt>裁切</dt><dd>${escapeHtml(labClipWindowText(job))} / requested ${escapeHtml(job.requested_duration_sec || "-")}s</dd>
+            <dt>操作者</dt><dd>${escapeHtml(job.operator_name || job.operator_id || "-")}</dd>
+            <dt>task</dt><dd>${escapeHtml(job.task_id || "-")}</dd>
+            <dt>输出</dt><dd>${output}</dd>
+            <dt>API 调用</dt><dd>${escapeHtml(apiCalls || "-")}</dd>
+            <dt>prompt</dt><dd>${escapeHtml(job.prompt || "-")}</dd>
+            <dt>ref 图</dt><dd>${escapeHtml(refNames || "-")}</dd>
+            ${job.error ? `<dt>错误</dt><dd>${escapeHtml(job.error)}</dd>` : ""}
+          </dl>
+        </details>
+      `;
     }
 
     function renderLab() {
@@ -2484,6 +2582,11 @@
       if (!experiment) return null;
       const payload = {
         title: $("labTitle") ? $("labTitle").value.trim() : experiment.title,
+        note: $("labNote") ? $("labNote").value.trim() : experiment.note || "",
+        preset_id: $("labPresetSelect") ? $("labPresetSelect").value : experiment.preset_id || "",
+        preset_name: $("labPresetSelect") && $("labPresetSelect").value
+          ? $("labPresetSelect").options[$("labPresetSelect").selectedIndex]?.textContent || ""
+          : "",
         mode: $("labMode") ? $("labMode").value : experiment.mode,
         prompt: $("labPrompt") ? $("labPrompt").value.trim() : experiment.prompt,
         reference_images: selectedReferenceImages("lab"),

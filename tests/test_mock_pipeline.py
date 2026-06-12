@@ -351,9 +351,20 @@ class MockPipelineTest(unittest.TestCase):
 
         patched = self.client.patch(
             f"/api/lab/experiments/{experiment_id}",
-            json={"prompt": "lab prompt", "reference_images": refs[:2], "mode": "mock"},
+            json={
+                "title": "prompt sweep 001",
+                "note": "compare deploy refs",
+                "preset_id": "iphone2deploy",
+                "preset_name": "头部视角-iphone-参考overlap全替换",
+                "prompt": "lab prompt",
+                "reference_images": refs[:2],
+                "mode": "mock",
+            },
         )
         self.assertEqual(patched.status_code, 200, patched.text)
+        self.assertEqual(patched.json()["note"], "compare deploy refs")
+        self.assertEqual(patched.json()["preset_id"], "iphone2deploy")
+        self.assertEqual(patched.json()["preset_name"], "头部视角-iphone-参考overlap全替换")
         queued = self.client.post(
             f"/api/lab/experiments/{experiment_id}/run",
             json={"mode": "mock", "operator_id": "tester", "operator_name": "Tester"},
@@ -364,7 +375,27 @@ class MockPipelineTest(unittest.TestCase):
         listing = self.client.get("/api/lab/experiments")
         self.assertEqual(listing.status_code, 200, listing.text)
         experiment = next(item for item in listing.json() if item["id"] == experiment_id)
+        self.assertEqual(experiment["title"], "prompt sweep 001")
+        self.assertEqual(experiment["note"], "compare deploy refs")
+        self.assertEqual(experiment["preset_id"], "iphone2deploy")
+        self.assertEqual(experiment["preset_name"], "头部视角-iphone-参考overlap全替换")
+        self.assertEqual(experiment["source_video_name"], "source.mp4")
+        self.assertEqual(len(experiment["jobs"]), 1)
         self.assertEqual(experiment["latest_job"]["status"], "succeeded")
+        job = experiment["latest_job"]
+        self.assertEqual(job["preset_id"], "iphone2deploy")
+        self.assertEqual(job["preset_name"], "头部视角-iphone-参考overlap全替换")
+        self.assertEqual(job["prompt"], "lab prompt")
+        self.assertEqual(job["reference_images"], refs[:2])
+        self.assertEqual(job["source_video_name"], "source.mp4")
+        self.assertTrue(job["input_video_url"].startswith("/media/"))
+        self.assertAlmostEqual(float(job["clip_start_sec"]), 0.0, delta=0.01)
+        self.assertAlmostEqual(float(job["clip_duration_sec"]), 4.0, delta=0.15)
+        self.assertIsNotNone(job["started_at"])
+        self.assertIsNotNone(job["completed_at"])
+        self.assertGreaterEqual(job["elapsed_sec"], 0)
+        self.assertGreaterEqual(job["seconds_per_video_second"], 0)
+        self.assertEqual(job["api_calls"], [])
         generated_path = self.media_path_for_url(experiment["generated_url"])
         self.assertTrue(generated_path.exists())
         validate_video_file(generated_path, 4.0)

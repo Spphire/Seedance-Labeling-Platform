@@ -18,6 +18,7 @@ from .services import (
     generation_overrides,
     json_text,
     normalize_operator,
+    parse_json_text,
     release_seedance_key_slot,
 )
 from .settings import load_settings
@@ -103,6 +104,15 @@ def _parse_json_list(value: Any) -> list[str]:
     return [str(item) for item in parsed if str(item).strip()]
 
 
+def _api_call_payload(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["usage"] = parse_json_text(item.get("usage_json"))
+    item["has_raw_response"] = bool(item.get("raw_response_json"))
+    item.pop("usage_json", None)
+    item.pop("raw_response_json", None)
+    return item
+
+
 def _default_generation_values() -> tuple[str, list[str]]:
     settings = load_settings()
     return generation_overrides(settings, None, None)
@@ -148,7 +158,22 @@ def _job_payload(job: dict[str, Any] | None) -> dict[str, Any] | None:
         else (100 if result.get("status") == "succeeded" else 0)
     )
     result["generated_url"] = media_url_for_path(result.get("output_path"), LAB_DIR, "lab_generated")
+    result["input_video_url"] = media_url_for_path(result.get("input_video_path"), LAB_DIR, "lab_input")
     result["reference_images"] = _parse_json_list(result.get("reference_images_json"))
+    result["reference_image_items"] = [_reference_image_payload(ref_id) for ref_id in result["reference_images"]]
+    calls = db.rows(
+        """
+        SELECT * FROM seedance_api_calls
+        WHERE lab_job_id=?
+        ORDER BY created_at DESC, id DESC
+        """,
+        (result["id"],),
+    )
+    result["api_calls"] = [_api_call_payload(call) for call in calls]
+    if elapsed is not None and result.get("clip_duration_sec"):
+        result["seconds_per_video_second"] = elapsed / float(result["clip_duration_sec"])
+    else:
+        result["seconds_per_video_second"] = None
     result.pop("reference_images_json", None)
     return result
 
@@ -169,11 +194,20 @@ def _experiment_payload(row: dict[str, Any]) -> dict[str, Any]:
             """,
             (item["id"],),
         )
+    jobs = db.rows(
+        """
+        SELECT * FROM lab_generation_jobs
+        WHERE experiment_id=?
+        ORDER BY created_at DESC, id DESC
+        """,
+        (item["id"],),
+    )
     item["reference_images"] = refs
     item["reference_image_items"] = [_reference_image_payload(ref_id) for ref_id in refs]
     item["source_video_url"] = media_url_for_path(item.get("source_video_path"), LAB_DIR, "lab_source")
     item["input_video_url"] = media_url_for_path(item.get("input_video_path"), LAB_DIR, "lab_input")
     item["latest_job"] = _job_payload(latest_job)
+    item["jobs"] = [_job_payload(job) for job in jobs]
     item["generated_url"] = item["latest_job"]["generated_url"] if item.get("latest_job") else None
     item.pop("reference_images_json", None)
     return item
@@ -196,20 +230,27 @@ def create_lab_experiment(
     operator_id: str | None = None,
     operator_name: str | None = None,
 ) -> dict[str, Any]:
+    settings = load_settings()
     prompt, refs = _default_generation_values()
+    preset_id = str(settings.get("default_generation_preset_id") or "")
+    presets = settings.get("generation_presets") if isinstance(settings.get("generation_presets"), list) else []
+    preset = next((item for item in presets if str(item.get("id") or "") == preset_id), None)
+    preset_name = str(preset.get("name") or "") if preset else ""
     operator_id, operator_name = normalize_operator(operator_id, operator_name)
     now = db.now()
     with db.connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO lab_experiments(
-                title, prompt, reference_images_json, status, mode,
+                title, preset_id, preset_name, prompt, reference_images_json, status, mode,
                 operator_id, operator_name, created_at, updated_at
             )
-            VALUES (?, ?, ?, 'draft', 'mock', ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'draft', 'mock', ?, ?, ?, ?)
             """,
             (
                 (title or "").strip() or "新实验",
+                preset_id,
+                preset_name,
                 prompt,
                 json_text(refs) or "[]",
                 operator_id,
@@ -234,6 +275,12 @@ def update_lab_experiment(experiment_id: int, values: dict[str, Any]) -> dict[st
     updates: dict[str, Any] = {}
     if "title" in values and values["title"] is not None:
         updates["title"] = str(values["title"]).strip() or current["title"]
+    if "note" in values and values["note"] is not None:
+        updates["note"] = str(values["note"]).strip()
+    if "preset_id" in values and values["preset_id"] is not None:
+        updates["preset_id"] = str(values["preset_id"]).strip()
+    if "preset_name" in values and values["preset_name"] is not None:
+        updates["preset_name"] = str(values["preset_name"]).strip()
     if "prompt" in values and values["prompt"] is not None:
         prompt = str(values["prompt"]).strip()
         if not prompt:
@@ -302,13 +349,14 @@ def save_lab_video_upload(
         conn.execute(
             """
             UPDATE lab_experiments
-            SET source_video_path=?, source_duration_sec=?, input_video_path=?,
+            SET source_video_path=?, source_video_name=?, source_duration_sec=?, input_video_path=?,
                 clip_start_sec=?, clip_duration_sec=?, status='ready',
                 latest_job_id=NULL, error=NULL, updated_at=?
             WHERE id=?
             """,
             (
                 str(source_path.resolve()),
+                filename,
                 source_duration,
                 str(input_path.resolve()),
                 start,
@@ -392,9 +440,12 @@ def queue_lab_generation(
             """
             INSERT INTO lab_generation_jobs(
                 experiment_id, mode, requested_duration_sec, operator_id, operator_name,
-                prompt, reference_images_json, status, estimated_total_sec, created_at, updated_at
+                preset_id, preset_name, prompt, reference_images_json,
+                source_video_path, source_video_name, input_video_path,
+                clip_start_sec, clip_duration_sec, source_duration_sec,
+                status, estimated_total_sec, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
             """,
             (
                 int(experiment_id),
@@ -402,8 +453,16 @@ def queue_lab_generation(
                 requested,
                 operator_id,
                 operator_name,
+                str(experiment.get("preset_id") or ""),
+                str(experiment.get("preset_name") or ""),
                 str(experiment.get("prompt") or ""),
                 json_text(refs) or "[]",
+                str(experiment.get("source_video_path") or ""),
+                str(experiment.get("source_video_name") or ""),
+                str(input_path.resolve()),
+                float(experiment.get("clip_start_sec") or 0.0),
+                duration,
+                float(experiment.get("source_duration_sec") or 0.0),
                 estimate,
                 now,
                 now,
@@ -426,7 +485,8 @@ def queue_lab_generation(
 def _lab_generation_worker(job_id: int) -> None:
     job = db.one(
         """
-        SELECT j.*, e.input_video_path, e.clip_duration_sec
+        SELECT j.*, COALESCE(j.input_video_path, e.input_video_path) AS input_video_path,
+               COALESCE(j.clip_duration_sec, e.clip_duration_sec) AS clip_duration_sec
         FROM lab_generation_jobs j
         JOIN lab_experiments e ON e.id = j.experiment_id
         WHERE j.id=?

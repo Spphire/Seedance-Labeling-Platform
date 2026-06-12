@@ -47,6 +47,9 @@ class LabExperimentCreateRequest(BaseModel):
 
 class LabExperimentUpdateRequest(BaseModel):
     title: str | None = None
+    note: str | None = None
+    preset_id: str | None = None
+    preset_name: str | None = None
     prompt: str | None = None
     reference_images: list[str] | None = None
     mode: str | None = None
