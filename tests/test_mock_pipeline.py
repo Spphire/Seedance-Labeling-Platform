@@ -30,6 +30,7 @@ from app.backend.paths import (
     FINAL_DIR,
     GENERATED_DIR,
     HEAD_VIDEOS_DIR,
+    LAB_DIR,
     REFERENCE_IMAGES_DIR,
     ROOT,
 )
@@ -87,7 +88,7 @@ class MockPipelineTest(unittest.TestCase):
             backend_services._GENERATION_WORKER_KEY_SLOTS.clear()
         save_settings(dict(DEFAULT_SETTINGS))
         self.unlink_with_retry(DB_PATH)
-        for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR, FINAL_DATASET_DIR]:
+        for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR, FINAL_DATASET_DIR, LAB_DIR]:
             self.rmtree_with_retry(directory)
             directory.mkdir(parents=True, exist_ok=True)
         db.init_db()
@@ -149,6 +150,18 @@ class MockPipelineTest(unittest.TestCase):
                 self.fail(f"preview failed: {last}")
             time.sleep(0.1)
         self.fail(f"preview did not become ready, last episode state: {last}")
+
+    def wait_for_lab_generated(self, experiment_id: int, timeout_sec: float = 10.0) -> dict:
+        deadline = time.time() + timeout_sec
+        last = None
+        while time.time() < deadline:
+            last = db.one("SELECT * FROM lab_experiments WHERE id=?", (experiment_id,))
+            if last and last["status"] == "generated":
+                return last
+            if last and last["status"] == "generated_failed":
+                self.fail(f"lab generation failed: {last}")
+            time.sleep(0.1)
+        self.fail(f"lab generation did not finish, last experiment state: {last}")
 
     def make_video(self, path: Path, duration: float) -> None:
         run_ffmpeg(
@@ -312,6 +325,49 @@ class MockPipelineTest(unittest.TestCase):
         second_job = next(item for item in second_result if item.get("clip_id") == anchor["id"])
         accepted = review_clip(anchor["id"], "accept", second_job["job_id"], require_lock_token=False)
         return db.one("SELECT * FROM clips WHERE id=?", (anchor["id"],)), accepted
+
+    def test_lab_experiment_upload_cut_and_mock_run(self) -> None:
+        refs = self.make_reference_images()
+        settings = dict(DEFAULT_SETTINGS)
+        settings["reference_images"] = refs
+        settings["mock_seconds_per_video_second"] = 0.01
+        save_settings(settings)
+        db.init_db()
+        source = DATA_DIR / "lab-source.mp4"
+        self.make_video(source, 5.0)
+
+        created = self.client.post("/api/lab/experiments", json={"operator_id": "tester", "operator_name": "Tester"})
+        self.assertEqual(created.status_code, 200, created.text)
+        experiment_id = created.json()["id"]
+        with source.open("rb") as handle:
+            uploaded = self.client.post(
+                f"/api/lab/experiments/{experiment_id}/video",
+                data={"start_sec": "0", "duration_sec": "4"},
+                files={"file": ("source.mp4", handle, "video/mp4")},
+            )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        self.assertEqual(uploaded.json()["status"], "ready")
+        self.assertTrue(uploaded.json()["input_video_url"].startswith("/media/"))
+
+        patched = self.client.patch(
+            f"/api/lab/experiments/{experiment_id}",
+            json={"prompt": "lab prompt", "reference_images": refs[:2], "mode": "mock"},
+        )
+        self.assertEqual(patched.status_code, 200, patched.text)
+        queued = self.client.post(
+            f"/api/lab/experiments/{experiment_id}/run",
+            json={"mode": "mock", "operator_id": "tester", "operator_name": "Tester"},
+        )
+        self.assertEqual(queued.status_code, 200, queued.text)
+        self.assertEqual(queued.json()["status"], "generating")
+        self.wait_for_lab_generated(experiment_id)
+        listing = self.client.get("/api/lab/experiments")
+        self.assertEqual(listing.status_code, 200, listing.text)
+        experiment = next(item for item in listing.json() if item["id"] == experiment_id)
+        self.assertEqual(experiment["latest_job"]["status"], "succeeded")
+        generated_path = self.media_path_for_url(experiment["generated_url"])
+        self.assertTrue(generated_path.exists())
+        validate_video_file(generated_path, 4.0)
 
     def test_mock_generation_accept_and_stitch(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000001"

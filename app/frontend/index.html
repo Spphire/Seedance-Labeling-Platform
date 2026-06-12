@@ -106,6 +106,10 @@
       grid-template-columns: minmax(0, 1fr);
     }
 
+    .shell.lab-route {
+      grid-template-columns: 300px minmax(0, 1fr) 360px;
+    }
+
     header {
       grid-column: 1 / -1;
       display: flex;
@@ -304,6 +308,31 @@
       display: none;
     }
 
+    #labSidebar,
+    #labSettingsPanel {
+      display: none;
+    }
+
+    .shell.lab-route #labelSidebar {
+      display: none;
+    }
+
+    .shell.lab-route #labSidebar,
+    .shell.lab-route #labSettingsPanel {
+      display: block;
+      grid-row: 2;
+    }
+
+    .shell.lab-route #labSidebar {
+      grid-column: 1;
+    }
+
+    .shell.lab-route #labSettingsPanel {
+      grid-column: 3;
+      border-left: 1px solid var(--line);
+      border-right: 0;
+    }
+
     main {
       min-width: 0;
       display: grid;
@@ -315,7 +344,16 @@
       grid-column: 1 / -1;
     }
 
+    .shell.lab-route main {
+      grid-column: 2;
+      grid-template-rows: minmax(0, 1fr) 116px;
+    }
+
     .shell.admin-route .tabs {
+      display: none;
+    }
+
+    .shell.lab-route .tabs {
       display: none;
     }
 
@@ -445,6 +483,90 @@
     .item.focused {
       border-color: var(--accent);
       box-shadow: inset 3px 0 0 var(--accent);
+    }
+
+    .lab-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .lab-item {
+      cursor: pointer;
+    }
+
+    .lab-controls {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .lab-workspace {
+      display: grid;
+      gap: 14px;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+
+    .lab-drop {
+      min-height: 114px;
+      display: grid;
+      place-items: center;
+      border: 1px dashed #8da2b5;
+      border-radius: 8px;
+      background: #f8fafc;
+      color: var(--muted);
+      text-align: center;
+      padding: 14px;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+
+    .lab-drop.dragover {
+      border-color: var(--accent);
+      background: var(--focus);
+      color: var(--accent);
+    }
+
+    .lab-video-tools {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+      gap: 8px;
+      align-items: end;
+      margin-top: 10px;
+    }
+
+    .lab-video-tools label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .lab-ref-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .lab-ref-thumb {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      padding: 7px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      font-size: 12px;
+    }
+
+    .lab-ref-thumb img {
+      width: 48px;
+      aspect-ratio: 1 / 1;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      object-fit: cover;
+      background: #f1f3f5;
     }
 
     .item-title {
@@ -935,6 +1057,31 @@
         border-bottom: 1px solid var(--line);
       }
 
+      .shell.lab-route {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto minmax(0, 1fr) auto;
+      }
+
+      .shell.lab-route #labSidebar,
+      .shell.lab-route main,
+      .shell.lab-route #labSettingsPanel {
+        grid-column: 1;
+      }
+
+      .shell.lab-route #labSidebar {
+        grid-row: 2;
+      }
+
+      .shell.lab-route main {
+        grid-row: 3;
+      }
+
+      .shell.lab-route #labSettingsPanel {
+        grid-row: 4;
+        max-height: none;
+        border-left: 0;
+      }
+
       main {
         grid-template-rows: 43px minmax(0, 1fr) 116px;
       }
@@ -947,6 +1094,10 @@
       .admin-grid {
         grid-template-columns: 1fr;
       }
+
+      .lab-video-tools {
+        grid-template-columns: 1fr 1fr;
+      }
     }
   </style>
 </head>
@@ -957,6 +1108,7 @@
       <div class="header-actions">
         <a id="labelRoute" class="route-link" href="/label">标注</a>
         <a id="adminRoute" class="route-link" href="/admin">管理员</a>
+        <a id="labRoute" class="route-link" href="/lab">Lab</a>
         <input id="reviewerName" class="reviewer" placeholder="审核人">
         <button id="openSettings" class="icon-button" title="设置" aria-label="设置">&#9881;</button>
         <button id="refresh" class="primary">刷新</button>
@@ -1146,6 +1298,17 @@
       </section>
     </aside>
 
+    <aside id="labSidebar">
+      <section class="block">
+        <h2>Prompt Lab</h2>
+        <div class="lab-controls">
+          <button id="newLabExperiment" class="primary">新建实验</button>
+          <div class="hint">左侧记录只用于快速实验，不会写入正式 episode/clip 流程。</div>
+        </div>
+        <div id="labExperimentList" class="lab-list"></div>
+      </section>
+    </aside>
+
     <main>
       <nav id="tabs" class="tabs"></nav>
       <section id="workspace" class="workspace">
@@ -1153,6 +1316,15 @@
       </section>
       <div id="status" class="statusbar">ready</div>
     </main>
+
+    <aside id="labSettingsPanel">
+      <section class="block">
+        <h2>本次实验设置</h2>
+        <div id="labSettingsBody" class="lab-settings-body">
+          <div class="empty">新建或选择一个实验</div>
+        </div>
+      </section>
+    </aside>
   </div>
 
   <script>
@@ -1162,9 +1334,11 @@
       jobs: [],
       locks: [],
       settings: {},
+      labExperiments: [],
+      activeLabExperimentId: null,
       seedanceUsage: null,
       reviewerActivity: null,
-      route: location.pathname.startsWith("/admin") ? "admin" : "label",
+      route: location.pathname.startsWith("/admin") ? "admin" : location.pathname.startsWith("/lab") ? "lab" : "label",
       tabs: [],
       activeClipId: null,
       selectedEpisode: null,
@@ -1289,9 +1463,11 @@
 
     function applyRouteMode() {
       $("appShell").classList.toggle("admin-route", state.route === "admin");
+      $("appShell").classList.toggle("lab-route", state.route === "lab");
       $("labelRoute").classList.toggle("active", state.route === "label");
       $("adminRoute").classList.toggle("active", state.route === "admin");
-      $("openSettings").title = state.route === "admin" ? "后台管理员设置" : "本次生成设置";
+      $("labRoute").classList.toggle("active", state.route === "lab");
+      $("openSettings").title = state.route === "admin" ? "后台管理员设置" : state.route === "lab" ? "Lab 实验设置" : "本次生成设置";
       $("openSettings").setAttribute("aria-label", $("openSettings").title);
       $("settingsOverlay").classList.add("hidden");
       $("runSettingsOverlay").classList.add("hidden");
@@ -1330,8 +1506,9 @@
 
     async function api(path, options = {}, retryAuth = true) {
       const opts = { ...options };
-      opts.headers = { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) };
-      if (opts.body && typeof opts.body !== "string") {
+      const isFormData = opts.body instanceof FormData;
+      opts.headers = { ...(isFormData ? {} : { "Content-Type": "application/json" }), ...authHeaders(), ...(opts.headers || {}) };
+      if (opts.body && !isFormData && typeof opts.body !== "string") {
         opts.body = JSON.stringify(opts.body);
       }
       const res = await fetch(path, opts);
@@ -1372,6 +1549,9 @@
         state.availableReferenceImages = state.settings.available_reference_images || [];
         if (state.route === "admin") {
           await loadAdminData({ render: false }).catch((err) => log(formatApiError(err)));
+        }
+        if (state.route === "lab") {
+          await loadLabExperiments({ render: false }).catch((err) => log(formatApiError(err)));
         }
         if (!$("generationMode").dataset.initialized) {
           $("generationMode").value = "mock";
@@ -1703,7 +1883,11 @@
     }
 
     function updateReferenceSlotControls(scope) {
-      const removeButton = scope === "settings" ? $("removeReferenceImageSlot") : $("removeRunReferenceImageSlot");
+      const removeButton = scope === "settings"
+        ? $("removeReferenceImageSlot")
+        : scope === "lab"
+          ? $("removeLabReferenceImageSlot")
+          : $("removeRunReferenceImageSlot");
       if (!removeButton) return;
       removeButton.disabled = document.querySelectorAll(`[data-ref-image-scope="${scope}"]`).length <= 1;
     }
@@ -2014,6 +2198,404 @@
       return { usage, reviews };
     }
 
+    async function loadLabExperiments(options = {}) {
+      const data = await api("/api/lab/experiments");
+      state.labExperiments = data || [];
+      if (state.activeLabExperimentId && !state.labExperiments.some((item) => Number(item.id) === Number(state.activeLabExperimentId))) {
+        state.activeLabExperimentId = null;
+      }
+      if (!state.activeLabExperimentId && state.labExperiments.length) {
+        state.activeLabExperimentId = state.labExperiments[0].id;
+      }
+      if (options.render !== false && state.route === "lab") {
+        render({ forceWorkspace: true });
+      }
+      return state.labExperiments;
+    }
+
+    function activeLabExperiment() {
+      return state.labExperiments.find((item) => Number(item.id) === Number(state.activeLabExperimentId)) || null;
+    }
+
+    async function ensureLabExperiment() {
+      const current = activeLabExperiment();
+      if (current) return current;
+      const created = await api("/api/lab/experiments", {
+        method: "POST",
+        body: { ...operatorPayload() },
+      });
+      state.activeLabExperimentId = created.id;
+      await refresh({ silent: true, forceWorkspace: true });
+      return activeLabExperiment() || created;
+    }
+
+    function labStatusLabel(status) {
+      const labels = {
+        draft: "草稿",
+        ready: "待生成",
+        generating: "生成中",
+        generated: "已生成",
+        generated_failed: "失败",
+      };
+      return labels[status] || status || "unknown";
+    }
+
+    function labModeLabel(mode) {
+      return mode === "seedance" ? "seedance" : "mock";
+    }
+
+    function labJobNotice(experiment) {
+      const job = experiment.latest_job;
+      if (experiment.status === "generating" && job) {
+        return `
+          <div class="notice stitching">
+            <span data-live="lab-job-text">实验生成中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。</span>
+            <div class="progress running" title="${job.progress_pct || 0}%"><span data-live="lab-job-progress" style="width: ${job.progress_pct || 0}%"></span></div>
+          </div>
+        `;
+      }
+      if (experiment.status === "generated_failed") {
+        return `<div class="notice failed">实验生成失败：${escapeHtml(experiment.error || job?.error || "未知错误")}</div>`;
+      }
+      return "";
+    }
+
+    function renderLabSidebar() {
+      const target = $("labExperimentList");
+      if (!target) return;
+      target.innerHTML = state.labExperiments.length
+        ? state.labExperiments.map((experiment) => {
+          const active = Number(experiment.id) === Number(state.activeLabExperimentId);
+          const job = experiment.latest_job;
+          const facts = [
+            labModeLabel(experiment.mode),
+            `${Number(experiment.clip_start_sec || 0).toFixed(1)}s + ${Number(experiment.clip_duration_sec || 0).toFixed(1)}s`,
+          ];
+          if (job) facts.push(`job ${job.id} ${job.status}`);
+          return `
+            <div class="item lab-item ${active ? "active" : ""}" data-lab-experiment-id="${experiment.id}">
+              <div class="item-title">
+                <span>${escapeHtml(experiment.title || `实验 ${experiment.id}`)}</span>
+                ${badge(experiment.status, labStatusLabel(experiment.status))}
+              </div>
+              <div class="meta">${facts.map(escapeHtml).join(" · ")}</div>
+            </div>
+          `;
+        }).join("")
+        : `<div class="episode-empty">还没有实验记录，点击“新建实验”开始。</div>`;
+      target.querySelectorAll("[data-lab-experiment-id]").forEach((item) => {
+        item.addEventListener("click", () => {
+          state.activeLabExperimentId = Number(item.dataset.labExperimentId);
+          render({ forceWorkspace: true });
+        });
+      });
+    }
+
+    function renderLabWorkspace() {
+      const target = $("workspace");
+      const experiment = activeLabExperiment();
+      if (!experiment) {
+        target.innerHTML = `<div class="empty">新建一次实验，然后把参考视频拖进中间窗口。</div>`;
+        target.dataset.signature = "lab-empty";
+        return;
+      }
+      const job = experiment.latest_job;
+      const sourceVideo = mediaUrl(experiment.input_video_url || "", experiment.updated_at, experiment.input_video_path);
+      const generatedVideo = mediaUrl(experiment.generated_url || "", job ? job.updated_at : "", job ? job.output_path : "");
+      const signature = [
+        "lab",
+        experiment.id,
+        experiment.status,
+        experiment.input_video_url,
+        experiment.generated_url,
+        experiment.clip_start_sec,
+        experiment.clip_duration_sec,
+        job ? `${job.id}:${job.status}:${job.updated_at}` : "",
+      ].join("|");
+      if (target.dataset.signature === signature) {
+        updateLabLiveFields(experiment);
+        return;
+      }
+      const canRun = !!experiment.input_video_url && experiment.status !== "generating";
+      target.innerHTML = `
+        <div class="lab-workspace">
+          ${labJobNotice(experiment)}
+          <div class="review-head">
+            <div class="review-title">
+              <h2>${escapeHtml(experiment.title || `实验 ${experiment.id}`)}</h2>
+              <div class="meta">Lab #${experiment.id} · ${labStatusLabel(experiment.status)} · ${Number(experiment.reference_images?.length || 0)} 张 ref 图</div>
+            </div>
+            <div class="actions">
+              ${renderPlaybackSpeedControl()}
+              <button data-lab-action="run" class="primary" ${canRun ? "" : "disabled"}>重跑</button>
+            </div>
+          </div>
+          <div class="videos">
+            <div class="video-pane">
+              <h3><span>Raw / clip 输入</span><span>${badge(experiment.status, labStatusLabel(experiment.status))}</span></h3>
+              ${sourceVideo
+                ? `<video id="originalVideo" src="${sourceVideo}" controls playsinline></video>`
+                : `<div id="labVideoDrop" class="lab-drop">把参考视频拖到这里，或在下方选择文件</div>`}
+            </div>
+            <div class="video-pane">
+              <h3><span>生成结果</span><span>${badge(job?.status || experiment.status)}</span></h3>
+              <video id="generatedVideo" src="${generatedVideo}" controls playsinline></video>
+            </div>
+          </div>
+          <div class="lab-video-tools">
+            <label>
+              起始秒
+              <input id="labClipStart" type="number" min="0" step="0.1" value="${Number(experiment.clip_start_sec || 0)}">
+            </label>
+            <label>
+              clip 秒数
+              <input id="labClipDuration" type="number" min="4" max="15" step="0.1" value="${Number(experiment.clip_duration_sec || 4)}">
+            </label>
+            <label>
+              上传视频
+              <input id="labVideoFile" type="file" accept="video/*">
+            </label>
+            <button data-lab-action="apply-cut" ${experiment.source_video_path ? "" : "disabled"}>应用裁切</button>
+          </div>
+        </div>
+      `;
+      target.dataset.signature = signature;
+      wireLabWorkspaceActions(experiment);
+      wireSync();
+    }
+
+    function updateLabLiveFields(experiment) {
+      const job = experiment.latest_job;
+      const text = document.querySelector("[data-live='lab-job-text']");
+      if (text && job && job.status === "running") {
+        text.textContent = `实验生成中：已耗时 ${formatDuration(job.elapsed_sec)}，预计剩余 ${formatDuration(job.remaining_estimated_sec)}。`;
+      }
+      const progress = document.querySelector("[data-live='lab-job-progress']");
+      if (progress && job && job.status === "running") {
+        progress.style.width = `${job.progress_pct || 0}%`;
+      }
+    }
+
+    function renderLabSettings() {
+      const target = $("labSettingsBody");
+      if (!target) return;
+      const experiment = activeLabExperiment();
+      if (!experiment) {
+        target.innerHTML = `<div class="empty">新建或选择一个实验</div>`;
+        return;
+      }
+      const presets = normalizedGenerationPresets();
+      const presetOptions = [
+        `<option value="">自定义</option>`,
+        ...presets.map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.name)}</option>`),
+      ].join("");
+      const refs = experiment.reference_images || [];
+      target.innerHTML = `
+        <div class="field">
+          <label for="labTitle">实验名称</label>
+          <input id="labTitle" value="${escapeAttr(experiment.title || "")}">
+        </div>
+        <div class="field">
+          <label for="labMode">运行模式</label>
+          <select id="labMode">
+            <option value="mock" ${experiment.mode !== "seedance" ? "selected" : ""}>mock（默认，不消耗额度）</option>
+            <option value="seedance" ${experiment.mode === "seedance" ? "selected" : ""}>seedance（真实消耗额度）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="labPresetSelect">Prompt/ref 组合</label>
+          <select id="labPresetSelect">${presetOptions}</select>
+        </div>
+        <div class="field">
+          <label for="labPrompt">Prompt</label>
+          <textarea id="labPrompt" spellcheck="false">${escapeHtml(experiment.prompt || "")}</textarea>
+        </div>
+        <div class="field">
+          <label>参考图顺序</label>
+          <div id="labReferenceImageOrder" class="ref-image-order"></div>
+          <div class="row">
+            <button id="addLabReferenceImageSlot">添加参考图</button>
+            <button id="removeLabReferenceImageSlot">移除最后一张</button>
+          </div>
+        </div>
+        <div id="labImageDrop" class="lab-drop">把参考图拖到这里加入本实验</div>
+        <div class="lab-ref-list">
+          ${(experiment.reference_image_items || []).map((item, index) => `
+            <div class="lab-ref-thumb">
+              <img src="${escapeAttr(item.url || "")}" alt="">
+              <div>
+                <strong>图片${index + 1}</strong>
+                <div class="meta">${escapeHtml(item.name || item.id)}</div>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+        <div class="admin-actions">
+          <button id="saveLabSettings">保存设置</button>
+          <button id="runLabExperiment" class="primary" ${experiment.input_video_url && experiment.status !== "generating" ? "" : "disabled"}>重跑</button>
+        </div>
+      `;
+      renderReferenceImageSelectors("labReferenceImageOrder", refs, "lab", () => {});
+      wireLabSettingsActions(experiment);
+    }
+
+    function renderLab() {
+      renderLabSidebar();
+      renderLabWorkspace();
+      renderLabSettings();
+    }
+
+    async function saveActiveLabSettings() {
+      const experiment = activeLabExperiment();
+      if (!experiment) return null;
+      const payload = {
+        title: $("labTitle") ? $("labTitle").value.trim() : experiment.title,
+        mode: $("labMode") ? $("labMode").value : experiment.mode,
+        prompt: $("labPrompt") ? $("labPrompt").value.trim() : experiment.prompt,
+        reference_images: selectedReferenceImages("lab"),
+        ...operatorPayload(),
+      };
+      const saved = await api(`/api/lab/experiments/${experiment.id}`, {
+        method: "PATCH",
+        body: payload,
+      });
+      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(saved.id) ? saved : item);
+      return saved;
+    }
+
+    async function applyLabCut() {
+      const experiment = activeLabExperiment();
+      if (!experiment) return;
+      const payload = {
+        clip_start_sec: Number.parseFloat($("labClipStart").value) || 0,
+        clip_duration_sec: Number.parseFloat($("labClipDuration").value) || 4,
+      };
+      const saved = await api(`/api/lab/experiments/${experiment.id}`, {
+        method: "PATCH",
+        body: payload,
+      });
+      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(saved.id) ? saved : item);
+      render({ forceWorkspace: true });
+    }
+
+    async function runActiveLabExperiment() {
+      const experiment = activeLabExperiment();
+      if (!experiment) throw new Error("请先新建或选择实验");
+      await saveActiveLabSettings();
+      const mode = $("labMode") ? $("labMode").value : experiment.mode || "mock";
+      const updated = await api(`/api/lab/experiments/${experiment.id}/run`, {
+        method: "POST",
+        body: { mode, ...operatorPayload() },
+      });
+      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(updated.id) ? updated : item);
+      log(`${mode} lab generation submitted`, updated.latest_job || updated);
+      render({ forceWorkspace: true });
+    }
+
+    async function uploadLabVideo(file) {
+      if (!file) return;
+      const experiment = await ensureLabExperiment();
+      const form = new FormData();
+      form.append("file", file);
+      const startInput = $("labClipStart");
+      const durationInput = $("labClipDuration");
+      form.append("start_sec", startInput ? startInput.value || "0" : String(experiment.clip_start_sec || 0));
+      form.append("duration_sec", durationInput ? durationInput.value || "4" : String(experiment.clip_duration_sec || 4));
+      const updated = await api(`/api/lab/experiments/${experiment.id}/video`, { method: "POST", body: form });
+      state.activeLabExperimentId = updated.id;
+      await refresh({ silent: true, forceWorkspace: true });
+      log("lab reference video uploaded");
+    }
+
+    async function uploadLabImages(files) {
+      const imageFiles = [...(files || [])].filter((file) => file.type.startsWith("image/"));
+      if (!imageFiles.length) return;
+      const experiment = await ensureLabExperiment();
+      const form = new FormData();
+      imageFiles.forEach((file) => form.append("files", file));
+      const updated = await api(`/api/lab/experiments/${experiment.id}/images`, { method: "POST", body: form });
+      state.activeLabExperimentId = updated.id;
+      await refresh({ silent: true, forceWorkspace: true });
+      log(`${imageFiles.length} 张参考图已加入 lab`);
+    }
+
+    function wireLabDropZone(element, onFiles) {
+      if (!element) return;
+      ["dragenter", "dragover"].forEach((eventName) => {
+        element.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          element.classList.add("dragover");
+        });
+      });
+      ["dragleave", "drop"].forEach((eventName) => {
+        element.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          element.classList.remove("dragover");
+        });
+      });
+      element.addEventListener("drop", (event) => {
+        const files = event.dataTransfer ? [...event.dataTransfer.files] : [];
+        onFiles(files).catch((err) => log(formatApiError(err)));
+      });
+    }
+
+    function wireLabWorkspaceActions(experiment) {
+      const videoInput = $("labVideoFile");
+      if (videoInput) {
+        videoInput.addEventListener("change", () => uploadLabVideo(videoInput.files[0]).catch((err) => log(formatApiError(err))));
+      }
+      wireLabDropZone($("labVideoDrop") || document.querySelector(".video-pane"), async (files) => {
+        const file = files.find((item) => item.type.startsWith("video/")) || files[0];
+        await uploadLabVideo(file);
+      });
+      document.querySelectorAll("[data-lab-action]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          try {
+            if (button.dataset.labAction === "run") {
+              await runActiveLabExperiment();
+            }
+            if (button.dataset.labAction === "apply-cut") {
+              await applyLabCut();
+              log("lab clip cut updated");
+            }
+          } catch (err) {
+            log(formatApiError(err));
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+    }
+
+    function wireLabSettingsActions(experiment) {
+      $("labPresetSelect").addEventListener("change", () => {
+        const preset = normalizedGenerationPresets().find((item) => item.id === $("labPresetSelect").value);
+        if (!preset) return;
+        $("labPrompt").value = preset.prompt || "";
+        renderReferenceImageSelectors("labReferenceImageOrder", preset.reference_images || [], "lab", () => {});
+      });
+      $("addLabReferenceImageSlot").addEventListener("click", () => addReferenceImageSlot("labReferenceImageOrder", "lab", () => {}));
+      $("removeLabReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("labReferenceImageOrder", "lab", () => {}));
+      $("saveLabSettings").addEventListener("click", async () => {
+        try {
+          await saveActiveLabSettings();
+          await refresh({ silent: true, forceWorkspace: true });
+          log("lab settings saved");
+        } catch (err) {
+          log(formatApiError(err));
+        }
+      });
+      $("runLabExperiment").addEventListener("click", async () => {
+        try {
+          await runActiveLabExperiment();
+        } catch (err) {
+          log(formatApiError(err));
+        }
+      });
+      wireLabDropZone($("labImageDrop"), uploadLabImages);
+    }
+
     function renderSeedanceUsage() {
       const data = state.seedanceUsage || {};
       const summaryTarget = $("seedanceUsageSummary");
@@ -2036,7 +2618,7 @@
         ? recent.map((row) => `
           <div class="usage-row">
             <div>
-              <strong>${escapeHtml(row.episode_uuid ? `${shortUuid(row.episode_uuid)} #${row.clip_index}` : `clip ${row.clip_id || "-"}`)}</strong>
+              <strong>${escapeHtml(row.episode_uuid ? `${shortUuid(row.episode_uuid)} #${row.clip_index}` : row.lab_job_id ? `lab job ${row.lab_job_id}` : `clip ${row.clip_id || "-"}`)}</strong>
               <span>${escapeHtml(row.operator_name || row.operator_id || "unknown")} · ${escapeHtml(row.status || "-")} · task ${escapeHtml(row.task_id || "-")} · usage ${row.usage ? "yes" : "none"}</span>
             </div>
             <div>${formatTimestamp(row.created_at)}</div>
@@ -2240,7 +2822,8 @@
         state.pollTimer = null;
       }
       const hasActiveWork = state.episodes.some((episode) => episode.final_status === "stitching" || episode.preview_status === "stitching")
-        || state.clips.some((clip) => clip.status === "generating");
+        || state.clips.some((clip) => clip.status === "generating")
+        || state.labExperiments.some((experiment) => experiment.status === "generating");
       const delay = document.hidden ? 30000 : hasActiveWork ? 1500 : 15000;
       state.pollTimer = setTimeout(() => {
         refresh({ silent: true }).catch((err) => log(formatApiError(err)));
@@ -3173,6 +3756,10 @@
     }
 
     function render(options = {}) {
+      if (state.route === "lab") {
+        renderLab();
+        return;
+      }
       renderEpisodes();
       renderClips();
       renderTabs();
@@ -3216,6 +3803,19 @@
     $("removeReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("referenceImageOrder", "settings", markSettingsDirty));
     $("addRunReferenceImageSlot").addEventListener("click", () => addReferenceImageSlot("runReferenceImageOrder", "run", updateRunSettingsSummary));
     $("removeRunReferenceImageSlot").addEventListener("click", () => removeReferenceImageSlot("runReferenceImageOrder", "run", updateRunSettingsSummary));
+    $("newLabExperiment").addEventListener("click", async () => {
+      try {
+        const created = await api("/api/lab/experiments", {
+          method: "POST",
+          body: { ...operatorPayload() },
+        });
+        state.activeLabExperimentId = created.id;
+        await refresh({ silent: true, forceWorkspace: true });
+        log(`lab experiment created: ${created.title}`);
+      } catch (err) {
+        log(formatApiError(err));
+      }
+    });
     $("adminPresetSelect").addEventListener("change", () => {
       const nextPresetId = $("adminPresetSelect").value;
       captureActiveAdminPreset();
@@ -3278,6 +3878,8 @@
       if (state.route === "admin") {
         $("settingsOverlay").classList.remove("hidden");
         $("dm3NedfRoot").focus();
+      } else if (state.route === "lab") {
+        $("labPrompt")?.focus();
       } else {
         $("runSettingsOverlay").classList.remove("hidden");
         $("runPrompt").focus();

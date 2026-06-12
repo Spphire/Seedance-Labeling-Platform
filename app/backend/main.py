@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +18,9 @@ from .schema import (
     EpisodeBatchRequest,
     GenerationRunRequest,
     ImportHeadVideoRequest,
+    LabExperimentCreateRequest,
+    LabExperimentUpdateRequest,
+    LabGenerationRequest,
     LockReleaseRequest,
     LockRenewRequest,
     LockRequest,
@@ -25,6 +28,15 @@ from .schema import (
     PreprocessRequest,
     ReviewRequest,
     SubmitPreprocessRequest,
+)
+from .lab import (
+    create_lab_experiment,
+    get_lab_experiment,
+    list_lab_experiments,
+    queue_lab_generation,
+    save_lab_reference_images,
+    save_lab_video_upload,
+    update_lab_experiment,
 )
 from .services import (
     auto_accept_all,
@@ -154,6 +166,11 @@ def label_index() -> FileResponse:
 
 @app.get("/admin")
 def admin_index() -> FileResponse:
+    return frontend_index()
+
+
+@app.get("/lab")
+def lab_index() -> FileResponse:
     return frontend_index()
 
 
@@ -354,6 +371,81 @@ def get_clips() -> list[dict[str, Any]]:
 @app.get("/api/jobs")
 def get_jobs() -> list[dict[str, Any]]:
     return list_jobs()
+
+
+@app.get("/api/lab/experiments")
+def get_lab_experiments_api(request: Request) -> list[dict[str, Any]]:
+    require_reviewer(request)
+    return list_lab_experiments()
+
+
+@app.post("/api/lab/experiments")
+def post_lab_experiment(payload: LabExperimentCreateRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return create_lab_experiment(payload.title, payload.operator_id, payload.operator_name)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.get("/api/lab/experiments/{experiment_id}")
+def get_lab_experiment_api(experiment_id: int, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return get_lab_experiment(experiment_id)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.patch("/api/lab/experiments/{experiment_id}")
+def patch_lab_experiment(experiment_id: int, payload: LabExperimentUpdateRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return update_lab_experiment(experiment_id, payload.model_dump(exclude_unset=True))
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/lab/experiments/{experiment_id}/video")
+async def post_lab_video(
+    experiment_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    start_sec: float | None = Form(None),
+    duration_sec: float | None = Form(None),
+) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return save_lab_video_upload(experiment_id, file.filename or "source.mp4", file.file, start_sec, duration_sec)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+    finally:
+        await file.close()
+
+
+@app.post("/api/lab/experiments/{experiment_id}/images")
+async def post_lab_images(
+    experiment_id: int,
+    request: Request,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return save_lab_reference_images(experiment_id, [(file.filename or "ref.png", file.file) for file in files])
+    except Exception as exc:
+        raise _public_error(exc) from exc
+    finally:
+        for file in files:
+            await file.close()
+
+
+@app.post("/api/lab/experiments/{experiment_id}/run")
+def post_lab_run(experiment_id: int, payload: LabGenerationRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return queue_lab_generation(experiment_id, payload.mode, payload.operator_id, payload.operator_name)
+    except Exception as exc:
+        raise _public_error(exc) from exc
 
 
 @app.get("/api/usage/seedance")

@@ -39,6 +39,29 @@ class GenerationRunRequest(BaseModel):
     reference_images: list[str] | None = None
 
 
+class LabExperimentCreateRequest(BaseModel):
+    title: str | None = None
+    operator_id: str | None = None
+    operator_name: str | None = None
+
+
+class LabExperimentUpdateRequest(BaseModel):
+    title: str | None = None
+    prompt: str | None = None
+    reference_images: list[str] | None = None
+    mode: str | None = None
+    clip_start_sec: float | None = None
+    clip_duration_sec: float | None = None
+    operator_id: str | None = None
+    operator_name: str | None = None
+
+
+class LabGenerationRequest(BaseModel):
+    mode: str | None = None
+    operator_id: str | None = None
+    operator_name: str | None = None
+
+
 class AnchorCandidatesRequest(BaseModel):
     start_secs: list[float]
     lock_token: str | None = None

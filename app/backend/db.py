@@ -168,6 +168,47 @@ def init_db() -> None:
                 created_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS lab_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                reference_images_json TEXT NOT NULL DEFAULT '[]',
+                source_video_path TEXT,
+                source_duration_sec REAL,
+                input_video_path TEXT,
+                clip_start_sec REAL NOT NULL DEFAULT 0,
+                clip_duration_sec REAL NOT NULL DEFAULT 4,
+                status TEXT NOT NULL DEFAULT 'draft',
+                mode TEXT NOT NULL DEFAULT 'mock',
+                latest_job_id INTEGER,
+                error TEXT,
+                operator_id TEXT,
+                operator_name TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lab_generation_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id INTEGER NOT NULL REFERENCES lab_experiments(id) ON DELETE CASCADE,
+                mode TEXT NOT NULL,
+                requested_duration_sec INTEGER NOT NULL,
+                operator_id TEXT,
+                operator_name TEXT,
+                prompt TEXT,
+                reference_images_json TEXT,
+                task_id TEXT,
+                status TEXT NOT NULL DEFAULT 'queued',
+                output_url TEXT,
+                output_path TEXT,
+                error TEXT,
+                started_at REAL,
+                completed_at REAL,
+                estimated_total_sec REAL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_resource_locks_expires_at
             ON resource_locks(expires_at);
 
@@ -179,6 +220,12 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_seedance_api_calls_clip
             ON seedance_api_calls(clip_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_lab_experiments_updated
+            ON lab_experiments(updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_lab_generation_jobs_experiment
+            ON lab_generation_jobs(experiment_id, created_at);
             """
         )
         _ensure_column(conn, "generation_jobs", "started_at", "REAL")
@@ -190,6 +237,7 @@ def init_db() -> None:
         _ensure_column(conn, "generation_jobs", "reference_images_json", "TEXT")
         _ensure_column(conn, "seedance_api_calls", "api_key_id", "TEXT")
         _ensure_column(conn, "seedance_api_calls", "api_key_name", "TEXT")
+        _ensure_column(conn, "seedance_api_calls", "lab_job_id", "INTEGER")
         _ensure_column(conn, "clips", "source_start_sec", "REAL")
         _ensure_column(conn, "clips", "source_duration_sec", "REAL")
         _ensure_column(conn, "clips", "overlap_sec", "REAL NOT NULL DEFAULT 0")
