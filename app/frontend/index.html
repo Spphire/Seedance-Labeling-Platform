@@ -1370,8 +1370,8 @@
     window.__seedanceState = state;
 
     function routeFromPath(pathname = location.pathname) {
-      if (pathname.startsWith("/admin")) return "admin";
-      if (pathname.startsWith("/lab")) return "lab";
+      if (pathname === "/admin" || pathname.startsWith("/admin/")) return "admin";
+      if (pathname === "/lab" || pathname.startsWith("/lab/")) return "lab";
       return "label";
     }
 
