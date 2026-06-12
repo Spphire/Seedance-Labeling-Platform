@@ -2610,9 +2610,52 @@
         method: "PATCH",
         body: payload,
       });
-      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(saved.id) ? saved : item);
+      replaceLabExperiment(saved);
       state.labSettingsDirty = false;
       return saved;
+    }
+
+    function captureLabSettingsDraft(experiment = activeLabExperiment()) {
+      if (!experiment) return null;
+      const presetSelect = $("labPresetSelect");
+      return {
+        title: $("labTitle") ? $("labTitle").value : experiment.title,
+        note: $("labNote") ? $("labNote").value : experiment.note || "",
+        preset_id: presetSelect ? presetSelect.value : experiment.preset_id || "",
+        preset_name: presetSelect && presetSelect.value
+          ? presetSelect.options[presetSelect.selectedIndex]?.textContent || ""
+          : "",
+        mode: $("labMode") ? $("labMode").value : experiment.mode,
+        prompt: $("labPrompt") ? $("labPrompt").value : experiment.prompt,
+        reference_images: $("labReferenceImageOrder") ? selectedReferenceImages("lab") : experiment.reference_images || [],
+      };
+    }
+
+    function applyLabSettingsDraft(experiment, draft) {
+      if (!experiment || !draft) return experiment;
+      return {
+        ...experiment,
+        title: draft.title !== undefined ? draft.title : experiment.title,
+        note: draft.note || "",
+        preset_id: draft.preset_id || "",
+        preset_name: draft.preset_name || "",
+        mode: draft.mode || experiment.mode,
+        prompt: draft.prompt !== undefined ? draft.prompt : experiment.prompt,
+        reference_images: [...(draft.reference_images || [])],
+        reference_image_items: referenceImageItemsForIds(draft.reference_images || []),
+      };
+    }
+
+    function referenceImageItemsForIds(refIds) {
+      const byId = new Map((state.availableReferenceImages || []).map((item) => [item.id, item]));
+      return (refIds || []).map((id) => {
+        const known = byId.get(id);
+        return known ? { id: known.id, name: known.name, url: known.url } : { id, name: String(id).split("/").pop() || id, url: "" };
+      });
+    }
+
+    function replaceLabExperiment(experiment) {
+      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(experiment.id) ? experiment : item);
     }
 
     async function applyLabCut() {
@@ -2626,7 +2669,7 @@
         method: "PATCH",
         body: payload,
       });
-      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(saved.id) ? saved : item);
+      replaceLabExperiment(saved);
       render({ forceWorkspace: true });
     }
 
@@ -2639,7 +2682,7 @@
         method: "POST",
         body: { mode, ...operatorPayload() },
       });
-      state.labExperiments = state.labExperiments.map((item) => Number(item.id) === Number(updated.id) ? updated : item);
+      replaceLabExperiment(updated);
       log(`${mode} lab generation submitted`, updated.latest_job || updated);
       render({ forceWorkspace: true });
     }
@@ -2647,6 +2690,8 @@
     async function uploadLabVideo(file) {
       if (!file) return;
       const experiment = await ensureLabExperiment();
+      const wasDirty = state.labSettingsDirty;
+      const draft = captureLabSettingsDraft(experiment);
       const form = new FormData();
       form.append("file", file);
       const startInput = $("labClipStart");
@@ -2655,8 +2700,9 @@
       form.append("duration_sec", durationInput ? durationInput.value || "4" : String(experiment.clip_duration_sec || 4));
       const updated = await api(`/api/lab/experiments/${experiment.id}/video`, { method: "POST", body: form });
       state.activeLabExperimentId = updated.id;
-      state.labSettingsDirty = false;
-      await refresh({ silent: true, forceWorkspace: true });
+      replaceLabExperiment(applyLabSettingsDraft(updated, draft));
+      state.labSettingsDirty = wasDirty;
+      render({ forceWorkspace: true, preserveLabSettings: true });
       log("lab reference video uploaded");
     }
 
@@ -2664,12 +2710,25 @@
       const imageFiles = [...(files || [])].filter((file) => file.type.startsWith("image/"));
       if (!imageFiles.length) return;
       const experiment = await ensureLabExperiment();
+      const wasDirty = state.labSettingsDirty;
+      const draft = captureLabSettingsDraft(experiment);
+      const serverBefore = await api(`/api/lab/experiments/${experiment.id}`);
+      const beforeRefs = new Set(serverBefore.reference_images || []);
       const form = new FormData();
       imageFiles.forEach((file) => form.append("files", file));
       const updated = await api(`/api/lab/experiments/${experiment.id}/images`, { method: "POST", body: form });
+      const uploadedRefs = (updated.reference_images || []).filter((ref) => !beforeRefs.has(ref));
+      const health = await api("/api/health");
+      state.settings = health.settings || state.settings;
+      state.availableReferenceImages = state.settings.available_reference_images || state.availableReferenceImages || [];
+      const nextDraft = {
+        ...draft,
+        reference_images: [...(draft?.reference_images || []), ...uploadedRefs],
+      };
       state.activeLabExperimentId = updated.id;
-      state.labSettingsDirty = false;
-      await refresh({ silent: true, forceWorkspace: true });
+      replaceLabExperiment(applyLabSettingsDraft(updated, nextDraft));
+      state.labSettingsDirty = wasDirty;
+      render({ forceWorkspace: true });
       log(`${imageFiles.length} 张参考图已加入 lab`);
     }
 
