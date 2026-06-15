@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR
+from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, LAB_DIR
 from .settings import load_settings
 
 
@@ -18,6 +18,7 @@ MEDIA_ROOTS: dict[str, Path] = {
     "generated": GENERATED_DIR,
     "final": FINAL_DIR,
     "head_videos": HEAD_VIDEOS_DIR,
+    "lab": LAB_DIR,
 }
 
 
@@ -105,4 +106,3 @@ def resolve_media_token(token: str) -> dict[str, Any] | None:
     row["path_obj"] = path
     row["media_type"] = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return row
-
