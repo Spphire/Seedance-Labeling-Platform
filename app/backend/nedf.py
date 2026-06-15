@@ -7,6 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+import re
 
 from mcap.reader import make_reader
 from mcap.writer import Writer
@@ -14,6 +15,9 @@ from nmx_msg.Image_pb2 import Image, RGBD
 from nmx_msg.Metadata_pb2 import Metadata
 
 from .video import run_ffmpeg
+
+SEEDANCE_TARGET_WIDTH = 760
+SEEDANCE_TARGET_HEIGHT = 570
 
 
 def load_json(path: Path):
@@ -25,6 +29,42 @@ def choose_head_topic(metadata: dict) -> tuple[str, str]:
         if "head" in str(alias).lower() or "ego" in str(alias).lower():
             return f"nmx/hal/camera/{camera_id}/rgbd", str(camera_id)
     raise RuntimeError("No head/ego camera found in metadata.camera_info")
+
+
+def _safe_view_key(value: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return key or "view"
+
+
+def camera_views(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    views: list[dict[str, str]] = []
+    used: set[str] = set()
+    for camera_id, alias in (metadata.get("camera_info") or {}).items():
+        camera_id = str(camera_id)
+        role = str(alias or camera_id)
+        lowered = role.lower()
+        if "head" in lowered or "ego" in lowered:
+            base_key = "head"
+        else:
+            base_key = _safe_view_key(role) or _safe_view_key(camera_id)
+        view_key = base_key
+        suffix = 2
+        while view_key in used:
+            view_key = f"{base_key}_{suffix}"
+            suffix += 1
+        used.add(view_key)
+        views.append(
+            {
+                "view_key": view_key,
+                "camera_id": camera_id,
+                "role": role,
+                "topic": f"nmx/hal/camera/{camera_id}/rgbd",
+                "is_head": "1" if view_key == "head" else "0",
+            }
+        )
+    if not views:
+        raise RuntimeError("No cameras found in metadata.camera_info")
+    return views
 
 
 def mcap_files(preprocessed_dir: Path) -> list[Path]:
@@ -273,16 +313,34 @@ def resolve_episode_root(path: Path) -> Path:
     raise RuntimeError(f"cannot find preprocessed metadata under {path}")
 
 
-def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, output_episode_dir: Path) -> dict[str, Any]:
+def export_seedance_dataset_for_views(
+    source_episode_dir: Path,
+    view_final_videos: list[dict[str, Any]],
+    output_episode_dir: Path,
+) -> dict[str, Any]:
     source_root = resolve_episode_root(source_episode_dir)
     source_preprocessed = source_root / "preprocessed"
-    if not final_video_path.exists():
-        raise RuntimeError(f"final video does not exist: {final_video_path}")
     metadata = load_json(source_preprocessed / "metadata.json")
-    head_topic, camera_id = choose_head_topic(metadata)
-    frame_count = count_topic_messages(source_preprocessed, head_topic)
-    fps = estimate_fps(source_preprocessed, head_topic)
-    rgb_format = head_rgb_format(source_preprocessed, head_topic)
+    replacements = []
+    for item in view_final_videos:
+        final_video_path = Path(str(item["final_video_path"]))
+        if not final_video_path.exists():
+            raise RuntimeError(f"final video does not exist: {final_video_path}")
+        topic = str(item["topic"])
+        frame_count = count_topic_messages(source_preprocessed, topic)
+        fps = estimate_fps(source_preprocessed, topic)
+        rgb_format = head_rgb_format(source_preprocessed, topic)
+        replacements.append(
+            {
+                "view_key": str(item.get("view_key") or ""),
+                "camera_id": str(item.get("camera_id") or ""),
+                "topic": topic,
+                "final_video_path": final_video_path,
+                "frame_count": frame_count,
+                "fps": fps,
+                "rgb_format": rgb_format,
+            }
+        )
     output_episode_dir.parent.mkdir(parents=True, exist_ok=True)
     temp_root = output_episode_dir.parent / f".{output_episode_dir.name}.exporting-{int(time.time() * 1000)}"
     if temp_root.exists():
@@ -296,12 +354,25 @@ def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, ou
             encoding="utf-8",
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            frames = encode_video_access_units(final_video_path, frame_count, fps, Path(tmpdir), rgb_format)
-        next_index = 0
-        for mcap_path in mcap_files(output_preprocessed):
-            next_index = rewrite_mcap_rgb_topic(mcap_path, head_topic, frames, next_index, frame_count, rgb_format)
-        if next_index != frame_count:
-            raise RuntimeError(f"replaced {next_index} head frames, expected {frame_count}")
+            tmp_root = Path(tmpdir)
+            for replacement in replacements:
+                replacement["frames"] = encode_video_access_units(
+                    replacement["final_video_path"],
+                    int(replacement["frame_count"]),
+                    float(replacement["fps"]),
+                    tmp_root,
+                    dict(replacement["rgb_format"]),
+                )
+        for replacement in replacements:
+            next_index = 0
+            topic = str(replacement["topic"])
+            frame_count = int(replacement["frame_count"])
+            rgb_format = dict(replacement["rgb_format"])
+            frames = list(replacement["frames"])
+            for mcap_path in mcap_files(output_preprocessed):
+                next_index = rewrite_mcap_rgb_topic(mcap_path, topic, frames, next_index, frame_count, rgb_format)
+            if next_index != frame_count:
+                raise RuntimeError(f"replaced {next_index} frames for {topic}, expected {frame_count}")
         if output_episode_dir.exists():
             shutil.rmtree(output_episode_dir)
         temp_root.rename(output_episode_dir)
@@ -311,17 +382,52 @@ def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, ou
     return {
         "output_path": str(output_episode_dir.resolve()),
         "preprocessed_path": str((output_episode_dir / "preprocessed").resolve()),
-        "head_topic": head_topic,
-        "camera_id": camera_id,
-        "frame_count": frame_count,
-        "fps": fps,
-        "rgb_format": rgb_format,
+        "views": [
+            {
+                "view_key": item["view_key"],
+                "camera_id": item["camera_id"],
+                "topic": item["topic"],
+                "frame_count": item["frame_count"],
+                "fps": item["fps"],
+                "rgb_format": item["rgb_format"],
+            }
+            for item in replacements
+        ],
     }
 
 
-def extract_head_video(preprocessed_dir: Path, output_mp4: Path) -> dict:
-    metadata = load_json(preprocessed_dir / "metadata.json")
-    topic, camera_id = choose_head_topic(metadata)
+def export_seedance_dataset(source_episode_dir: Path, final_video_path: Path, output_episode_dir: Path) -> dict[str, Any]:
+    source_root = resolve_episode_root(source_episode_dir)
+    metadata = load_json(source_root / "preprocessed" / "metadata.json")
+    head_topic, camera_id = choose_head_topic(metadata)
+    result = export_seedance_dataset_for_views(
+        source_episode_dir,
+        [
+            {
+                "view_key": "head",
+                "camera_id": camera_id,
+                "topic": head_topic,
+                "final_video_path": final_video_path,
+            }
+        ],
+        output_episode_dir,
+    )
+    head_view = result["views"][0]
+    result.update(
+        {
+            "head_topic": head_topic,
+            "camera_id": camera_id,
+            "frame_count": head_view["frame_count"],
+            "fps": head_view["fps"],
+            "rgb_format": head_view["rgb_format"],
+        }
+    )
+    return result
+
+
+def extract_view_video(preprocessed_dir: Path, output_mp4: Path, view: dict[str, str]) -> dict:
+    topic = str(view["topic"])
+    camera_id = str(view["camera_id"])
     fps = estimate_fps(preprocessed_dir, topic)
     raw_h264 = output_mp4.with_suffix(".raw.h264")
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
@@ -359,7 +465,7 @@ def extract_head_video(preprocessed_dir: Path, output_mp4: Path) -> dict:
             "-i",
             str(raw_h264),
             "-vf",
-            "scale=760:570,setsar=1",
+            f"scale={SEEDANCE_TARGET_WIDTH}:{SEEDANCE_TARGET_HEIGHT},setsar=1",
             "-an",
             "-c:v",
             "libx264",
@@ -372,16 +478,41 @@ def extract_head_video(preprocessed_dir: Path, output_mp4: Path) -> dict:
     )
     raw_h264.unlink(missing_ok=True)
     duration_sec = (last_time - first_time) / 1e9 if first_time and last_time else frame_count / fps
+    source_width = int(width or SEEDANCE_TARGET_WIDTH)
+    source_height = int(height or SEEDANCE_TARGET_HEIGHT)
     return {
+        "view_key": view.get("view_key") or ("head" if view.get("is_head") == "1" else camera_id),
         "topic": topic,
         "camera_id": camera_id,
+        "role": view.get("role") or "",
+        "is_head": str(view.get("is_head") or "0") == "1",
         "fps": fps,
         "frame_count": frame_count,
         "duration_sec": duration_sec,
-        "source_width": width,
-        "source_height": height,
+        "source_width": source_width,
+        "source_height": source_height,
+        "target_width": SEEDANCE_TARGET_WIDTH,
+        "target_height": SEEDANCE_TARGET_HEIGHT,
+        "scale_x": SEEDANCE_TARGET_WIDTH / source_width if source_width else None,
+        "scale_y": SEEDANCE_TARGET_HEIGHT / source_height if source_height else None,
         "output_path": str(output_mp4),
     }
+
+
+def extract_head_video(preprocessed_dir: Path, output_mp4: Path) -> dict:
+    metadata = load_json(preprocessed_dir / "metadata.json")
+    topic, camera_id = choose_head_topic(metadata)
+    return extract_view_video(
+        preprocessed_dir,
+        output_mp4,
+        {
+            "view_key": "head",
+            "camera_id": camera_id,
+            "role": "head",
+            "topic": topic,
+            "is_head": "1",
+        },
+    )
 
 
 def fetch_episode(host: str, remote_root: str, uuid: str, local_dir: Path) -> Path:

@@ -242,7 +242,7 @@ def post_import_head(payload: ImportHeadVideoRequest, request: Request) -> dict[
 def post_anchor_candidates(uuid: str, payload: AnchorCandidatesRequest, request: Request) -> dict[str, Any]:
     require_reviewer(request)
     try:
-        return create_anchor_candidates(uuid.lower(), payload.start_secs, payload.lock_token)
+        return create_anchor_candidates(uuid.lower(), payload.start_secs, payload.lock_token, payload.view_key)
     except Exception as exc:
         raise _public_error(exc) from exc
 
@@ -346,7 +346,12 @@ def post_review(clip_id: int, payload: ReviewRequest, request: Request) -> dict[
 def post_stitch(uuid: str, request: Request, payload: LockTokenRequest | None = None) -> dict[str, Any]:
     require_reviewer(request)
     try:
-        return queue_stitch_episode(uuid.lower(), payload.lock_token if payload else None, require_lock_token=True)
+        return queue_stitch_episode(
+            uuid.lower(),
+            payload.lock_token if payload else None,
+            require_lock_token=True,
+            view_key=payload.view_key if payload else None,
+        )
     except Exception as exc:
         raise _public_error(exc) from exc
 

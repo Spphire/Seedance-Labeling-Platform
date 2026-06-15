@@ -68,6 +68,7 @@ class LabGenerationRequest(BaseModel):
 class AnchorCandidatesRequest(BaseModel):
     start_secs: list[float]
     lock_token: str | None = None
+    view_key: str | None = None
 
 
 class ReviewRequest(BaseModel):
@@ -119,3 +120,4 @@ class LockTokenRequest(BaseModel):
     operator_name: str | None = None
     prompt: str | None = None
     reference_images: list[str] | None = None
+    view_key: str | None = None

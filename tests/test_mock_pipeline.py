@@ -63,6 +63,12 @@ from app.backend.settings import (
     IPHONE2DEPLOY_PRESET_ID,
     IPHONE2DEPLOY_PROMPT,
     IPHONE2DEPLOY_REFERENCE_IMAGES,
+    LAB_EXP1_PRESET_ID,
+    LAB_EXP1_PROMPT,
+    LAB_EXP1_REFERENCE_IMAGES,
+    LAB_EXP2_PRESET_ID,
+    LAB_EXP2_PROMPT,
+    LAB_EXP2_REFERENCE_IMAGES,
     SETTINGS_PATH,
     load_settings,
     public_settings,
@@ -305,6 +311,18 @@ class MockPipelineTest(unittest.TestCase):
         finally:
             self.client.post("/api/locks/release", json={"token": token, "owner_id": "alice"})
 
+    def create_anchor_candidates_with_lock_for_view(self, uuid: str, starts: list[float], view_key: str) -> dict:
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        token = lock.json()["token"]
+        try:
+            return create_anchor_candidates(uuid, starts, token, view_key)
+        finally:
+            self.client.post("/api/locks/release", json={"token": token, "owner_id": "alice"})
+
     def corrupt_mp4_mdat(self, path: Path) -> None:
         data = bytearray(path.read_bytes())
         offset = data.find(b"mdat")
@@ -525,6 +543,58 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(succeeded_ids, {clip["id"] for clip in clips})
         statuses = {row["id"]: row["status"] for row in db.rows("SELECT id, status FROM clips WHERE episode_uuid=?", (uuid,))}
         self.assertEqual(set(statuses.values()), {"generated"})
+
+    def test_rolling_generation_is_scoped_by_episode_view(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000128"
+        save_settings({"mock_async": False})
+        head = self.make_head_ready_episode(uuid, 8)
+        side = DATA_DIR / "side_view_760x570.mp4"
+        self.make_video(side, 8)
+        now = db.now()
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, created_at, updated_at
+                )
+                VALUES (?, 'side', 'camera_side', 'side', 'nmx/hal/camera/camera_side/rgbd',
+                        640, 480, 760, 570, ?, ?, 0, 24, 192, 8, ?, 'ready', ?, ?)
+                """,
+                (uuid, 760 / 640, 570 / 480, str(side.resolve()), now, now),
+            )
+
+        head_created = self.create_anchor_candidates_with_lock_for_view(uuid, [0], "head")
+        side_created = self.create_anchor_candidates_with_lock_for_view(uuid, [0], "side")
+
+        self.assertEqual(head_created["created"][0]["view_key"], "head")
+        self.assertEqual(side_created["created"][0]["view_key"], "side")
+        clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY view_key, clip_index", (uuid,))
+        self.assertEqual([clip["view_key"] for clip in clips], ["head", "side"])
+
+        result = queue_rolling_generation(mode="mock")
+
+        generated_by_view = {
+            db.one("SELECT view_key FROM clips WHERE id=?", (item["clip_id"],))["view_key"]
+            for item in result
+            if item.get("status") == "succeeded"
+        }
+        self.assertEqual(generated_by_view, {"head", "side"})
+        listed = list_episodes()
+        episode = next(item for item in listed if item["uuid"] == uuid)
+        views = {view["view_key"]: view for view in episode["views"]}
+        self.assertEqual(set(views), {"head", "side"})
+        self.assertEqual(views["head"]["clip_count"], 1)
+        self.assertEqual(views["side"]["clip_count"], 1)
+        self.assertEqual(views["head"]["generated_clip_count"], 1)
+        self.assertEqual(views["side"]["generated_clip_count"], 1)
+        self.assertEqual(views["side"]["review_remaining_count"], 1)
+        self.assertAlmostEqual(views["side"]["scale_x"], 760 / 640)
+        self.assertAlmostEqual(views["side"]["scale_y"], 570 / 480)
+        side_clip = next(item for item in list_clips() if item["episode_uuid"] == uuid and item["view_key"] == "side")
+        self.assertIn("\\side\\", side_clip["local_path"])
 
     def test_anchor_candidate_creation_skips_invalid_starts_without_dropping_valid_ones(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000031"
@@ -1123,6 +1193,8 @@ class MockPipelineTest(unittest.TestCase):
             DEFAULT_GENERATION_PRESET_ID,
             COLLECTOR_ONLY_PRESET_ID,
             IPHONE2DEPLOY_PRESET_ID,
+            LAB_EXP1_PRESET_ID,
+            LAB_EXP2_PRESET_ID,
         ])
         self.assertEqual(presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
         self.assertEqual(presets["iphone-default"]["prompt"], DEFAULT_PROMPT)
@@ -1134,6 +1206,12 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(presets["iphone2deploy"]["prompt"], IPHONE2DEPLOY_PROMPT)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
         self.assertEqual(len(presets["iphone2deploy"]["reference_images"]), 4)
+        self.assertEqual(presets[LAB_EXP1_PRESET_ID]["name"], "Lab实验1-上半身手臂替换")
+        self.assertEqual(presets[LAB_EXP1_PRESET_ID]["prompt"], LAB_EXP1_PROMPT)
+        self.assertEqual(presets[LAB_EXP1_PRESET_ID]["reference_images"], LAB_EXP1_REFERENCE_IMAGES)
+        self.assertEqual(presets[LAB_EXP2_PRESET_ID]["name"], "Lab实验2-单采集器替换")
+        self.assertEqual(presets[LAB_EXP2_PRESET_ID]["prompt"], LAB_EXP2_PROMPT)
+        self.assertEqual(presets[LAB_EXP2_PRESET_ID]["reference_images"], LAB_EXP2_REFERENCE_IMAGES)
 
     def test_old_generation_presets_gain_iphone2deploy_once(self) -> None:
         SETTINGS_PATH.write_text(
@@ -1164,15 +1242,21 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(settings["generation_presets_version"], GENERATION_PRESETS_VERSION)
         self.assertIn("collector-only", presets)
         self.assertIn("iphone2deploy", presets)
+        self.assertIn(LAB_EXP1_PRESET_ID, presets)
+        self.assertIn(LAB_EXP2_PRESET_ID, presets)
         self.assertEqual(presets["iphone-default"]["name"], "头部视角-iphone-仅替换机械臂")
         self.assertEqual(presets["collector-only"]["name"], "头部视角-iphone-仅替换采集器")
         self.assertEqual(presets["iphone2deploy"]["name"], "头部视角-iphone-参考overlap全替换")
         self.assertEqual(presets["collector-only"]["prompt"], COLLECTOR_ONLY_PROMPT)
         self.assertEqual(presets["collector-only"]["reference_images"], COLLECTOR_ONLY_REFERENCE_IMAGES)
         self.assertEqual(presets["iphone2deploy"]["reference_images"], IPHONE2DEPLOY_REFERENCE_IMAGES)
+        self.assertEqual(presets[LAB_EXP1_PRESET_ID]["prompt"], LAB_EXP1_PROMPT)
+        self.assertEqual(presets[LAB_EXP2_PRESET_ID]["reference_images"], LAB_EXP2_REFERENCE_IMAGES)
         self.assertEqual(persisted["generation_presets_version"], GENERATION_PRESETS_VERSION)
         self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == "collector-only"]), 1)
         self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == "iphone2deploy"]), 1)
+        self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == LAB_EXP1_PRESET_ID]), 1)
+        self.assertEqual(len([item for item in persisted["generation_presets"] if item["id"] == LAB_EXP2_PRESET_ID]), 1)
 
         persisted["generation_presets"] = [item for item in persisted["generation_presets"] if item["id"] != "iphone2deploy"]
         SETTINGS_PATH.write_text(json.dumps(persisted, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2541,6 +2625,7 @@ class MockPipelineTest(unittest.TestCase):
         finally:
             with backend_services._STITCH_LOCK:
                 backend_services._STITCHING_EPISODES.discard(uuid)
+                backend_services._STITCHING_EPISODES.discard(f"{uuid}:head")
             with db.connect() as conn:
                 conn.execute("DELETE FROM resource_locks WHERE owner_id='system-stitcher'")
 

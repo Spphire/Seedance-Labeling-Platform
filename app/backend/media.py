@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, LAB_DIR
+from .paths import ACCEPTED_DIR, CLIPS_DIR, FINAL_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, LAB_DIR, VIEW_VIDEOS_DIR
 from .settings import load_settings
 
 
@@ -18,6 +18,7 @@ MEDIA_ROOTS: dict[str, Path] = {
     "generated": GENERATED_DIR,
     "final": FINAL_DIR,
     "head_videos": HEAD_VIDEOS_DIR,
+    "view_videos": VIEW_VIDEOS_DIR,
     "lab": LAB_DIR,
 }
 

@@ -640,6 +640,31 @@
       margin-top: 7px;
     }
 
+    .view-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+    }
+
+    .view-tabs button {
+      min-height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 0 7px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .view-tabs button.active {
+      border-color: var(--accent);
+      background: var(--focus);
+      color: var(--accent);
+      font-weight: 650;
+    }
+
     .progress {
       height: 6px;
       overflow: hidden;
@@ -1379,6 +1404,7 @@
       tabs: [],
       activeClipId: null,
       selectedEpisode: null,
+      selectedViewByEpisode: {},
       pollTimer: null,
       renewTimer: null,
       clientId: "",
@@ -1891,6 +1917,7 @@
     }
 
     function episodeBadges(episode) {
+      const stats = episodeViewStats(episode);
       const values = [badge(episode.status || "unknown")];
       if (isFocusedEpisode(episode.uuid)) {
         values.push(badge("ready", "专注"));
@@ -1902,11 +1929,11 @@
       if (episode.preprocess_health === "damaged") {
         values.push(badge("damaged", "损坏"));
       }
-      const finalStatus = episode.final_status || "";
+      const finalStatus = stats.final_status || episode.final_status || "";
       if (finalStatus && finalStatus !== "missing") {
         values.push(badge(finalStatus));
       }
-      const previewStatus = episode.preview_status || "";
+      const previewStatus = stats.preview_status || episode.preview_status || "";
       if (previewStatus && previewStatus !== "missing" && finalStatus !== "ready") {
         values.push(badge(previewStatus, `preview ${previewStatus}`));
       }
@@ -3000,38 +3027,45 @@
       return [...new Set(matches.map((item) => item.toLowerCase()))];
     }
 
+    function episodeViewStats(episode) {
+      const view = selectedEpisodeView(episode);
+      return view || episode || {};
+    }
+
     function episodeClass(episode) {
+      const stats = episodeViewStats(episode);
       const classes = ["item"];
       if (state.selectedEpisode === episode.uuid) classes.push("active");
       if (isFocusedEpisode(episode.uuid)) classes.push("focused");
-      if (episode.final_status === "stitching" || episode.preview_status === "stitching") classes.push("stitching");
-      if (episode.final_status === "ready") classes.push("final-ready");
-      if (episode.generated_failed_clip_count || episode.flagged_clip_count || episode.rejected_clip_count || episode.preprocess_health === "damaged") {
+      if (stats.final_status === "stitching" || stats.preview_status === "stitching") classes.push("stitching");
+      if (stats.final_status === "ready") classes.push("final-ready");
+      if (stats.generated_failed_clip_count || stats.flagged_clip_count || stats.rejected_clip_count || episode.preprocess_health === "damaged") {
         classes.push("needs-attention");
       }
       return classes.join(" ");
     }
 
     function episodeStage(episode) {
-      return episode.episode_stage || "等待处理";
+      return episodeViewStats(episode).episode_stage || episode.episode_stage || "等待处理";
     }
 
     function episodeFacts(episode) {
+      const stats = episodeViewStats(episode);
       const facts = [
-        `${episode.accepted_clip_count || 0}/${episode.clip_count || 0} accepted`,
-        `${episode.review_remaining_count || 0} 待处理`,
+        `${stats.accepted_clip_count || 0}/${stats.clip_count || 0} accepted`,
+        `${stats.review_remaining_count || 0} 待处理`,
       ];
-      if (episode.continuity_state) facts.push(`state ${episode.continuity_state}`);
-      if (episode.continuity_anchor_candidate_count) facts.push(`${episode.continuity_anchor_candidate_count} 锚点候选`);
-      if (episode.generating_clip_count) facts.push(`${episode.generating_clip_count} 生成中`);
-      if (episode.generated_clip_count) facts.push(`${episode.generated_clip_count} 待审核`);
-      if (episode.generated_failed_clip_count) facts.push(`${episode.generated_failed_clip_count} 失败`);
-      if (episode.flagged_clip_count) facts.push(`${episode.flagged_clip_count} 标记问题`);
-      if (episode.rejected_clip_count) facts.push(`${episode.rejected_clip_count} 已丢弃`);
-      if (episode.rolling_planned_sec) facts.push(`rolling ${formatDuration(episode.rolling_accepted_sec || 0)}/${formatDuration(episode.rolling_planned_sec)}`);
-      if (episode.preview_status === "stitching") facts.push("preview 合成中");
-      if (episode.preview_status === "ready" && episode.final_status !== "ready") facts.push("preview 可看");
-      if (episode.preview_status === "failed") facts.push("preview 失败");
+      if (stats.continuity_state) facts.push(`state ${stats.continuity_state}`);
+      if (stats.continuity_anchor_candidate_count) facts.push(`${stats.continuity_anchor_candidate_count} 锚点候选`);
+      if (stats.generating_clip_count) facts.push(`${stats.generating_clip_count} 生成中`);
+      if (stats.generated_clip_count) facts.push(`${stats.generated_clip_count} 待审核`);
+      if (stats.generated_failed_clip_count) facts.push(`${stats.generated_failed_clip_count} 失败`);
+      if (stats.flagged_clip_count) facts.push(`${stats.flagged_clip_count} 标记问题`);
+      if (stats.rejected_clip_count) facts.push(`${stats.rejected_clip_count} 已丢弃`);
+      if (stats.rolling_planned_sec) facts.push(`rolling ${formatDuration(stats.rolling_accepted_sec || 0)}/${formatDuration(stats.rolling_planned_sec)}`);
+      if (stats.preview_status === "stitching") facts.push("preview 合成中");
+      if (stats.preview_status === "ready" && stats.final_status !== "ready") facts.push("preview 可看");
+      if (stats.preview_status === "failed") facts.push("preview 失败");
       if (episode.preprocess_health === "damaged") facts.push(`损坏：${episode.preprocess_health_reason || "需要重新预处理"}`);
       return facts;
     }
@@ -3079,31 +3113,37 @@
     function episodeMatchesFilter(episode) {
       const mode = state.episodeFilterMode || "all";
       const mine = isMine(episodeLock(episode)) || !!myEpisodeLock(episode.uuid);
-      const reviewCount = Number(episode.generated_clip_count || 0)
-        + Number(episode.flagged_clip_count || 0)
-        + Number(episode.rejected_clip_count || 0);
+      const viewStats = [episode, ...(episode.views || [])];
+      const hasViewStat = (predicate) => viewStats.some((stats) => predicate(stats || {}));
+      const reviewCount = viewStats.reduce((total, stats) => total
+        + Number(stats.generated_clip_count || 0)
+        + Number(stats.flagged_clip_count || 0)
+        + Number(stats.rejected_clip_count || 0), 0);
       if (mode === "focused") return isFocusedEpisode(episode.uuid);
       if (mode === "mine") return mine;
       if (mode === "available") {
-        return episode.status === "preprocessed" && episode.final_status !== "ready" && !episodeLockedByOther(episode);
+        return episode.status === "preprocessed"
+          && hasViewStat((stats) => stats.final_status !== "ready")
+          && !episodeLockedByOther(episode);
       }
       if (mode === "review") return reviewCount > 0;
-      if (mode === "pending") return Number(episode.pending_clip_count || 0) > 0;
+      if (mode === "pending") return hasViewStat((stats) => Number(stats.pending_clip_count || 0) > 0);
       if (mode === "running") {
         return episode.status === "preprocessing"
-          || Number(episode.generating_clip_count || 0) > 0
-          || episode.final_status === "stitching"
-          || episode.preview_status === "stitching";
+          || hasViewStat((stats) => Number(stats.generating_clip_count || 0) > 0
+            || stats.final_status === "stitching"
+            || stats.preview_status === "stitching");
       }
       if (mode === "attention") {
-        return Number(episode.generated_failed_clip_count || 0) > 0
-          || Number(episode.flagged_clip_count || 0) > 0
-          || Number(episode.rejected_clip_count || 0) > 0
+        return hasViewStat((stats) => Number(stats.generated_failed_clip_count || 0) > 0
+          || Number(stats.flagged_clip_count || 0) > 0
+          || Number(stats.rejected_clip_count || 0) > 0
+          || stats.final_status === "failed"
+          || stats.preview_status === "failed")
           || episode.preprocess_health === "damaged"
-          || episode.final_status === "failed"
-          || episode.preview_status === "failed";
+          || episode.final_dataset_status === "failed";
       }
-      if (mode === "complete") return episode.final_status === "ready";
+      if (mode === "complete") return hasViewStat((stats) => stats.final_status === "ready");
       return true;
     }
 
@@ -3140,10 +3180,16 @@
         return;
       }
       episodes.forEach((episode) => {
-        const accepted = episode.accepted_clip_count || 0;
-        const total = episode.clip_count || 0;
+        const views = episode.views || [];
+        const selectedView = selectedEpisodeViewKey(episode);
+        const stats = episodeViewStats(episode);
+        const accepted = stats.accepted_clip_count || 0;
+        const total = stats.clip_count || 0;
         const progress = pct(accepted, total);
         const focused = isFocusedEpisode(episode.uuid);
+        const previewUrl = stats.preview_url || episode.preview_url;
+        const previewStatus = stats.preview_status || episode.preview_status;
+        const finalStatus = stats.final_status || episode.final_status;
         const div = document.createElement("div");
         div.className = episodeClass(episode);
         div.innerHTML = `
@@ -3152,16 +3198,29 @@
           <div class="progress" title="${progress}% accepted"><span style="width: ${progress}%"></span></div>
           <div class="episode-facts">${episodeFacts(episode).map((fact) => `<span class="badge">${fact}</span>`).join("")}</div>
           <div class="meta">${episode.uuid}</div>
+          ${views.length > 1 ? `<div class="view-tabs">
+            ${views.map((view) => `<button data-episode-view="${episode.uuid}" data-view-key="${view.view_key}" class="${view.view_key === selectedView ? "active" : ""}">${viewLabel(view)}</button>`).join("")}
+          </div>` : ""}
           <div class="episode-actions">
             <button data-episode-focus="${episode.uuid}" class="${focused ? "active" : ""}">${focused ? "移出专注" : "加入专注"}</button>
-            ${episode.preview_status === "ready" && episode.preview_url && episode.final_status !== "ready" ? `<a href="${episode.preview_url}" target="_blank" rel="noreferrer">打开 preview</a>` : ""}
-            ${total && accepted === total && episode.final_status !== "stitching" ? `<button data-episode-stitch="${episode.uuid}">重新合成</button>` : ""}
+            ${previewStatus === "ready" && previewUrl && finalStatus !== "ready" ? `<a href="${previewUrl}" target="_blank" rel="noreferrer">打开 preview</a>` : ""}
+            ${total && accepted === total && finalStatus !== "stitching" ? `<button data-episode-stitch="${episode.uuid}">重新合成</button>` : ""}
           </div>
         `;
         div.addEventListener("click", () => {
           state.selectedEpisode = state.selectedEpisode === episode.uuid ? null : episode.uuid;
           state.activeClipId = null;
+          ensureSelectedView(episode);
           render({ forceWorkspace: true });
+        });
+        div.querySelectorAll("[data-episode-view]").forEach((button) => {
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            state.selectedEpisode = episode.uuid;
+            state.selectedViewByEpisode[episode.uuid] = button.dataset.viewKey || "head";
+            state.activeClipId = null;
+            render({ forceWorkspace: true });
+          });
         });
         div.querySelectorAll("[data-episode-focus]").forEach((button) => {
           button.addEventListener("click", (event) => {
@@ -3176,7 +3235,7 @@
             try {
               const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/stitch`, {
                 method: "POST",
-                body: { lock_token: lock.token },
+                body: { lock_token: lock.token, view_key: selectedEpisodeViewKey(episode) },
               }));
               log("episode stitch queued", result);
               await refresh();
@@ -3189,6 +3248,35 @@
         });
         target.appendChild(div);
       });
+    }
+
+    function selectedEpisodeViewKey(episodeOrUuid) {
+      const uuid = typeof episodeOrUuid === "string" ? episodeOrUuid : episodeOrUuid?.uuid;
+      const episode = typeof episodeOrUuid === "string"
+        ? state.episodes.find((item) => item.uuid === episodeOrUuid)
+        : episodeOrUuid;
+      const views = episode?.views || [];
+      const saved = uuid ? state.selectedViewByEpisode[uuid] : "";
+      if (saved && views.some((view) => view.view_key === saved)) return saved;
+      const head = views.find((view) => view.view_key === "head") || views[0];
+      return head?.view_key || "head";
+    }
+
+    function ensureSelectedView(episode) {
+      if (!episode?.uuid) return "head";
+      const key = selectedEpisodeViewKey(episode);
+      state.selectedViewByEpisode[episode.uuid] = key;
+      return key;
+    }
+
+    function selectedEpisodeView(episode) {
+      const key = selectedEpisodeViewKey(episode);
+      return (episode.views || []).find((view) => view.view_key === key) || (episode.views || [])[0] || null;
+    }
+
+    function viewLabel(view) {
+      const name = view.role || view.view_key || "view";
+      return view.view_key === "head" ? "head" : name;
     }
 
     function clipTimingText(clip) {
@@ -3204,25 +3292,29 @@
       return `${Number(clip.start_sec).toFixed(2)}s + ${Number(clip.duration_sec).toFixed(2)}s`;
     }
 
-    function anchorDrafts(uuid) {
-      return state.anchorDrafts[uuid] || [];
+    function anchorDraftKey(uuid, viewKey = null) {
+      return `${uuid}:${viewKey || selectedEpisodeViewKey(uuid) || "head"}`;
     }
 
-    function setAnchorDrafts(uuid, values) {
+    function anchorDrafts(uuid, viewKey = null) {
+      return state.anchorDrafts[anchorDraftKey(uuid, viewKey)] || [];
+    }
+
+    function setAnchorDrafts(uuid, values, viewKey = null) {
       const normalized = values
         .map((value) => Number(value))
         .filter((value) => Number.isFinite(value))
         .map((value) => Math.max(0, Math.floor(value)));
-      state.anchorDrafts[uuid] = [...new Set(normalized)].sort((a, b) => a - b);
+      state.anchorDrafts[anchorDraftKey(uuid, viewKey)] = [...new Set(normalized)].sort((a, b) => a - b);
     }
 
-    function addAnchorDraft(uuid, value) {
-      setAnchorDrafts(uuid, [...anchorDrafts(uuid), value]);
+    function addAnchorDraft(uuid, value, viewKey = null) {
+      setAnchorDrafts(uuid, [...anchorDrafts(uuid, viewKey), value], viewKey);
       render({ forceWorkspace: true });
     }
 
-    function removeAnchorDraft(uuid, value) {
-      setAnchorDrafts(uuid, anchorDrafts(uuid).filter((item) => item !== value));
+    function removeAnchorDraft(uuid, value, viewKey = null) {
+      setAnchorDrafts(uuid, anchorDrafts(uuid, viewKey).filter((item) => item !== value), viewKey);
       render({ forceWorkspace: true });
     }
 
@@ -3235,8 +3327,8 @@
         .filter((item) => Number.isFinite(item));
     }
 
-    function setAnchorPanelStatus(uuid, message, kind = "") {
-      state.anchorStatus[uuid] = { message, kind };
+    function setAnchorPanelStatus(uuid, message, kind = "", viewKey = null) {
+      state.anchorStatus[anchorDraftKey(uuid, viewKey)] = { message, kind };
       const target = document.querySelector("[data-anchor-status]");
       if (target && state.selectedEpisode === uuid) {
         target.textContent = message || "";
@@ -3245,9 +3337,11 @@
     }
 
     function renderAnchorPanel(episode) {
-      if (episode.status !== "preprocessed" || episode.continuity_anchor_clip_id) return "";
-      const drafts = anchorDrafts(episode.uuid);
-      const panelStatus = state.anchorStatus[episode.uuid] || {};
+      const view = selectedEpisodeView(episode);
+      const viewKey = view?.view_key || "head";
+      if (episode.status !== "preprocessed" || view?.continuity_anchor_clip_id) return "";
+      const drafts = anchorDrafts(episode.uuid, viewKey);
+      const panelStatus = state.anchorStatus[anchorDraftKey(episode.uuid, viewKey)] || {};
       return `
         <div class="anchor-panel" data-anchor-panel>
           <h3>锚点候选</h3>
@@ -3274,64 +3368,65 @@
     function wireAnchorPanel(episode) {
       const panel = document.querySelector("[data-anchor-panel]");
       if (!panel) return;
+      const viewKey = selectedEpisodeViewKey(episode);
       const input = $("anchorStartSec");
       panel.querySelectorAll("[data-anchor-remove]").forEach((button) => {
-        button.addEventListener("click", () => removeAnchorDraft(episode.uuid, Number(button.dataset.anchorRemove)));
+        button.addEventListener("click", () => removeAnchorDraft(episode.uuid, Number(button.dataset.anchorRemove), viewKey));
       });
       panel.querySelectorAll("[data-anchor-action]").forEach((button) => {
         button.addEventListener("click", async () => {
           const action = button.dataset.anchorAction;
           if (action === "add-current") {
             const video = $("originalVideo");
-            addAnchorDraft(episode.uuid, video && Number.isFinite(video.currentTime) ? video.currentTime : 0);
-            setAnchorPanelStatus(episode.uuid, "已添加当前播放位置。", "success");
+            addAnchorDraft(episode.uuid, video && Number.isFinite(video.currentTime) ? video.currentTime : 0, viewKey);
+            setAnchorPanelStatus(episode.uuid, "已添加当前播放位置。", "success", viewKey);
             return;
           }
           if (action === "add-typed") {
             const typed = parseAnchorStartInput(input?.value);
             if (!typed.length) {
-              setAnchorPanelStatus(episode.uuid, "请输入至少一个起点秒数。", "error");
+              setAnchorPanelStatus(episode.uuid, "请输入至少一个起点秒数。", "error", viewKey);
               return;
             }
-            setAnchorDrafts(episode.uuid, [...anchorDrafts(episode.uuid), ...typed]);
+            setAnchorDrafts(episode.uuid, [...anchorDrafts(episode.uuid, viewKey), ...typed], viewKey);
             if (input) input.value = "";
-            setAnchorPanelStatus(episode.uuid, `已添加 ${typed.length} 个起点。`, "success");
+            setAnchorPanelStatus(episode.uuid, `已添加 ${typed.length} 个起点。`, "success", viewKey);
             render({ forceWorkspace: true });
             return;
           }
           if (action === "clear") {
-            setAnchorDrafts(episode.uuid, []);
-            setAnchorPanelStatus(episode.uuid, "", "");
+            setAnchorDrafts(episode.uuid, [], viewKey);
+            setAnchorPanelStatus(episode.uuid, "", "", viewKey);
             render({ forceWorkspace: true });
             return;
           }
           if (action === "create") {
-            setAnchorDrafts(episode.uuid, [...anchorDrafts(episode.uuid), ...parseAnchorStartInput(input?.value)]);
-            const starts = anchorDrafts(episode.uuid);
+            setAnchorDrafts(episode.uuid, [...anchorDrafts(episode.uuid, viewKey), ...parseAnchorStartInput(input?.value)], viewKey);
+            const starts = anchorDrafts(episode.uuid, viewKey);
             if (!starts.length) {
-              setAnchorPanelStatus(episode.uuid, "请先添加至少一个起点秒数。", "error");
+              setAnchorPanelStatus(episode.uuid, "请先添加至少一个起点秒数。", "error", viewKey);
               render({ forceWorkspace: true });
               return;
             }
             button.disabled = true;
-            setAnchorPanelStatus(episode.uuid, `正在创建 ${starts.length} 个候选锚点...`, "");
+            setAnchorPanelStatus(episode.uuid, `正在创建 ${starts.length} 个候选锚点...`, "", viewKey);
             try {
               const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/anchor_candidates`, {
                 method: "POST",
-                body: { start_secs: starts, lock_token: lock.token },
+                body: { start_secs: starts, lock_token: lock.token, view_key: viewKey },
               }));
-              setAnchorDrafts(episode.uuid, []);
+              setAnchorDrafts(episode.uuid, [], viewKey);
               if (input) input.value = "";
               const skipped = result.skipped || [];
               const createdCount = (result.created || []).length;
               const skippedText = skipped.length
                 ? `\n跳过 ${skipped.length} 个：${skipped.map((item) => `${item.start_sec ?? "-"}s ${item.reason}`).join("；")}`
                 : "";
-              setAnchorPanelStatus(episode.uuid, `已创建 ${createdCount} 个候选锚点。${skippedText}`, createdCount ? "success" : "error");
+              setAnchorPanelStatus(episode.uuid, `已创建 ${createdCount} 个候选锚点。${skippedText}`, createdCount ? "success" : "error", viewKey);
               log("anchor candidates created", result);
               await refresh({ forceWorkspace: true });
             } catch (err) {
-              setAnchorPanelStatus(episode.uuid, formatApiError(err), "error");
+              setAnchorPanelStatus(episode.uuid, formatApiError(err), "error", viewKey);
               log(formatApiError(err));
             } finally {
               button.disabled = false;
@@ -3343,7 +3438,11 @@
 
     function dependentContinuityCount(clip) {
       if (clip.input_kind === "anchor") {
-        return state.clips.filter((item) => item.episode_uuid === clip.episode_uuid && item.input_kind === "rolling").length;
+        return state.clips.filter((item) =>
+          item.episode_uuid === clip.episode_uuid
+          && (item.view_key || "head") === (clip.view_key || "head")
+          && item.input_kind === "rolling"
+        ).length;
       }
       if (clip.input_kind !== "rolling") return 0;
       const epsilon = 0.001;
@@ -3351,6 +3450,7 @@
         const boundary = Number(clip.timeline_start_sec ?? clip.start_sec ?? 0);
         return state.clips.filter((item) =>
           item.episode_uuid === clip.episode_uuid
+          && (item.view_key || "head") === (clip.view_key || "head")
           && item.input_kind === "rolling"
           && item.id !== clip.id
           && (item.direction || "forward") === "backward"
@@ -3360,6 +3460,7 @@
       const boundary = Number(clip.timeline_end_sec ?? ((clip.start_sec || 0) + (clip.timeline_duration_sec || clip.duration_sec || 0)));
       return state.clips.filter((item) =>
         item.episode_uuid === clip.episode_uuid
+        && (item.view_key || "head") === (clip.view_key || "head")
         && item.input_kind === "rolling"
         && item.id !== clip.id
         && (item.direction || "forward") !== "backward"
@@ -3371,7 +3472,7 @@
       const target = $("clipList");
       target.innerHTML = "";
       const clips = state.selectedEpisode
-        ? state.clips.filter((clip) => clip.episode_uuid === state.selectedEpisode)
+        ? state.clips.filter((clip) => clip.episode_uuid === state.selectedEpisode && (clip.view_key || "head") === selectedEpisodeViewKey(state.selectedEpisode))
         : state.clips;
       clips.forEach((clip) => {
         const div = document.createElement("div");
@@ -3381,7 +3482,7 @@
         const job = clip.latest_job;
         div.innerHTML = `
           <div class="item-title">
-            <span>${shortUuid(clip.episode_uuid)} #${String(clip.clip_index).padStart(4, "0")}</span>
+            <span>${shortUuid(clip.episode_uuid)} ${clip.view_key || "head"} #${String(clip.clip_index).padStart(4, "0")}</span>
             ${clipBadges(clip)}
           </div>
           <div class="meta">${clipTimingText(clip)}</div>
@@ -3557,6 +3658,18 @@
         return;
       }
       const clip = state.clips.find((item) => item.id === state.activeClipId);
+      if (
+        clip
+        && state.selectedEpisode
+        && (
+          clip.episode_uuid !== state.selectedEpisode
+          || (clip.view_key || "head") !== selectedEpisodeViewKey(state.selectedEpisode)
+        )
+      ) {
+        state.activeClipId = null;
+        renderEpisodeWorkspace(state.episodes.find((item) => item.uuid === state.selectedEpisode));
+        return;
+      }
       if (!clip) {
         const episode = state.episodes.find((item) => item.uuid === state.selectedEpisode);
         if (episode) {
@@ -3584,17 +3697,16 @@
         job ? job.status : "",
         job ? job.output_path || "" : "",
         job ? job.updated_at || "" : "",
-        episode.final_status || "",
-        episode.preview_status || "",
-        episode.preview_version || "",
-        episode.preview_url || "",
+        clip.view_key || "head",
+        clip.final_status || episode.final_status || "",
         clipCanEdit(clip) ? "edit" : "readonly",
       ].join("|");
       if (target.dataset.signature === signature) {
         updateWorkspaceLiveFields(clip, episode, job);
         return;
       }
-      const episodeNotice = renderEpisodeNotice(episode);
+      const clipView = (episode.views || []).find((view) => (view.view_key || "head") === (clip.view_key || "head"));
+      const episodeNotice = renderEpisodeNotice(episode, clipView || clip);
       const canEdit = clipCanEdit(clip);
       const lockNotice = renderClipLockNotice(clip, canEdit);
       const jobNotice = renderJobNotice(job);
@@ -3607,7 +3719,7 @@
         <div class="review-head">
           <div class="review-title">
             <h2>${shortUuid(clip.episode_uuid)} · clip #${String(clip.clip_index).padStart(4, "0")}</h2>
-            <div class="meta" data-live="workspace-meta">${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}</div>
+            <div class="meta" data-live="workspace-meta">${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${clip.final_status || episode.final_status || "-"}</div>
           </div>
           <div class="actions">
             ${renderPlaybackSpeedControl()}
@@ -3639,38 +3751,41 @@
 
     function renderEpisodeWorkspace(episode) {
       const target = $("workspace");
+      const view = selectedEpisodeView(episode);
+      const viewKey = view?.view_key || "head";
       const signature = [
         "episode",
         episode.uuid,
+        viewKey,
         episode.status || "",
-        episode.final_status || "",
-        episode.preview_status || "",
-        episode.preview_version || "",
-        episode.head_video_url || "",
-        episode.final_url || "",
-        episode.preview_url || "",
+        view?.final_status || episode.final_status || "",
+        view?.preview_status || episode.preview_status || "",
+        view?.preview_version || episode.preview_version || "",
+        view?.video_url || episode.head_video_url || "",
+        view?.final_url || episode.final_url || "",
+        view?.preview_url || episode.preview_url || "",
         episode.updated_at || "",
-        episode.clip_count || 0,
-        episode.accepted_clip_count || 0,
-        episode.continuity_state || "",
-        episode.continuity_anchor_clip_id || "",
-        episode.continuity_anchor_candidate_count || 0,
-        episode.continuity_coverage_start_sec ?? "",
-        episode.continuity_coverage_end_sec ?? "",
-        anchorDrafts(episode.uuid).join(","),
+        view?.rolling_clip_count || 0,
+        view?.continuity_accepted_sec || 0,
+        view?.continuity_state || episode.continuity_state || "",
+        view?.continuity_anchor_clip_id || "",
+        view?.continuity_anchor_candidate_count || 0,
+        view?.continuity_coverage_start_sec ?? "",
+        view?.continuity_coverage_end_sec ?? "",
+        anchorDrafts(episode.uuid, viewKey).join(","),
       ].join("|");
       if (target.dataset.signature === signature) {
         return;
       }
-      const finalReady = episode.final_status === "ready" && episode.final_url;
-      const previewReady = !finalReady && episode.preview_status === "ready" && episode.preview_url;
-      const outputUrl = finalReady ? episode.final_url : previewReady ? episode.preview_url : "";
+      const finalReady = (view?.final_status || episode.final_status) === "ready" && (view?.final_url || episode.final_url);
+      const previewReady = !finalReady && (view?.preview_status || episode.preview_status) === "ready" && (view?.preview_url || episode.preview_url);
+      const outputUrl = finalReady ? (view?.final_url || episode.final_url) : previewReady ? (view?.preview_url || episode.preview_url) : "";
       const outputTitle = finalReady ? "合成 final" : "accepted preview";
-      const outputStatus = finalReady ? episode.final_status : episode.preview_status || "missing";
-      const headVideo = mediaUrl(episode.head_video_url || "", episode.updated_at, episode.status);
-      const outputVideo = mediaUrl(outputUrl, episode.preview_version, episode.updated_at, outputStatus);
+      const outputStatus = finalReady ? (view?.final_status || episode.final_status) : (view?.preview_status || episode.preview_status || "missing");
+      const headVideo = mediaUrl(view?.video_url || episode.head_video_url || "", episode.updated_at, episode.status);
+      const outputVideo = mediaUrl(outputUrl, view?.preview_version || episode.preview_version, episode.updated_at, outputStatus);
       target.innerHTML = `
-        ${renderEpisodeNotice(episode)}
+        ${renderEpisodeNotice(episode, view)}
         ${renderAnchorPanel(episode)}
         <div class="review-head">
           <div class="review-title">
@@ -3700,7 +3815,7 @@
     function updateWorkspaceLiveFields(clip, episode, job) {
       const meta = document.querySelector("[data-live='workspace-meta']");
       if (meta) {
-        meta.textContent = `${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${episode.final_status || "-"}`;
+        meta.textContent = `${clipTimingText(clip)} · ${job ? jobSummary(job) : `job ${clip.latest_job_id || "-"}`} · final ${clip.final_status || episode.final_status || "-"}`;
       }
       const progress = document.querySelector("[data-live='job-progress']");
       if (progress && job && job.status === "running") {
@@ -3787,31 +3902,38 @@
       return "";
     }
 
-    function renderEpisodeNotice(episode) {
+    function renderEpisodeNotice(episode, statsOverride = null) {
       if (!episode || !episode.uuid) return "";
-      if (episode.final_status === "stitching") {
+      const stats = statsOverride || episodeViewStats(episode);
+      const finalStatus = stats.final_status || episode.final_status;
+      const previewStatus = stats.preview_status || episode.preview_status;
+      const finalUrl = stats.final_url || episode.final_url;
+      const previewUrl = stats.preview_url || episode.preview_url;
+      const error = stats.error || episode.error;
+      const previewError = stats.preview_error || episode.preview_error;
+      if (finalStatus === "stitching") {
         return `<div class="notice stitching">这个 episode 的所有 clip 已经保留，正在后台合成完整 final。旧 final 会保留到新文件合成完成后再被替换。</div>`;
       }
-      if (episode.final_status === "ready") {
-        return `<div class="notice">这个 episode 已经全部保留并合成 final。${episode.final_url ? `<a href="${episode.final_url}" target="_blank" rel="noreferrer">打开 final</a>` : ""}</div>`;
+      if (finalStatus === "ready") {
+        return `<div class="notice">这个 episode 已经全部保留并合成 final。${finalUrl ? `<a href="${finalUrl}" target="_blank" rel="noreferrer">打开 final</a>` : ""}</div>`;
       }
-      if (episode.final_status === "failed") {
-        return `<div class="notice failed">这个 episode 的 final 合成失败，可以在左侧 episode 卡片点“重新合成”。${episode.error ? `错误：${episode.error}` : ""}</div>`;
+      if (finalStatus === "failed") {
+        return `<div class="notice failed">这个 episode 的 final 合成失败，可以在左侧 episode 卡片点“重新合成”。${error ? `错误：${error}` : ""}</div>`;
       }
-      if (episode.preview_status === "stitching") {
+      if (previewStatus === "stitching") {
         return `<div class="notice stitching">正在后台合成当前 accepted preview，未保留的时间段会用黑帧占位；这不会锁定审核。</div>`;
       }
-      if (episode.preview_status === "ready" && episode.preview_url) {
-        return `<div class="notice">当前 accepted preview 已更新，未保留的时间段为黑帧。<a href="${episode.preview_url}" target="_blank" rel="noreferrer">打开 preview</a></div>`;
+      if (previewStatus === "ready" && previewUrl) {
+        return `<div class="notice">当前 accepted preview 已更新，未保留的时间段为黑帧。<a href="${previewUrl}" target="_blank" rel="noreferrer">打开 preview</a></div>`;
       }
-      if (episode.preview_status === "failed") {
-        return `<div class="notice failed">当前 accepted preview 合成失败，不影响继续审核。${episode.preview_error ? `错误：${episode.preview_error}` : ""}</div>`;
+      if (previewStatus === "failed") {
+        return `<div class="notice failed">当前 accepted preview 合成失败，不影响继续审核。${previewError ? `错误：${previewError}` : ""}</div>`;
       }
-      if ((episode.generated_failed_clip_count || 0) > 0) {
-        return `<div class="notice failed">这个 episode 有 ${episode.generated_failed_clip_count} 个 clip 生成失败，建议先重跑失败 clip。</div>`;
+      if ((stats.generated_failed_clip_count || 0) > 0) {
+        return `<div class="notice failed">这个 episode 有 ${stats.generated_failed_clip_count} 个 clip 生成失败，建议先重跑失败 clip。</div>`;
       }
-      if ((episode.generated_clip_count || 0) > 0 || (episode.flagged_clip_count || 0) > 0 || (episode.rejected_clip_count || 0) > 0) {
-        return `<div class="notice">这个 episode 还需要人工判断：${episode.review_remaining_count || 0} 个 clip 尚未保留。</div>`;
+      if ((stats.generated_clip_count || 0) > 0 || (stats.flagged_clip_count || 0) > 0 || (stats.rejected_clip_count || 0) > 0) {
+        return `<div class="notice">这个 episode 还需要人工判断：${stats.review_remaining_count || 0} 个 clip 尚未保留。</div>`;
       }
       return "";
     }

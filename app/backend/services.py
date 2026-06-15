@@ -16,7 +16,7 @@ from . import db
 from .ids import parse_uuids
 from .locks import LockError, active_lock, locks_by_resource, require_lock, require_no_active_lock
 from .media import media_url_for_known_roots, media_url_for_path
-from .nedf import export_seedance_dataset, extract_head_video, fetch_episode
+from .nedf import camera_views, export_seedance_dataset, export_seedance_dataset_for_views, extract_head_video, extract_view_video, fetch_episode, load_json
 from .paths import (
     ACCEPTED_DIR,
     ARCHIVED_ANCHORS_DIR,
@@ -28,6 +28,7 @@ from .paths import (
     GENERATED_DIR,
     HEAD_VIDEOS_DIR,
     ROOT,
+    VIEW_VIDEOS_DIR,
 )
 from .settings import (
     COLLECTOR_ONLY_PRESET_ID,
@@ -89,6 +90,240 @@ CONTINUITY_DIRECTIONS = {"anchor", "forward", "backward"}
 MIN_SEEDANCE_INPUT_SEC = 4
 MAX_SEEDANCE_INPUT_SEC = 15
 TIME_EPSILON = 1e-3
+DEFAULT_VIEW_KEY = "head"
+CLIP_COUNT_KEYS = (
+    "clip_count",
+    "accepted_clip_count",
+    "generated_clip_count",
+    "generating_clip_count",
+    "generated_failed_clip_count",
+    "pending_clip_count",
+    "rejected_clip_count",
+    "flagged_clip_count",
+)
+
+
+def clip_status_counts(clips: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "clip_count": len(clips),
+        "accepted_clip_count": sum(1 for clip in clips if clip.get("status") == "accepted"),
+        "generated_clip_count": sum(1 for clip in clips if clip.get("status") == "generated"),
+        "generating_clip_count": sum(1 for clip in clips if clip.get("status") == "generating"),
+        "generated_failed_clip_count": sum(1 for clip in clips if clip.get("status") == "generated_failed"),
+        "pending_clip_count": sum(1 for clip in clips if clip.get("status") == "pending"),
+        "rejected_clip_count": sum(1 for clip in clips if clip.get("status") == "rejected"),
+        "flagged_clip_count": sum(1 for clip in clips if clip.get("status") == "flagged"),
+    }
+
+
+def normalize_view_key(view_key: str | None) -> str:
+    value = (view_key or DEFAULT_VIEW_KEY).strip()
+    return value or DEFAULT_VIEW_KEY
+
+
+def view_clip_filter(view_key: str | None = None) -> tuple[str, tuple[str]]:
+    view_key = normalize_view_key(view_key)
+    return " AND COALESCE(view_key, 'head')=?", (view_key,)
+
+
+def clip_view_key(clip: dict[str, Any]) -> str:
+    return normalize_view_key(clip.get("view_key"))
+
+
+def episode_view_resource_id(uuid: str, view_key: str | None = None) -> str:
+    return f"{uuid}:{normalize_view_key(view_key)}"
+
+
+def view_scoped_dir(root: Path, uuid: str, view_key: str | None = None) -> Path:
+    view_key = normalize_view_key(view_key)
+    return root / uuid if view_key == DEFAULT_VIEW_KEY else root / uuid / view_key
+
+
+def view_video_path_for_episode(uuid: str, view_key: str | None = None) -> Path:
+    view_key = normalize_view_key(view_key)
+    if view_key == DEFAULT_VIEW_KEY:
+        episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
+        if episode and episode.get("head_video_path"):
+            return Path(episode["head_video_path"])
+    view = db.one(
+        "SELECT video_path FROM episode_views WHERE episode_uuid=? AND view_key=?",
+        (uuid, view_key),
+    )
+    if view and view.get("video_path"):
+        return Path(view["video_path"])
+    raise RuntimeError(f"view video path missing for {uuid}/{view_key}")
+
+
+def head_view_row(uuid: str, head_path: Path, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta = dict(meta or {})
+    return {
+        "episode_uuid": uuid,
+        "view_key": DEFAULT_VIEW_KEY,
+        "camera_id": str(meta.get("camera_id") or DEFAULT_VIEW_KEY),
+        "role": str(meta.get("role") or "head"),
+        "topic": str(meta.get("topic") or ""),
+        "source_width": meta.get("source_width") or 760,
+        "source_height": meta.get("source_height") or 570,
+        "target_width": meta.get("target_width") or 760,
+        "target_height": meta.get("target_height") or 570,
+        "scale_x": meta.get("scale_x") or 1.0,
+        "scale_y": meta.get("scale_y") or 1.0,
+        "is_head": 1,
+        "fps": meta.get("fps"),
+        "frame_count": meta.get("frame_count"),
+        "duration_sec": meta.get("duration_sec"),
+        "video_path": str(head_path.resolve()),
+        "status": "ready",
+    }
+
+
+def upsert_episode_view(conn, row: dict[str, Any]) -> None:
+    now = db.now()
+    conn.execute(
+        """
+        INSERT INTO episode_views(
+            episode_uuid, view_key, camera_id, role, topic,
+            source_width, source_height, target_width, target_height,
+            scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+            video_path, status, final_status, preview_status, preview_version,
+            continuity_state, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'missing', 'missing', 0, 'select_anchor', ?, ?)
+        ON CONFLICT(episode_uuid, view_key) DO UPDATE SET
+            camera_id=excluded.camera_id,
+            role=excluded.role,
+            topic=excluded.topic,
+            source_width=excluded.source_width,
+            source_height=excluded.source_height,
+            target_width=excluded.target_width,
+            target_height=excluded.target_height,
+            scale_x=excluded.scale_x,
+            scale_y=excluded.scale_y,
+            is_head=excluded.is_head,
+            fps=excluded.fps,
+            frame_count=excluded.frame_count,
+            duration_sec=excluded.duration_sec,
+            video_path=excluded.video_path,
+            status=excluded.status,
+            updated_at=excluded.updated_at
+        """,
+        (
+            row["episode_uuid"],
+            normalize_view_key(row.get("view_key")),
+            str(row.get("camera_id") or ""),
+            str(row.get("role") or ""),
+            str(row.get("topic") or ""),
+            row.get("source_width"),
+            row.get("source_height"),
+            int(row.get("target_width") or 760),
+            int(row.get("target_height") or 570),
+            row.get("scale_x"),
+            row.get("scale_y"),
+            1 if row.get("is_head") else 0,
+            row.get("fps"),
+            row.get("frame_count"),
+            row.get("duration_sec"),
+            str(row.get("video_path") or ""),
+            str(row.get("status") or "ready"),
+            now,
+            now,
+        ),
+    )
+
+
+def list_episode_view_rows(uuid: str | None = None) -> list[dict[str, Any]]:
+    if uuid:
+        rows = db.rows("SELECT * FROM episode_views WHERE episode_uuid=? ORDER BY is_head DESC, view_key", (uuid,))
+    else:
+        rows = db.rows("SELECT * FROM episode_views ORDER BY episode_uuid, is_head DESC, view_key")
+    for row in rows:
+        row["view_key"] = normalize_view_key(row.get("view_key"))
+        row["is_head"] = bool(row.get("is_head"))
+        row["video_url"] = media_url_for_path(row.get("video_path"), VIEW_VIDEOS_DIR, "view_videos") or media_url_for_path(
+            row.get("video_path"), HEAD_VIDEOS_DIR, "head_videos"
+        )
+        row["final_url"] = media_url_for_path(row.get("final_video_path"), FINAL_DIR, "final") if row.get("final_video_path") else None
+        row["preview_url"] = (
+            media_url_for_path(row.get("preview_video_path"), FINAL_DIR, "preview") if row.get("preview_video_path") else None
+        )
+    return rows
+
+
+def get_episode_view_row(uuid: str, view_key: str | None = None) -> dict[str, Any] | None:
+    view_key = normalize_view_key(view_key)
+    row = db.one(
+        "SELECT * FROM episode_views WHERE episode_uuid=? AND view_key=?",
+        (uuid, view_key),
+    )
+    if row:
+        row["view_key"] = normalize_view_key(row.get("view_key"))
+        return row
+    if view_key == DEFAULT_VIEW_KEY:
+        episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
+        if episode and episode.get("head_video_path") and Path(episode["head_video_path"]).exists():
+            head_path = Path(episode["head_video_path"])
+            try:
+                duration = video_duration(head_path)
+            except Exception:
+                duration = None
+            with db.connect() as conn:
+                upsert_episode_view(
+                    conn,
+                    head_view_row(
+                        uuid,
+                        head_path,
+                        {
+                            "duration_sec": duration,
+                            "target_width": 760,
+                            "target_height": 570,
+                            "scale_x": 1.0,
+                            "scale_y": 1.0,
+                        },
+                    ),
+                )
+            row = db.one(
+                "SELECT * FROM episode_views WHERE episode_uuid=? AND view_key=?",
+                (uuid, view_key),
+            )
+            if row:
+                row["view_key"] = normalize_view_key(row.get("view_key"))
+    return row
+
+
+def view_anchor_clip_id(uuid: str, view_key: str | None = None) -> int | None:
+    view_key = normalize_view_key(view_key)
+    row = get_episode_view_row(uuid, view_key)
+    value = row.get("anchor_clip_id") if row else None
+    if value:
+        return int(value)
+    if view_key == DEFAULT_VIEW_KEY:
+        episode = db.one("SELECT anchor_clip_id FROM episodes WHERE uuid=?", (uuid,))
+        if episode and episode.get("anchor_clip_id"):
+            return int(episode["anchor_clip_id"])
+    return None
+
+
+def mark_view_outputs_stale(conn, uuid: str, view_key: str | None = None) -> None:
+    view_key = normalize_view_key(view_key)
+    now = db.now()
+    conn.execute(
+        """
+        UPDATE episode_views
+        SET final_status='stale', preview_status=CASE WHEN preview_status='ready' THEN 'stale' ELSE preview_status END,
+            error=NULL, updated_at=?
+        WHERE episode_uuid=? AND view_key=? AND final_status IN ('ready','stitching','stale','missing')
+        """,
+        (now, uuid, view_key),
+    )
+    if view_key == DEFAULT_VIEW_KEY:
+        conn.execute(
+            """
+            UPDATE episodes
+            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=?
+            """,
+            (now, uuid),
+        )
 
 
 def submit_episodes(text: str) -> list[dict[str, Any]]:
@@ -146,7 +381,11 @@ def list_episodes() -> list[dict[str, Any]]:
     }
     clips_by_episode: dict[str, list[dict[str, Any]]] = {}
     for row in db.rows("SELECT * FROM clips"):
+        row["view_key"] = normalize_view_key(row.get("view_key"))
         clips_by_episode.setdefault(row["episode_uuid"], []).append(row)
+    views_by_episode: dict[str, list[dict[str, Any]]] = {}
+    for row in list_episode_view_rows():
+        views_by_episode.setdefault(row["episode_uuid"], []).append(row)
     for episode in episodes:
         aggregate = counts.get(episode["uuid"], {})
         clip_count = int(aggregate.get("clip_count") or 0)
@@ -154,21 +393,47 @@ def list_episodes() -> list[dict[str, Any]]:
         generated = int(aggregate.get("generated_clip_count") or 0)
         flagged = int(aggregate.get("flagged_clip_count") or 0)
         rejected = int(aggregate.get("rejected_clip_count") or 0)
-        for key in [
-            "clip_count",
-            "accepted_clip_count",
-            "generated_clip_count",
-            "generating_clip_count",
-            "generated_failed_clip_count",
-            "pending_clip_count",
-            "rejected_clip_count",
-            "flagged_clip_count",
-        ]:
+        for key in CLIP_COUNT_KEYS:
             episode[key] = int(aggregate.get(key) or 0)
-        health, health_reason = episode_preprocess_health(episode, clips_by_episode.get(episode["uuid"], []))
+        episode_clips = clips_by_episode.get(episode["uuid"], [])
+        health, health_reason = episode_preprocess_health(episode, episode_clips)
         episode["preprocess_health"] = health
         episode["preprocess_health_reason"] = health_reason
-        episode.update(rolling_episode_progress(episode, clips_by_episode.get(episode["uuid"], [])))
+        views = views_by_episode.get(episode["uuid"], [])
+        if not views and episode.get("head_video_path"):
+            views = [head_view_row(episode["uuid"], Path(episode["head_video_path"]))]
+        for view in views:
+            key = normalize_view_key(view.get("view_key"))
+            view_clips = [clip for clip in episode_clips if clip_view_key(clip) == key]
+            view_counts = clip_status_counts(view_clips)
+            view.update(view_counts)
+            view["review_remaining_count"] = max(view_counts["clip_count"] - view_counts["accepted_clip_count"], 0)
+            view["manual_decision_count"] = (
+                view_counts["generated_clip_count"]
+                + view_counts["flagged_clip_count"]
+                + view_counts["rejected_clip_count"]
+            )
+            view.update(rolling_episode_progress(episode, view_clips, key))
+            view_stage_payload = dict(episode)
+            view_stage_payload.update(view_counts)
+            view_stage_payload.update(
+                {
+                    "review_remaining_count": view["review_remaining_count"],
+                    "manual_decision_count": view["manual_decision_count"],
+                    "final_status": view.get("final_status") or "missing",
+                    "preview_status": view.get("preview_status") or "missing",
+                    "continuity_state": view.get("continuity_state") or episode.get("continuity_state"),
+                }
+            )
+            view["episode_stage"] = describe_episode_stage(view_stage_payload)
+        episode["views"] = views
+        episode.update(
+            rolling_episode_progress(
+                episode,
+                [clip for clip in episode_clips if clip_view_key(clip) == DEFAULT_VIEW_KEY],
+                DEFAULT_VIEW_KEY,
+            )
+        )
         episode["review_remaining_count"] = max(clip_count - accepted, 0)
         episode["manual_decision_count"] = generated + flagged + rejected
         episode["episode_stage"] = describe_episode_stage(episode)
@@ -261,8 +526,12 @@ def describe_episode_stage(episode: dict[str, Any]) -> str:
     return "处理中"
 
 
-def rolling_episode_progress(episode: dict[str, Any], clips: list[dict[str, Any]]) -> dict[str, Any]:
-    summary = continuity_timeline_summary(episode["uuid"], clips, episode)
+def rolling_episode_progress(
+    episode: dict[str, Any],
+    clips: list[dict[str, Any]],
+    view_key: str | None = None,
+) -> dict[str, Any]:
+    summary = continuity_timeline_summary(episode["uuid"], clips, episode, view_key)
     rolling_clips = [clip for clip in clips if clip.get("input_kind") == "rolling"]
     accepted_sec = float(summary.get("accepted_sec") or 0.0)
     planned_sec = summary.get("total_sec")
@@ -290,10 +559,15 @@ def rolling_episode_progress(episode: dict[str, Any], clips: list[dict[str, Any]
 def list_clips() -> list[dict[str, Any]]:
     clips = db.rows(
         """
-        SELECT c.*, e.final_status
+        SELECT c.*, e.final_status, v.role AS view_role, v.topic AS view_topic,
+               v.source_width AS view_source_width, v.source_height AS view_source_height,
+               v.target_width AS view_target_width, v.target_height AS view_target_height,
+               v.scale_x AS view_scale_x, v.scale_y AS view_scale_y
         FROM clips c
         JOIN episodes e ON e.uuid = c.episode_uuid
+        LEFT JOIN episode_views v ON v.episode_uuid = c.episode_uuid AND v.view_key = COALESCE(c.view_key, 'head')
         ORDER BY c.episode_uuid,
+                 COALESCE(c.view_key, 'head'),
                  COALESCE(c.timeline_start_sec, c.source_start_sec, c.start_sec, 0),
                  c.clip_index
         """
@@ -315,6 +589,7 @@ def list_clips() -> list[dict[str, Any]]:
         )
     }
     for clip in clips:
+        clip["view_key"] = normalize_view_key(clip.get("view_key"))
         input_video_url = clip_input_video_url(clip)
         raw_video_url = raw_clip_video_url(clip)
         clip["input_video_url"] = input_video_url
@@ -335,7 +610,8 @@ def list_clips() -> list[dict[str, Any]]:
 def list_jobs() -> list[dict[str, Any]]:
     jobs = db.rows(
         """
-        SELECT j.*, c.episode_uuid, c.clip_index, c.duration_sec, c.local_path AS clip_path
+        SELECT j.*, c.episode_uuid, COALESCE(c.view_key, 'head') AS view_key,
+               c.clip_index, c.duration_sec, c.local_path AS clip_path
         FROM generation_jobs j
         JOIN clips c ON c.id = j.clip_id
         ORDER BY j.created_at DESC
@@ -353,6 +629,7 @@ def list_seedance_usage(limit: int = 100) -> dict[str, Any]:
         SELECT
             a.*,
             c.episode_uuid,
+            COALESCE(c.view_key, 'head') AS view_key,
             c.clip_index
         FROM seedance_api_calls a
         LEFT JOIN clips c ON c.id = a.clip_id
@@ -406,6 +683,7 @@ def list_reviewer_activity(limit: int = 100) -> dict[str, Any]:
         SELECT
             r.*,
             c.episode_uuid,
+            COALESCE(c.view_key, 'head') AS view_key,
             c.clip_index,
             c.status AS clip_status,
             j.mode AS job_mode,
@@ -564,13 +842,18 @@ def continuity_clip_input_path(
     clip_id: int,
     input_kind: str,
     direction: str = "forward",
+    view_key: str | None = None,
 ) -> Path:
     label = "anchor" if input_kind == "anchor" else str(direction or "forward")
-    return CLIPS_DIR / uuid / f"clip_{int(clip_index):04d}_{label}_input_{int(clip_id)}.mp4"
+    return view_scoped_dir(CLIPS_DIR, uuid, view_key) / f"clip_{int(clip_index):04d}_{label}_input_{int(clip_id)}.mp4"
 
 
 def legacy_clip_input_path(clip: dict[str, Any]) -> Path:
     return CLIPS_DIR / str(clip["episode_uuid"]) / f"clip_{int(clip['clip_index']):04d}.mp4"
+
+
+def view_legacy_clip_input_path(clip: dict[str, Any]) -> Path:
+    return CLIPS_DIR / str(clip["episode_uuid"]) / clip_view_key(clip) / f"clip_{int(clip['clip_index']):04d}.mp4"
 
 
 def clip_record_id(item: dict[str, Any]) -> int:
@@ -587,6 +870,7 @@ def merge_latest_clip_fields(item: dict[str, Any], latest: dict[str, Any] | None
     is_joined_job = "clip_id" in result or "clip_row_id" in result
     clip_field_names = {
         "episode_uuid",
+        "view_key",
         "clip_index",
         "start_sec",
         "duration_sec",
@@ -634,6 +918,7 @@ def canonical_continuity_input_path(clip: dict[str, Any]) -> Path:
         clip_record_id(clip),
         str(clip.get("input_kind") or "rolling"),
         str(clip.get("direction") or "forward"),
+        clip_view_key(clip),
     )
 
 
@@ -689,8 +974,9 @@ def continuity_input_cache_paths(clip: dict[str, Any]) -> list[Path]:
     if local_value and path_is_under(local_value, CLIPS_DIR):
         paths.append(Path(str(local_value)))
     paths.append(canonical_continuity_input_path(clip))
+    paths.append(view_legacy_clip_input_path(clip))
     paths.append(legacy_clip_input_path(clip))
-    clip_dir = CLIPS_DIR / str(clip["episode_uuid"])
+    clip_dir = view_scoped_dir(CLIPS_DIR, str(clip["episode_uuid"]), clip_view_key(clip))
     clip_index = int(clip["clip_index"])
     clip_id = clip_record_id(clip)
     if clip_dir.exists():
@@ -713,6 +999,7 @@ def raw_clip_path(clip: dict[str, Any]) -> Path:
             clip_record_id(clip),
             "anchor",
             "anchor",
+            clip_view_key(clip),
         )
     return Path(str(clip.get("local_path") or legacy_clip_input_path(clip)))
 
@@ -721,12 +1008,9 @@ def ensure_anchor_raw_input(clip: dict[str, Any]) -> Path:
     path = raw_clip_path(clip)
     if path.exists():
         return path
-    episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (clip["episode_uuid"],))
-    if not episode or not episode.get("head_video_path"):
-        raise RuntimeError("episode head video path missing")
-    head_path = Path(episode["head_video_path"])
+    head_path = view_video_path_for_episode(str(clip["episode_uuid"]), clip_view_key(clip))
     if not head_path.exists():
-        raise RuntimeError("episode head video file missing")
+        raise RuntimeError("episode view video file missing")
     path.parent.mkdir(parents=True, exist_ok=True)
     cut_clip(
         head_path,
@@ -919,16 +1203,41 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
                     """,
                     (str(existing_head_path.resolve()), db.now(), uuid),
                 )
+                upsert_episode_view(
+                    conn,
+                    head_view_row(
+                        uuid,
+                        existing_head_path,
+                        {
+                            "duration_sec": duration,
+                            "target_width": 760,
+                            "target_height": 570,
+                            "scale_x": 1.0,
+                            "scale_y": 1.0,
+                        },
+                    ),
+                )
             return {
                 "uuid": uuid,
                 "status": "preprocessed",
                 "reason": integrity["reason"],
                 "head": {"output_path": str(existing_head_path.resolve()), "duration_sec": duration, "reused": True},
+                "views": list_episode_view_rows(uuid),
                 "clips": [],
             }
         if not (preprocessed_dir / "metadata.json").exists():
             raise RuntimeError(f"Missing preprocessed metadata for {uuid}")
-        meta = extract_head_video(preprocessed_dir, head_path)
+        metadata = load_json(preprocessed_dir / "metadata.json")
+        view_metas = []
+        for view in camera_views(metadata):
+            key = normalize_view_key(view.get("view_key"))
+            output_path = head_path if key == DEFAULT_VIEW_KEY else VIEW_VIDEOS_DIR / uuid / f"{key}_760x570.mp4"
+            view_metas.append(extract_view_video(preprocessed_dir, output_path, view))
+        head_meta = next((item for item in view_metas if item.get("is_head") or normalize_view_key(item.get("view_key")) == DEFAULT_VIEW_KEY), None)
+        if not head_meta:
+            head_meta = extract_head_video(preprocessed_dir, head_path)
+            view_metas.insert(0, head_meta)
+        meta = head_meta
         duration = video_duration(head_path)
         clear_episode_clip_state(uuid)
         with db.connect() as conn:
@@ -941,7 +1250,37 @@ def preprocess_one(uuid: str, settings: dict[str, Any], fetch_remote: bool, lock
                 """,
                 (str(head_path.resolve()), str(episode_dir.resolve()), db.now(), uuid),
             )
-        return {"uuid": uuid, "status": "preprocessed", "reason": integrity["reason"], "head": meta, "clips": []}
+            for view_meta in view_metas:
+                upsert_episode_view(
+                    conn,
+                    {
+                        "episode_uuid": uuid,
+                        "view_key": normalize_view_key(view_meta.get("view_key")),
+                        "camera_id": view_meta.get("camera_id"),
+                        "role": view_meta.get("role") or ("head" if view_meta.get("is_head") else ""),
+                        "topic": view_meta.get("topic"),
+                        "source_width": view_meta.get("source_width"),
+                        "source_height": view_meta.get("source_height"),
+                        "target_width": view_meta.get("target_width"),
+                        "target_height": view_meta.get("target_height"),
+                        "scale_x": view_meta.get("scale_x"),
+                        "scale_y": view_meta.get("scale_y"),
+                        "is_head": bool(view_meta.get("is_head")),
+                        "fps": view_meta.get("fps"),
+                        "frame_count": view_meta.get("frame_count"),
+                        "duration_sec": view_meta.get("duration_sec"),
+                        "video_path": view_meta.get("output_path"),
+                        "status": "ready",
+                    },
+                )
+        return {
+            "uuid": uuid,
+            "status": "preprocessed",
+            "reason": integrity["reason"],
+            "head": meta,
+            "views": list_episode_view_rows(uuid),
+            "clips": [],
+        }
     except Exception as exc:
         with db.connect() as conn:
             conn.execute("UPDATE episodes SET status='failed', error=?, updated_at=? WHERE uuid=?", (str(exc), db.now(), uuid))
@@ -965,6 +1304,17 @@ def clear_episode_clip_state(uuid: str) -> None:
                 preview_error=NULL, final_dataset_path=NULL, final_dataset_status='missing',
                 final_dataset_error=NULL, updated_at=?
             WHERE uuid=?
+            """,
+            (db.now(), uuid),
+        )
+        conn.execute(
+            """
+            UPDATE episode_views
+            SET anchor_clip_id=NULL, continuity_state='select_anchor',
+                final_video_path=NULL, final_status='missing',
+                preview_video_path=NULL, preview_status='missing', preview_error=NULL,
+                preview_version=preview_version+1, error=NULL, updated_at=?
+            WHERE episode_uuid=?
             """,
             (db.now(), uuid),
         )
@@ -993,10 +1343,16 @@ def delete_clip_rows(uuid: str, clips: list[dict[str, Any]]) -> int:
     return len(clips)
 
 
-def archive_anchor_candidates(uuid: str, clips: list[dict[str, Any]], reason: str) -> Path | None:
+def archive_anchor_candidates(
+    uuid: str,
+    clips: list[dict[str, Any]],
+    reason: str,
+    view_key: str | None = None,
+) -> Path | None:
     if not clips:
         return None
-    archive_dir = ARCHIVED_ANCHORS_DIR / uuid / f"{int(time.time() * 1000)}_{reason}"
+    view_key = normalize_view_key(view_key or clips[0].get("view_key"))
+    archive_dir = ARCHIVED_ANCHORS_DIR / uuid / view_key / f"{int(time.time() * 1000)}_{reason}"
     archive_dir.mkdir(parents=True, exist_ok=True)
     metadata: list[dict[str, Any]] = []
     for clip in clips:
@@ -1023,21 +1379,26 @@ def archive_anchor_candidates(uuid: str, clips: list[dict[str, Any]], reason: st
     return archive_dir
 
 
-def delete_anchor_candidates_except(uuid: str, keep_clip_id: int) -> int:
+def delete_anchor_candidates_except(uuid: str, keep_clip_id: int, view_key: str | None = None) -> int:
+    view_key = normalize_view_key(view_key)
     clips = db.rows(
         """
         SELECT * FROM clips
-        WHERE episode_uuid=? AND input_kind='anchor' AND id<>?
+        WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind='anchor' AND id<>?
         ORDER BY clip_index
         """,
-        (uuid, keep_clip_id),
+        (uuid, view_key, keep_clip_id),
     )
-    archive_anchor_candidates(uuid, clips, "official_anchor_selected")
+    archive_anchor_candidates(uuid, clips, "official_anchor_selected", view_key)
     return delete_clip_rows(uuid, clips)
 
 
-def latest_anchor_candidate_archive(uuid: str, reason: str = "official_anchor_selected") -> Path | None:
-    archive_root = ARCHIVED_ANCHORS_DIR / uuid
+def latest_anchor_candidate_archive(
+    uuid: str,
+    reason: str = "official_anchor_selected",
+    view_key: str | None = None,
+) -> Path | None:
+    archive_root = ARCHIVED_ANCHORS_DIR / uuid / normalize_view_key(view_key)
     if not archive_root.exists():
         return None
     candidates = [
@@ -1050,8 +1411,9 @@ def latest_anchor_candidate_archive(uuid: str, reason: str = "official_anchor_se
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def restore_archived_anchor_candidates(uuid: str) -> int:
-    archive_dir = latest_anchor_candidate_archive(uuid)
+def restore_archived_anchor_candidates(uuid: str, view_key: str | None = None) -> int:
+    view_key = normalize_view_key(view_key)
+    archive_dir = latest_anchor_candidate_archive(uuid, view_key=view_key)
     if not archive_dir:
         return 0
     metadata_path = archive_dir / "metadata.json"
@@ -1063,8 +1425,8 @@ def restore_archived_anchor_candidates(uuid: str) -> int:
         return 0
 
     restored = 0
-    clip_dir = CLIPS_DIR / uuid
-    generated_dir = GENERATED_DIR / uuid
+    clip_dir = CLIPS_DIR / uuid / view_key
+    generated_dir = GENERATED_DIR / uuid / view_key
     clip_dir.mkdir(parents=True, exist_ok=True)
     generated_dir.mkdir(parents=True, exist_ok=True)
     now = db.now()
@@ -1081,7 +1443,8 @@ def restore_archived_anchor_candidates(uuid: str) -> int:
         input_kind = str(raw_item.get("input_kind") or "anchor")
         input_path_value = str(raw_item.get("archived_input_path") or "").strip()
         input_path = Path(input_path_value) if input_path_value else None
-        restored_input = continuity_clip_input_path(uuid, clip_index, clip_id, input_kind, direction)
+        item_view_key = normalize_view_key(raw_item.get("view_key") or view_key)
+        restored_input = continuity_clip_input_path(uuid, clip_index, clip_id, input_kind, direction, item_view_key)
         source_value = str(raw_item.get("local_path") or "").strip()
         source_path = Path(source_value) if source_value else None
         if input_path and input_path.is_file():
@@ -1093,17 +1456,18 @@ def restore_archived_anchor_candidates(uuid: str) -> int:
             conn.execute(
                 """
                 INSERT INTO clips(
-                    id, episode_uuid, clip_index, start_sec, duration_sec,
+                    id, episode_uuid, view_key, clip_index, start_sec, duration_sec,
                     source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec,
                     timeline_start_sec, timeline_end_sec, input_timeline_start_sec, input_timeline_end_sec,
                     direction, input_kind, anchor_stage,
                     local_path, public_url, status, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clip_id,
                     uuid,
+                    item_view_key,
                     clip_index,
                     float(raw_item.get("start_sec") or 0),
                     float(raw_item.get("duration_sec") or ANCHOR_CLIP_DURATION_SEC),
@@ -1128,11 +1492,17 @@ def restore_archived_anchor_candidates(uuid: str) -> int:
         restored += 1
         for raw_job in raw_item.get("jobs") or []:
             if isinstance(raw_job, dict):
-                restore_archived_generation_job(uuid, clip_id, clip_index, raw_job)
+                restore_archived_generation_job(uuid, clip_id, clip_index, raw_job, item_view_key)
     return restored
 
 
-def restore_archived_generation_job(uuid: str, clip_id: int, clip_index: int, raw_job: dict[str, Any]) -> None:
+def restore_archived_generation_job(
+    uuid: str,
+    clip_id: int,
+    clip_index: int,
+    raw_job: dict[str, Any],
+    view_key: str | None = None,
+) -> None:
     job_id = int(raw_job.get("id") or 0)
     if job_id <= 0 or db.one("SELECT id FROM generation_jobs WHERE id=?", (job_id,)):
         return
@@ -1140,7 +1510,7 @@ def restore_archived_generation_job(uuid: str, clip_id: int, clip_index: int, ra
     archived_output = Path(str(raw_job.get("archived_output_path") or ""))
     if archived_output.exists():
         suffix = archived_output.suffix or ".mp4"
-        output_path = GENERATED_DIR / uuid / f"clip_{clip_index:04d}_job_{job_id}_restored{suffix}"
+        output_path = GENERATED_DIR / uuid / normalize_view_key(view_key) / f"clip_{clip_index:04d}_job_{job_id}_restored{suffix}"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(archived_output, output_path)
     now = db.now()
@@ -1181,14 +1551,14 @@ def restore_archived_generation_job(uuid: str, clip_id: int, clip_index: int, ra
 
 def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
     uuid = clip["episode_uuid"]
+    view_key = clip_view_key(clip)
     input_kind = clip.get("input_kind") or ""
     if input_kind == "anchor":
-        episode = db.one("SELECT anchor_clip_id FROM episodes WHERE uuid=?", (uuid,))
-        is_official_anchor = bool(episode and int(episode.get("anchor_clip_id") or 0) == int(clip["id"]))
+        is_official_anchor = view_anchor_clip_id(uuid, view_key) == int(clip["id"])
         clips = (
             db.rows(
-                "SELECT * FROM clips WHERE episode_uuid=? AND input_kind='rolling' ORDER BY clip_index",
-                (uuid,),
+                "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind='rolling' ORDER BY clip_index",
+                (uuid, view_key),
             )
             if is_official_anchor
             else []
@@ -1198,14 +1568,24 @@ def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
             with db.connect() as conn:
                 conn.execute(
                     """
-                    UPDATE episodes
+                    UPDATE episode_views
                     SET anchor_clip_id=NULL, continuity_state='anchor_candidates',
-                        final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
-                    WHERE uuid=?
+                        final_status='stale', updated_at=?
+                    WHERE episode_uuid=? AND view_key=?
                     """,
-                    (db.now(), uuid),
+                    (db.now(), uuid, view_key),
                 )
-            restore_archived_anchor_candidates(uuid)
+                if view_key == DEFAULT_VIEW_KEY:
+                    conn.execute(
+                        """
+                        UPDATE episodes
+                        SET anchor_clip_id=NULL, continuity_state='anchor_candidates',
+                            final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+                        WHERE uuid=?
+                        """,
+                        (db.now(), uuid),
+                    )
+            restore_archived_anchor_candidates(uuid, view_key)
         return deleted
     if input_kind != "rolling":
         return 0
@@ -1214,32 +1594,60 @@ def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
         clips = db.rows(
             """
             SELECT * FROM clips
-            WHERE episode_uuid=? AND input_kind='rolling' AND direction='backward'
+            WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind='rolling' AND direction='backward'
               AND timeline_end_sec<=?
               AND id<>?
             ORDER BY timeline_start_sec
             """,
-            (uuid, float(clip.get("timeline_start_sec") or 0) + TIME_EPSILON, int(clip["id"])),
+            (uuid, view_key, float(clip.get("timeline_start_sec") or 0) + TIME_EPSILON, int(clip["id"])),
         )
     else:
         clips = db.rows(
             """
             SELECT * FROM clips
-            WHERE episode_uuid=? AND input_kind='rolling' AND direction='forward'
+            WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind='rolling' AND direction='forward'
               AND timeline_start_sec>=?
               AND id<>?
             ORDER BY timeline_start_sec
             """,
-            (uuid, float(clip.get("timeline_end_sec") or 0) - TIME_EPSILON, int(clip["id"])),
+            (uuid, view_key, float(clip.get("timeline_end_sec") or 0) - TIME_EPSILON, int(clip["id"])),
         )
     return delete_clip_rows(uuid, clips)
 
 
 def create_clips(uuid: str, head_path: Path, duration: float) -> list[dict[str, Any]]:
+    view_key = DEFAULT_VIEW_KEY
     plan = clip_plan(duration)
     clear_episode_clip_state(uuid)
     clip_dir = CLIPS_DIR / uuid
     clip_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        head_duration = video_duration(head_path)
+    except Exception:
+        head_duration = duration
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE episodes
+            SET head_video_path=COALESCE(head_video_path, ?), updated_at=?
+            WHERE uuid=?
+            """,
+            (str(head_path.resolve()), db.now(), uuid),
+        )
+        upsert_episode_view(
+            conn,
+            head_view_row(
+                uuid,
+                head_path,
+                {
+                    "duration_sec": head_duration,
+                    "target_width": 760,
+                    "target_height": 570,
+                    "scale_x": 1.0,
+                    "scale_y": 1.0,
+                },
+            ),
+        )
     created = []
     for index, (start, clip_duration) in enumerate(plan):
         path = clip_dir / f"clip_{index:04d}.mp4"
@@ -1250,13 +1658,13 @@ def create_clips(uuid: str, head_path: Path, duration: float) -> list[dict[str, 
             cur = conn.execute(
                 """
                 INSERT INTO clips(
-                    episode_uuid, clip_index, start_sec, duration_sec,
+                    episode_uuid, view_key, clip_index, start_sec, duration_sec,
                     source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec, input_kind,
                     local_path, public_url, status, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'split', ?, ?, 'pending', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'split', ?, ?, 'pending', ?, ?)
                 """,
-                (uuid, index, start, clip_duration, start, clip_duration, clip_duration, str(path.resolve()), public_url, now, now),
+                (uuid, view_key, index, start, clip_duration, start, clip_duration, clip_duration, str(path.resolve()), public_url, now, now),
             )
             clip_id = cur.lastrowid
         created.append({"id": clip_id, "episode_uuid": uuid, "clip_index": index, "duration_sec": clip_duration, "path": str(path)})
@@ -1308,10 +1716,25 @@ def import_head_video(uuid: str, source_path: str, lock_token: str | None = None
                 now,
             ),
         )
+        upsert_episode_view(
+            conn,
+            head_view_row(
+                uuid,
+                head_path,
+                {
+                    "duration_sec": duration,
+                    "target_width": 760,
+                    "target_height": 570,
+                    "scale_x": 1.0,
+                    "scale_y": 1.0,
+                },
+            ),
+        )
     return {
         "uuid": uuid,
         "head_video_path": str(head_path.resolve()),
         "duration_sec": duration,
+        "views": list_episode_view_rows(uuid),
         "clips": [],
     }
 
@@ -1349,36 +1772,42 @@ def prepare_rolling_generation_clips() -> tuple[list[dict[str, Any]], list[dict[
     prepared: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for episode in episodes:
-        results = prepare_rolling_clips_for_episode(episode)
-        episode_clips = [item["clip"] for item in results if item.get("clip")]
-        if episode_clips:
-            prepared.extend(episode_clips)
-        else:
-            skipped.extend(results or [rolling_skip(episode["uuid"], "waiting for anchor candidates")])
+        views = list_episode_view_rows(episode["uuid"]) or [head_view_row(episode["uuid"], Path(episode["head_video_path"]))]
+        for view in views:
+            results = prepare_rolling_clips_for_episode(episode, normalize_view_key(view.get("view_key")))
+            episode_clips = [item["clip"] for item in results if item.get("clip")]
+            if episode_clips:
+                prepared.extend(episode_clips)
+            else:
+                skipped.extend(results or [rolling_skip(episode["uuid"], "waiting for anchor candidates", view.get("view_key"))])
     return prepared, skipped
 
 
-def prepare_rolling_clips_for_episode(episode: dict[str, Any]) -> list[dict[str, Any]]:
+def prepare_rolling_clips_for_episode(episode: dict[str, Any], view_key: str | None = None) -> list[dict[str, Any]]:
     uuid = episode["uuid"]
-    head_value = episode.get("head_video_path")
-    if not head_value:
-        return [rolling_skip(uuid, "head video path missing")]
-    head_path = Path(head_value)
+    view_key = normalize_view_key(view_key)
+    try:
+        head_path = view_video_path_for_episode(uuid, view_key)
+    except Exception as exc:
+        return [rolling_skip(uuid, str(exc), view_key)]
     if not head_path.exists():
-        return [rolling_skip(uuid, "head video file missing")]
+        return [rolling_skip(uuid, f"{view_key} video file missing", view_key)]
     try:
         duration = continuity_total_duration(head_path)
     except Exception as exc:
-        return [rolling_skip(uuid, str(exc))]
+        return [rolling_skip(uuid, str(exc), view_key)]
     if duration < MIN_SEEDANCE_INPUT_SEC:
-        return [rolling_skip(uuid, f"episode is too short for seedance continuity: {duration:.3f}s")]
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY timeline_start_sec, clip_index", (uuid,))
+        return [rolling_skip(uuid, f"episode is too short for seedance continuity: {duration:.3f}s", view_key)]
+    clips = db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY timeline_start_sec, clip_index",
+        (uuid, view_key),
+    )
     legacy = [clip for clip in clips if clip.get("input_kind") not in CONTINUITY_INPUT_KINDS]
     if legacy:
-        return [rolling_skip(uuid, "legacy split clips exist; continuity generation skipped")]
+        return [rolling_skip(uuid, "legacy split clips exist; continuity generation skipped", view_key)]
     if not clips:
-        update_continuity_state(uuid)
-        return [rolling_skip(uuid, "waiting for anchor candidates")]
+        update_continuity_state(uuid, view_key)
+        return [rolling_skip(uuid, "waiting for anchor candidates", view_key)]
 
     results: list[dict[str, Any]] = []
     for clip in clips:
@@ -1389,30 +1818,36 @@ def prepare_rolling_clips_for_episode(episode: dict[str, Any]) -> list[dict[str,
         try:
             ensure_continuity_clip_input(clip)
         except Exception as exc:
-            results.append(rolling_skip(uuid, f"cannot rebuild input for clip {clip['id']}: {exc}"))
+            results.append(rolling_skip(uuid, f"cannot rebuild input for clip {clip['id']}: {exc}", view_key))
             continue
         results.append({"episode_uuid": uuid, "clip": db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip})
     if not results:
         active = next((clip for clip in clips if clip["status"] in {"generated", "flagged", "generating", "preparing"}), None)
         reason = f"waiting for clip {active['id']} status {active['status']}" if active else "no pending continuity clips"
-        results.append(rolling_skip(uuid, reason))
-    update_continuity_state(uuid)
+        results.append(rolling_skip(uuid, reason, view_key))
+    update_continuity_state(uuid, view_key)
     return results
 
 
-def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str | None = None) -> dict[str, Any]:
+def create_anchor_candidates(
+    uuid: str,
+    start_secs: list[float],
+    lock_token: str | None = None,
+    view_key: str | None = None,
+) -> dict[str, Any]:
     uuid = uuid.lower()
+    view_key = normalize_view_key(view_key)
     require_episode_mutation_lock(uuid, lock_token)
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
     if not episode:
         raise ValueError("episode not found")
-    if episode.get("status") != "preprocessed" or not episode.get("head_video_path"):
-        raise ValueError("episode head video is not ready")
-    if episode.get("anchor_clip_id"):
+    if episode.get("status") != "preprocessed":
+        raise ValueError("episode video is not ready")
+    if view_anchor_clip_id(uuid, view_key):
         raise ValueError("official anchor already selected")
-    head_path = Path(episode["head_video_path"])
+    head_path = view_video_path_for_episode(uuid, view_key)
     if not head_path.exists():
-        raise ValueError("episode head video file missing")
+        raise ValueError("episode view video file missing")
     total = continuity_total_duration(head_path)
     if total < ANCHOR_CLIP_DURATION_SEC:
         raise ValueError(f"episode is too short for a {ANCHOR_CLIP_DURATION_SEC}s anchor")
@@ -1425,7 +1860,10 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
     )
     existing_keys = {
         int(round(float(row.get("timeline_start_sec") or row.get("start_sec") or 0.0) * 1000))
-        for row in db.rows("SELECT timeline_start_sec, start_sec FROM clips WHERE episode_uuid=? AND input_kind='anchor'", (uuid,))
+        for row in db.rows(
+            "SELECT timeline_start_sec, start_sec FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind='anchor'",
+            (uuid, view_key),
+        )
     }
     created = []
     for start in starts:
@@ -1446,6 +1884,7 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
             "input_kind": "anchor",
             "direction": "anchor",
             "anchor_stage": ANCHOR_STAGE_REPLACE_ARM,
+            "view_key": view_key,
         }
         clip = insert_continuity_clip(uuid, plan_item)
         try:
@@ -1460,19 +1899,20 @@ def create_anchor_candidates(uuid: str, start_secs: list[float], lock_token: str
         existing_keys.add(int(round(start * 1000)))
     if existing_keys:
         with db.connect() as conn:
-            conn.execute(
-                """
-                UPDATE episodes
-                SET continuity_state='anchor_candidates', final_status='stale',
-                    final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
-                WHERE uuid=?
-                """,
-                (db.now(), uuid),
-            )
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET continuity_state='anchor_candidates', final_status='stale',
+                        final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (db.now(), uuid),
+                )
         state = "anchor_candidates"
     else:
-        state = update_continuity_state(uuid)["state"]
-    return {"uuid": uuid, "created": created, "skipped": skipped, "continuity_state": state}
+        state = update_continuity_state(uuid, view_key)["state"]
+    return {"uuid": uuid, "view_key": view_key, "created": created, "skipped": skipped, "continuity_state": state}
 
 
 def normalize_anchor_starts(
@@ -1677,23 +2117,29 @@ def continuity_timeline_summary(
     uuid: str,
     clips: list[dict[str, Any]] | None = None,
     episode: dict[str, Any] | None = None,
+    view_key: str | None = None,
 ) -> dict[str, Any]:
+    view_key = normalize_view_key(view_key)
     episode = episode or db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
-    clips = clips if clips is not None else db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY timeline_start_sec, clip_index", (uuid,))
+    clips = clips if clips is not None else db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY timeline_start_sec, clip_index",
+        (uuid, view_key),
+    )
     if not episode:
         return {"state": "prepare_head", "complete": False, "error": "episode not found"}
     total = None
     error = ""
-    head_value = episode.get("head_video_path")
-    if head_value and Path(head_value).exists():
+    view_row = get_episode_view_row(uuid, view_key)
+    view_path_value = view_row.get("video_path") if view_row else None
+    if view_path_value and Path(view_path_value).exists():
         try:
-            total = continuity_total_duration(Path(head_value))
+            total = continuity_total_duration(Path(view_path_value))
         except Exception as exc:
             error = str(exc)
-    anchor_clip_id = int(episode.get("anchor_clip_id") or 0) or None
+    anchor_clip_id = view_anchor_clip_id(uuid, view_key)
     anchor_candidates = [clip for clip in clips if clip.get("input_kind") == "anchor"]
     official_anchor = db.one("SELECT * FROM clips WHERE id=?", (anchor_clip_id,)) if anchor_clip_id else None
-    if official_anchor and official_anchor.get("status") != "accepted":
+    if official_anchor and (official_anchor.get("status") != "accepted" or clip_view_key(official_anchor) != view_key):
         official_anchor = None
         anchor_clip_id = None
     relevant = continuity_relevant_clips(clips, anchor_clip_id)
@@ -1707,8 +2153,8 @@ def continuity_timeline_summary(
         and float(coverage["coverage_end_sec"]) >= float(total) - TIME_EPSILON
         and all(clip.get("status") == "accepted" for clip in relevant)
     )
-    final_status = episode.get("final_status") or "missing"
-    if episode.get("status") != "preprocessed" or not head_value:
+    final_status = (view_row.get("final_status") if view_row else None) or (episode.get("final_status") if view_key == DEFAULT_VIEW_KEY else "missing") or "missing"
+    if episode.get("status") != "preprocessed" or not view_path_value:
         state = "prepare_head"
     elif not official_anchor:
         state = "anchor_candidates" if anchor_candidates else "select_anchor"
@@ -1732,17 +2178,27 @@ def continuity_timeline_summary(
     }
 
 
-def update_continuity_state(uuid: str) -> dict[str, Any]:
-    summary = continuity_timeline_summary(uuid)
+def update_continuity_state(uuid: str, view_key: str | None = None) -> dict[str, Any]:
+    view_key = normalize_view_key(view_key)
+    summary = continuity_timeline_summary(uuid, view_key=view_key)
     with db.connect() as conn:
         conn.execute(
             """
-            UPDATE episodes
+            UPDATE episode_views
             SET continuity_state=?, anchor_clip_id=?, updated_at=?
-            WHERE uuid=?
+            WHERE episode_uuid=? AND view_key=?
             """,
-            (summary["state"], summary.get("anchor_clip_id"), db.now(), uuid),
+            (summary["state"], summary.get("anchor_clip_id"), db.now(), uuid, view_key),
         )
+        if view_key == DEFAULT_VIEW_KEY:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET continuity_state=?, anchor_clip_id=?, updated_at=?
+                WHERE uuid=?
+                """,
+                (summary["state"], summary.get("anchor_clip_id"), db.now(), uuid),
+            )
     return summary
 
 
@@ -1765,12 +2221,20 @@ def trim_continuity_contribution(
     return dst
 
 
-def stitchable_clips(uuid: str, clips: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    clips = clips if clips is not None else db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+def stitchable_clips(
+    uuid: str,
+    clips: list[dict[str, Any]] | None = None,
+    view_key: str | None = None,
+) -> list[dict[str, Any]]:
+    view_key = normalize_view_key(view_key)
+    clips = clips if clips is not None else db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY clip_index",
+        (uuid, view_key),
+    )
     continuity = [clip for clip in clips if clip.get("input_kind") in CONTINUITY_INPUT_KINDS]
     if not continuity:
         return sorted(clips, key=lambda item: int(item.get("clip_index") or 0))
-    summary = continuity_timeline_summary(uuid, clips)
+    summary = continuity_timeline_summary(uuid, clips, view_key=view_key)
     return continuity_relevant_clips(clips, int(summary["anchor_clip_id"]) if summary.get("anchor_clip_id") else None)
 
 
@@ -1784,69 +2248,80 @@ def maybe_prepare_next_continuity_clips_after_accept(
     accepted_clip = db.one("SELECT * FROM clips WHERE id=?", (accepted_clip_id,))
     if not accepted_clip or accepted_clip.get("input_kind") not in CONTINUITY_INPUT_KINDS:
         return []
+    view_key = clip_view_key(accepted_clip)
     if accepted_clip.get("input_kind") == "anchor":
-        deleted = delete_anchor_candidates_except(uuid, accepted_clip_id)
+        deleted = delete_anchor_candidates_except(uuid, accepted_clip_id, view_key)
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
-                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale',
-                    final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
-                WHERE uuid=?
+                UPDATE episode_views
+                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale', updated_at=?
+                WHERE episode_uuid=? AND view_key=?
                 """,
-                (accepted_clip_id, db.now(), uuid),
+                (accepted_clip_id, db.now(), uuid, view_key),
             )
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale',
+                        final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (accepted_clip_id, db.now(), uuid),
+                )
         prepared = []
         for direction in ["backward", "forward"]:
-            clip = maybe_prepare_direction_clip(uuid, direction)
+            clip = maybe_prepare_direction_clip(uuid, direction, view_key)
             if clip:
                 prepared.append(clip)
-        update_continuity_state(uuid)
+        update_continuity_state(uuid, view_key)
         if deleted:
             for item in prepared:
                 item["deleted_anchor_candidate_count"] = deleted
         return prepared
     if accepted_clip.get("input_kind") == "rolling":
         direction = str(accepted_clip.get("direction") or "forward")
-        clip = maybe_prepare_direction_clip(uuid, direction)
-        update_continuity_state(uuid)
+        clip = maybe_prepare_direction_clip(uuid, direction, view_key)
+        update_continuity_state(uuid, view_key)
         return [clip] if clip else []
     return []
 
 
-def maybe_prepare_direction_clip(uuid: str, direction: str) -> dict[str, Any] | None:
+def maybe_prepare_direction_clip(uuid: str, direction: str, view_key: str | None = None) -> dict[str, Any] | None:
     if direction not in {"forward", "backward"}:
         return None
+    view_key = normalize_view_key(view_key)
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
-    if not episode or not episode.get("head_video_path") or not episode.get("anchor_clip_id"):
+    anchor_id = view_anchor_clip_id(uuid, view_key)
+    if not episode or not anchor_id:
         return None
-    head_path = Path(episode["head_video_path"])
+    head_path = view_video_path_for_episode(uuid, view_key)
     if not head_path.exists():
         return None
     total = continuity_total_duration(head_path)
-    anchor_id = int(episode["anchor_clip_id"])
     anchor = db.one("SELECT * FROM clips WHERE id=? AND status='accepted'", (anchor_id,))
     if not anchor:
         return None
     existing_open = db.one(
         """
         SELECT * FROM clips
-        WHERE episode_uuid=? AND input_kind='rolling' AND direction=?
+        WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind='rolling' AND direction=?
           AND status IN ('pending','generated_failed','rejected','generating','generated','flagged','preparing')
         ORDER BY created_at DESC
         LIMIT 1
         """,
-        (uuid, direction),
+        (uuid, view_key, direction),
     )
     if existing_open:
         return None
     accepted = db.rows(
         """
         SELECT * FROM clips
-        WHERE episode_uuid=? AND input_kind IN ('anchor','rolling') AND status='accepted'
+        WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind IN ('anchor','rolling') AND status='accepted'
         ORDER BY timeline_start_sec, clip_index
         """,
-        (uuid,),
+        (uuid, view_key),
     )
     settings = load_settings()
     overlap = continuity_overlap(settings)
@@ -1886,6 +2361,7 @@ def maybe_prepare_direction_clip(uuid: str, direction: str) -> dict[str, Any] | 
         "input_timeline_end_sec": input_timeline_end,
         "input_kind": "rolling",
         "direction": direction,
+        "view_key": view_key,
     }
     clip = insert_continuity_clip(uuid, plan_item)
     try:
@@ -1901,36 +2377,38 @@ def maybe_prepare_direction_clip(uuid: str, direction: str) -> dict[str, Any] | 
     return db.one("SELECT * FROM clips WHERE id=?", (clip["id"],)) or clip
 
 
-def rolling_skip(uuid: str, reason: str) -> dict[str, Any]:
-    return {"episode_uuid": uuid, "status": "skipped", "reason": reason}
+def rolling_skip(uuid: str, reason: str, view_key: str | None = None) -> dict[str, Any]:
+    return {"episode_uuid": uuid, "view_key": normalize_view_key(view_key), "status": "skipped", "reason": reason}
 
 
 def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, Any]:
-    clip_index = int(plan_item.get("clip_index") or next_clip_index(uuid))
-    placeholder_path = CLIPS_DIR / uuid / f".clip_{clip_index:04d}_preparing.mp4"
+    view_key = normalize_view_key(plan_item.get("view_key"))
+    clip_index = int(plan_item.get("clip_index") or next_clip_index(uuid, view_key))
+    placeholder_path = view_scoped_dir(CLIPS_DIR, uuid, view_key) / f".clip_{clip_index:04d}_preparing.mp4"
     placeholder_url = public_url_for("clips", Path(uuid) / placeholder_path.name)
     now = db.now()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT * FROM clips WHERE episode_uuid=? AND clip_index=?",
-            (uuid, clip_index),
+            "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND clip_index=?",
+            (uuid, view_key, clip_index),
         ).fetchone()
         if existing:
             return dict(existing)
         cur = conn.execute(
             """
             INSERT INTO clips(
-                episode_uuid, clip_index, start_sec, duration_sec,
+                episode_uuid, view_key, clip_index, start_sec, duration_sec,
                 source_start_sec, source_duration_sec, overlap_sec, timeline_duration_sec,
                 timeline_start_sec, timeline_end_sec, input_timeline_start_sec, input_timeline_end_sec,
                 direction, input_kind, anchor_stage,
                 local_path, public_url, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
             """,
             (
                 uuid,
+                view_key,
                 clip_index,
                 float(plan_item["start_sec"]),
                 float(plan_item["duration_sec"]),
@@ -1958,6 +2436,7 @@ def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, An
             int(clip_id),
             str(plan_item.get("input_kind") or "rolling"),
             str(plan_item.get("direction") or "forward"),
+            view_key,
         )
         public_url = public_url_for_local_path(path, uuid)
         conn.execute(
@@ -1968,19 +2447,15 @@ def insert_continuity_clip(uuid: str, plan_item: dict[str, Any]) -> dict[str, An
             """,
             (str(path.resolve()), public_url, now, int(clip_id)),
         )
-        conn.execute(
-            """
-            UPDATE episodes
-            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
-            WHERE uuid=? AND final_status IN ('ready','stitching')
-            """,
-            (now, uuid),
-        )
+        mark_view_outputs_stale(conn, uuid, view_key)
     return db.one("SELECT * FROM clips WHERE id=?", (clip_id,)) or {"id": clip_id, "episode_uuid": uuid}
 
 
-def next_clip_index(uuid: str) -> int:
-    row = db.one("SELECT COALESCE(MAX(clip_index), -1) + 1 AS next_index FROM clips WHERE episode_uuid=?", (uuid,))
+def next_clip_index(uuid: str, view_key: str | None = None) -> int:
+    row = db.one(
+        "SELECT COALESCE(MAX(clip_index), -1) + 1 AS next_index FROM clips WHERE episode_uuid=?",
+        (uuid,),
+    )
     return int(row["next_index"] if row else 0)
 
 
@@ -2004,12 +2479,9 @@ def ensure_continuity_clip_input(clip: dict[str, Any], verify_duration: bool = T
 def build_continuity_clip_input(clip: dict[str, Any]) -> None:
     if clip.get("input_kind") in CONTINUITY_INPUT_KINDS and path_is_under(clip.get("local_path"), CLIPS_DIR):
         clip = ensure_continuity_cache_target(clip)
-    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (clip["episode_uuid"],))
-    if not episode or not episode.get("head_video_path"):
-        raise RuntimeError("episode head video path missing")
-    head_path = Path(episode["head_video_path"])
-    if not head_path.exists():
-        raise RuntimeError("episode head video file missing")
+    source_path = view_video_path_for_episode(str(clip["episode_uuid"]), clip_view_key(clip))
+    if not source_path.exists():
+        raise RuntimeError("episode view video file missing")
     anchor_path = None
     overlap = float(clip.get("overlap_sec") or 0)
     direction = str(clip.get("direction") or "forward")
@@ -2024,7 +2496,7 @@ def build_continuity_clip_input(clip: dict[str, Any]) -> None:
     temp_path = target_path.with_name(f".{target_path.name}.{int(db.now() * 1000)}.{secrets.token_hex(4)}.tmp.mp4")
     try:
         compose_continuity_input(
-            head_path,
+            source_path,
             temp_path,
             float(clip.get("source_start_sec") if clip.get("source_start_sec") is not None else clip["start_sec"]),
             float(clip.get("source_duration_sec") if clip.get("source_duration_sec") is not None else clip["duration_sec"]),
@@ -2046,27 +2518,28 @@ def build_continuity_clip_input(clip: dict[str, Any]) -> None:
 
 def adjacent_accepted_path(clip: dict[str, Any]) -> Path | None:
     direction = str(clip.get("direction") or "forward")
+    view_key = clip_view_key(clip)
     if direction == "backward":
         neighbor = db.one(
             """
             SELECT * FROM clips
-            WHERE episode_uuid=? AND input_kind IN ('anchor','rolling') AND status='accepted'
+            WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind IN ('anchor','rolling') AND status='accepted'
               AND timeline_start_sec>=?
             ORDER BY timeline_start_sec ASC
             LIMIT 1
             """,
-            (clip["episode_uuid"], float(clip.get("timeline_end_sec") or 0) - TIME_EPSILON),
+            (clip["episode_uuid"], view_key, float(clip.get("timeline_end_sec") or 0) - TIME_EPSILON),
         )
     else:
         neighbor = db.one(
             """
             SELECT * FROM clips
-            WHERE episode_uuid=? AND input_kind IN ('anchor','rolling') AND status='accepted'
+            WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? AND input_kind IN ('anchor','rolling') AND status='accepted'
               AND timeline_end_sec<=?
             ORDER BY timeline_end_sec DESC
             LIMIT 1
             """,
-            (clip["episode_uuid"], float(clip.get("timeline_start_sec") or 0) + TIME_EPSILON),
+            (clip["episode_uuid"], view_key, float(clip.get("timeline_start_sec") or 0) + TIME_EPSILON),
         )
     return latest_accepted_path(int(neighbor["id"])) if neighbor else None
 
@@ -2326,14 +2799,7 @@ def claim_async_generation_job(
         )
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
-        conn.execute(
-            """
-            UPDATE episodes
-            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
-            WHERE uuid=? AND final_status IN ('ready','stitching')
-            """,
-            (now, clip["episode_uuid"]),
-        )
+        mark_view_outputs_stale(conn, clip["episode_uuid"], clip_view_key(clip))
     return {"job_id": job_id, "clip_id": clip["id"], "status": "queued", "estimated_total_sec": estimate}
 
 
@@ -2363,7 +2829,8 @@ def mock_job_worker(job_id: int) -> None:
     try:
         row = db.one(
             """
-            SELECT j.*, c.id AS clip_row_id, c.episode_uuid, c.clip_index, c.local_path,
+            SELECT j.*, c.id AS clip_row_id, c.episode_uuid, COALESCE(c.view_key, 'head') AS view_key,
+                   c.clip_index, c.local_path,
                    c.input_kind, c.direction, c.duration_sec, c.source_start_sec, c.source_duration_sec,
                    c.overlap_sec, c.start_sec, c.updated_at AS clip_updated_at, c.public_url
             FROM generation_jobs j
@@ -2378,7 +2845,7 @@ def mock_job_worker(job_id: int) -> None:
             return
         job = dict(row)
         job["status"] = "running"
-        out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_mock.mp4"
+        out_path = view_scoped_dir(GENERATED_DIR, job["episode_uuid"], job.get("view_key")) / f"clip_{int(job['clip_index']):04d}_job_{job_id}_mock.mp4"
         remaining = max(0.0, float(job.get("estimated_total_sec") or 0))
         while remaining > 0:
             sleep_for = min(0.5, remaining)
@@ -2415,7 +2882,8 @@ def seedance_job_worker(job_id: int) -> None:
     try:
         row = db.one(
             """
-            SELECT j.*, c.id AS clip_row_id, c.episode_uuid, c.clip_index, c.duration_sec,
+            SELECT j.*, c.id AS clip_row_id, c.episode_uuid, COALESCE(c.view_key, 'head') AS view_key,
+                   c.clip_index, c.duration_sec,
                    c.public_url, c.local_path, c.input_kind, c.direction, c.source_start_sec,
                    c.source_duration_sec, c.overlap_sec, c.start_sec, c.updated_at AS clip_updated_at
             FROM generation_jobs j
@@ -2432,7 +2900,7 @@ def seedance_job_worker(job_id: int) -> None:
         input_url = generation_input_url(job, job_id)
         settings = load_settings()
         job_prompt, job_refs = generation_values_from_job(job, settings)
-        out_path = GENERATED_DIR / job["episode_uuid"] / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
+        out_path = view_scoped_dir(GENERATED_DIR, job["episode_uuid"], job.get("view_key")) / f"clip_{int(job['clip_index']):04d}_job_{job_id}_seedance.mp4"
         heartbeat = generation_job_heartbeat(job_id)
         key_slot = acquire_seedance_key_slot(settings)
         set_generation_worker_key_slot(job_id, worker_token, key_slot)
@@ -3053,14 +3521,7 @@ def run_generation_for_clip(
         )
         job_id = cur.lastrowid
         conn.execute("UPDATE clips SET status='generating', updated_at=? WHERE id=?", (now, clip["id"]))
-        conn.execute(
-            """
-            UPDATE episodes
-            SET final_status='stale', final_dataset_status='stale', final_dataset_error=NULL, updated_at=?
-            WHERE uuid=? AND final_status IN ('ready','stitching')
-            """,
-            (now, clip["episode_uuid"]),
-        )
+        mark_view_outputs_stale(conn, clip["episode_uuid"], clip_view_key(clip))
     try:
         latest_clip = db.one("SELECT * FROM clips WHERE id=?", (clip["id"],))
         if not latest_clip:
@@ -3070,7 +3531,7 @@ def run_generation_for_clip(
         input_url = generation_input_url(clip, job_id)
         episode_uuid = clip["episode_uuid"]
         suffix = "dryrun" if dry_run else mode
-        out_path = GENERATED_DIR / episode_uuid / f"clip_{int(clip['clip_index']):04d}_job_{job_id}_{suffix}.mp4"
+        out_path = view_scoped_dir(GENERATED_DIR, episode_uuid, clip_view_key(clip)) / f"clip_{int(clip['clip_index']):04d}_job_{job_id}_{suffix}.mp4"
         if dry_run:
             payload = client.dry_run_payload(prompt, input_url, float(clip["duration_sec"]), reference_images or [])
             out_path = out_path.with_suffix(".json")
@@ -3189,6 +3650,7 @@ def retry_clip(
     clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
     if not clip:
         raise ValueError("clip not found")
+    view_key = clip_view_key(clip)
     if require_lock_token:
         require_lock("episode", clip["episode_uuid"], lock_token)
     deleted_future_clip_count = (
@@ -3212,20 +3674,20 @@ def retry_clip(
     )[0]
     result["deleted_future_clip_count"] = deleted_future_clip_count
     if clip.get("input_kind") in CONTINUITY_INPUT_KINDS:
-        update_continuity_state(clip["episode_uuid"])
+        update_continuity_state(clip["episode_uuid"], view_key)
     return result
 
 
 def anchor_stage1_input_path(clip: dict[str, Any]) -> Path:
-    return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}_stage1_input.mp4"
+    return view_scoped_dir(ACCEPTED_DIR, clip["episode_uuid"], clip_view_key(clip)) / f"clip_{int(clip['clip_index']):04d}_stage1_input.mp4"
 
 
 def accepted_clip_output_path(clip: dict[str, Any]) -> Path:
-    return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}.mp4"
+    return view_scoped_dir(ACCEPTED_DIR, clip["episode_uuid"], clip_view_key(clip)) / f"clip_{int(clip['clip_index']):04d}.mp4"
 
 
 def chronological_accepted_output_path(clip: dict[str, Any]) -> Path:
-    return ACCEPTED_DIR / clip["episode_uuid"] / f"clip_{int(clip['clip_index']):04d}_chronological.mp4"
+    return view_scoped_dir(ACCEPTED_DIR, clip["episode_uuid"], clip_view_key(clip)) / f"clip_{int(clip['clip_index']):04d}_chronological.mp4"
 
 
 def accepted_output_needs_chronological_sidecar(clip: dict[str, Any]) -> bool:
@@ -3279,6 +3741,7 @@ def review_clip(
     clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
     if not clip:
         raise ValueError("clip not found")
+    view_key = clip_view_key(clip)
     if require_lock_token:
         require_lock("episode", clip["episode_uuid"], lock_token)
     if job_id is None:
@@ -3353,7 +3816,10 @@ def review_clip(
         )
         if stage1_anchor_accept:
             assert accepted_path is not None
-            public_url = public_url_for("accepted", Path(clip["episode_uuid"]) / Path(accepted_path).name)
+            rel = Path(clip["episode_uuid"]) / Path(accepted_path).name
+            if view_key != DEFAULT_VIEW_KEY:
+                rel = Path(clip["episode_uuid"]) / view_key / Path(accepted_path).name
+            public_url = public_url_for("accepted", rel)
             conn.execute(
                 """
                 UPDATE clips
@@ -3381,6 +3847,14 @@ def review_clip(
             """,
             (now, clip["episode_uuid"]),
         )
+        conn.execute(
+            """
+            UPDATE episode_views
+            SET final_status='stale', updated_at=?
+            WHERE episode_uuid=? AND view_key=?
+            """,
+            (now, clip["episode_uuid"], view_key),
+        )
     deleted_future_clip_count = (
         delete_dependent_continuity_clips(clip)
         if decision in {"reject", "rerun"} and clip.get("input_kind") in CONTINUITY_INPUT_KINDS
@@ -3395,7 +3869,7 @@ def review_clip(
             if decision == "accept"
             else []
         )
-    update_continuity_state(clip["episode_uuid"])
+    update_continuity_state(clip["episode_uuid"], view_key)
     if stage1_anchor_accept:
         preview = {
             "uuid": clip["episode_uuid"],
@@ -3405,8 +3879,8 @@ def review_clip(
         }
         final = None
     else:
-        preview = queue_preview_episode(clip["episode_uuid"])
-        final = maybe_stitch_episode(clip["episode_uuid"])
+        preview = queue_preview_episode(clip["episode_uuid"], view_key)
+        final = maybe_stitch_episode(clip["episode_uuid"], view_key)
     return {
         "clip_id": clip_id,
         "decision": decision,
@@ -3419,101 +3893,164 @@ def review_clip(
     }
 
 
-def maybe_stitch_episode(uuid: str) -> dict[str, Any] | None:
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+def maybe_stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any] | None:
+    view_key = normalize_view_key(view_key)
+    clips = db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY clip_index",
+        (uuid, view_key),
+    )
     if not clips:
         return None
-    if not episode_clips_ready_for_stitch(uuid, clips):
+    if not episode_clips_ready_for_stitch(uuid, clips, view_key):
         return None
-    return queue_stitch_episode(uuid, check_episode_lock=False)
+    return queue_stitch_episode(uuid, view_key=view_key, check_episode_lock=False)
 
 
-def queue_preview_episode(uuid: str) -> dict[str, Any]:
+def queue_preview_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
     uuid = uuid.lower()
+    view_key = normalize_view_key(view_key)
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
     if not episode:
-        return {"uuid": uuid, "queued": False, "preview_status": "missing", "reason": "episode not found"}
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+        return {"uuid": uuid, "view_key": view_key, "queued": False, "preview_status": "missing", "reason": "episode not found"}
+    get_episode_view_row(uuid, view_key)
+    clips = db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY clip_index",
+        (uuid, view_key),
+    )
     if not clips:
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
+                UPDATE episode_views
                 SET preview_video_path=NULL, preview_status='missing', preview_error=NULL,
                     preview_version=preview_version+1, updated_at=?
-                WHERE uuid=?
+                WHERE episode_uuid=? AND view_key=?
                 """,
-                (db.now(), uuid),
+                (db.now(), uuid, view_key),
             )
-        return {"uuid": uuid, "queued": False, "preview_status": "missing", "reason": "no clips"}
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET preview_video_path=NULL, preview_status='missing', preview_error=NULL,
+                        preview_version=preview_version+1, updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (db.now(), uuid),
+                )
+        return {"uuid": uuid, "view_key": view_key, "queued": False, "preview_status": "missing", "reason": "no clips"}
     accepted_count = sum(1 for clip in clips if clip.get("status") == "accepted")
     if accepted_count <= 0:
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
+                UPDATE episode_views
                 SET preview_video_path=NULL, preview_status='missing', preview_error=NULL,
                     preview_version=preview_version+1, updated_at=?
-                WHERE uuid=?
+                WHERE episode_uuid=? AND view_key=?
                 """,
-                (db.now(), uuid),
+                (db.now(), uuid, view_key),
             )
-        return {"uuid": uuid, "queued": False, "preview_status": "missing", "reason": "no accepted clips"}
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET preview_video_path=NULL, preview_status='missing', preview_error=NULL,
+                        preview_version=preview_version+1, updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (db.now(), uuid),
+                )
+        return {"uuid": uuid, "view_key": view_key, "queued": False, "preview_status": "missing", "reason": "no accepted clips"}
     with db.connect() as conn:
-        row = conn.execute("SELECT COALESCE(preview_version, 0) AS version FROM episodes WHERE uuid=?", (uuid,)).fetchone()
+        row = conn.execute(
+            "SELECT COALESCE(preview_version, 0) AS version FROM episode_views WHERE episode_uuid=? AND view_key=?",
+            (uuid, view_key),
+        ).fetchone()
         version = int(row["version"] if row else 0) + 1
         conn.execute(
             """
-            UPDATE episodes
+            UPDATE episode_views
             SET preview_status='stitching', preview_error=NULL, preview_version=?, updated_at=?
-            WHERE uuid=?
+            WHERE episode_uuid=? AND view_key=?
             """,
-            (version, db.now(), uuid),
+            (version, db.now(), uuid, view_key),
         )
+        if view_key == DEFAULT_VIEW_KEY:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET preview_status='stitching', preview_error=NULL, preview_version=?, updated_at=?
+                WHERE uuid=?
+                """,
+                (version, db.now(), uuid),
+            )
     with _PREVIEW_LOCK:
-        if uuid not in _PREVIEWING_EPISODES:
-            _PREVIEWING_EPISODES.add(uuid)
-            _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, version)
-    return {"uuid": uuid, "queued": True, "preview_status": "stitching", "preview_version": version}
+        key = episode_view_resource_id(uuid, view_key)
+        if key not in _PREVIEWING_EPISODES:
+            _PREVIEWING_EPISODES.add(key)
+            _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, version, view_key)
+    return {"uuid": uuid, "view_key": view_key, "queued": True, "preview_status": "stitching", "preview_version": version}
 
 
-def _preview_episode_worker(uuid: str, version: int) -> None:
+def _preview_episode_worker(uuid: str, version: int, view_key: str | None = None) -> None:
+    view_key = normalize_view_key(view_key)
+    resource_id = episode_view_resource_id(uuid, view_key)
     rerun = False
     try:
-        result = preview_episode(uuid, version)
+        result = preview_episode(uuid, version, view_key)
         rerun = bool(result.get("stale"))
     except Exception as exc:
-        episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
+        episode = db.one(
+            "SELECT preview_version FROM episode_views WHERE episode_uuid=? AND view_key=?",
+            (uuid, view_key),
+        )
         if episode and int(episode.get("preview_version") or 0) != version:
             rerun = True
         else:
             with db.connect() as conn:
                 conn.execute(
-                    "UPDATE episodes SET preview_status='failed', preview_error=?, updated_at=? WHERE uuid=?",
-                    (str(exc), db.now(), uuid),
+                    "UPDATE episode_views SET preview_status='failed', preview_error=?, updated_at=? WHERE episode_uuid=? AND view_key=?",
+                    (str(exc), db.now(), uuid, view_key),
                 )
+                if view_key == DEFAULT_VIEW_KEY:
+                    conn.execute(
+                        "UPDATE episodes SET preview_status='failed', preview_error=?, updated_at=? WHERE uuid=?",
+                        (str(exc), db.now(), uuid),
+                    )
     finally:
         with _PREVIEW_LOCK:
-            _PREVIEWING_EPISODES.discard(uuid)
-            latest = db.one("SELECT preview_status, preview_version FROM episodes WHERE uuid=?", (uuid,))
+            _PREVIEWING_EPISODES.discard(resource_id)
+            latest = db.one(
+                "SELECT preview_status, preview_version FROM episode_views WHERE episode_uuid=? AND view_key=?",
+                (uuid, view_key),
+            )
             latest_still_wants_preview = latest and latest.get("preview_status") == "stitching"
             if latest_still_wants_preview and (rerun or int(latest.get("preview_version") or 0) != version):
                 latest_version = int(latest.get("preview_version") or 0) if latest else version + 1
-                _PREVIEWING_EPISODES.add(uuid)
-                _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, latest_version)
+                _PREVIEWING_EPISODES.add(resource_id)
+                _PREVIEW_EXECUTOR.submit(_preview_episode_worker, uuid, latest_version, view_key)
 
 
-def _preview_is_stale(uuid: str, version: int) -> bool:
-    episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
+def _preview_is_stale(uuid: str, version: int, view_key: str | None = None) -> bool:
+    view_key = normalize_view_key(view_key)
+    episode = db.one(
+        "SELECT preview_version FROM episode_views WHERE episode_uuid=? AND view_key=?",
+        (uuid, view_key),
+    )
     return not episode or int(episode.get("preview_version") or 0) != version
 
 
-def preview_episode(uuid: str, version: int) -> dict[str, Any]:
+def preview_episode(uuid: str, version: int, view_key: str | None = None) -> dict[str, Any]:
     uuid = uuid.lower()
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    view_key = normalize_view_key(view_key)
+    clips = db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY clip_index",
+        (uuid, view_key),
+    )
     if not clips:
-        return {"uuid": uuid, "preview_status": "missing", "reason": "no clips"}
-    should_cancel = lambda: _preview_is_stale(uuid, version)
+        return {"uuid": uuid, "view_key": view_key, "preview_status": "missing", "reason": "no clips"}
+    should_cancel = lambda: _preview_is_stale(uuid, version, view_key)
     accepted_by_id: dict[int, Path] = {}
     for clip in clips:
         if clip.get("status") != "accepted":
@@ -3527,40 +4064,53 @@ def preview_episode(uuid: str, version: int) -> dict[str, Any]:
             if path.exists():
                 accepted_by_id[int(clip["id"])] = ensure_chronological_accepted_path(clip, path, should_cancel)
     if _preview_is_stale(uuid, version):
-        return {"uuid": uuid, "preview_status": "stitching", "stale": True}
+        return {"uuid": uuid, "view_key": view_key, "preview_status": "stitching", "stale": True}
     if not accepted_by_id:
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
+                UPDATE episode_views
                 SET preview_video_path=NULL, preview_status='missing', preview_error=NULL, updated_at=?
-                WHERE uuid=? AND preview_version=?
+                WHERE episode_uuid=? AND view_key=? AND preview_version=?
                 """,
-                (db.now(), uuid, version),
+                (db.now(), uuid, view_key, version),
             )
-        return {"uuid": uuid, "preview_status": "missing", "reason": "no accepted clips"}
-    out = FINAL_DIR / f"{uuid}_preview_accepted_with_black.mp4"
-    tmp = FINAL_DIR / f".{uuid}_preview-{version}-{int(time.time() * 1000)}.mp4"
+        return {"uuid": uuid, "view_key": view_key, "preview_status": "missing", "reason": "no accepted clips"}
+    out = FINAL_DIR / uuid / view_key / f"preview_accepted_with_black.mp4"
+    tmp = FINAL_DIR / uuid / view_key / f".preview-{version}-{int(time.time() * 1000)}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
-            stitch_inputs = preview_stitch_inputs(uuid, clips, accepted_by_id, tmp_root, should_cancel)
+            stitch_inputs = preview_stitch_inputs(uuid, clips, accepted_by_id, tmp_root, should_cancel, view_key)
             concat_videos_precise(stitch_inputs, tmp, should_cancel=should_cancel)
-        episode = db.one("SELECT preview_version FROM episodes WHERE uuid=?", (uuid,))
+        episode = db.one(
+            "SELECT preview_version FROM episode_views WHERE episode_uuid=? AND view_key=?",
+            (uuid, view_key),
+        )
         if not episode or int(episode.get("preview_version") or 0) != version:
             tmp.unlink(missing_ok=True)
-            return {"uuid": uuid, "preview_status": "stitching", "stale": True}
+            return {"uuid": uuid, "view_key": view_key, "preview_status": "stitching", "stale": True}
         tmp.replace(out)
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
+                UPDATE episode_views
                 SET preview_video_path=?, preview_status='ready', preview_error=NULL, updated_at=?
-                WHERE uuid=? AND preview_version=?
+                WHERE episode_uuid=? AND view_key=? AND preview_version=?
                 """,
-                (str(out.resolve()), db.now(), uuid, version),
+                (str(out.resolve()), db.now(), uuid, view_key, version),
             )
-        return {"uuid": uuid, "preview_video_path": str(out.resolve()), "preview_status": "ready"}
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET preview_video_path=?, preview_status='ready', preview_error=NULL, updated_at=?
+                    WHERE uuid=? AND preview_version=?
+                    """,
+                    (str(out.resolve()), db.now(), uuid, version),
+                )
+        return {"uuid": uuid, "view_key": view_key, "preview_video_path": str(out.resolve()), "preview_status": "ready"}
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -3572,6 +4122,7 @@ def preview_stitch_inputs(
     accepted_by_id: dict[int, Path],
     tmp_root: Path,
     should_cancel: Callable[[], bool] | None = None,
+    view_key: str | None = None,
 ) -> list[Path]:
     def check_cancelled() -> None:
         if should_cancel and should_cancel():
@@ -3579,11 +4130,15 @@ def preview_stitch_inputs(
 
     continuity = [clip for clip in clips if clip.get("input_kind") in CONTINUITY_INPUT_KINDS]
     if continuity:
-        episode = db.one("SELECT head_video_path FROM episodes WHERE uuid=?", (uuid,))
+        view_key = normalize_view_key(view_key or (continuity[0].get("view_key") if continuity else None))
         total = None
-        if episode and episode.get("head_video_path") and Path(episode["head_video_path"]).exists():
-            total = continuity_total_duration(Path(episode["head_video_path"]))
-        summary = continuity_timeline_summary(uuid, clips, episode)
+        try:
+            view_path = view_video_path_for_episode(uuid, view_key)
+            if view_path.exists():
+                total = continuity_total_duration(view_path)
+        except Exception:
+            total = None
+        summary = continuity_timeline_summary(uuid, clips, view_key=view_key)
         relevant = continuity_relevant_clips(
             clips,
             int(summary["anchor_clip_id"]) if summary.get("anchor_clip_id") else None,
@@ -3636,13 +4191,14 @@ def preview_stitch_inputs(
     return items
 
 
-def episode_clips_ready_for_stitch(uuid: str, clips: list[dict[str, Any]]) -> bool:
+def episode_clips_ready_for_stitch(uuid: str, clips: list[dict[str, Any]], view_key: str | None = None) -> bool:
     if not clips:
         return False
+    view_key = normalize_view_key(view_key or clips[0].get("view_key"))
     continuity = [clip for clip in clips if clip.get("input_kind") in CONTINUITY_INPUT_KINDS]
     if continuity:
-        relevant = stitchable_clips(uuid, clips)
-        return bool(relevant) and continuity_timeline_summary(uuid, clips).get("complete") is True
+        relevant = stitchable_clips(uuid, clips, view_key)
+        return bool(relevant) and continuity_timeline_summary(uuid, clips, view_key=view_key).get("complete") is True
     return all(clip["status"] == "accepted" for clip in clips)
 
 
@@ -3651,58 +4207,79 @@ def queue_stitch_episode(
     lock_token: str | None = None,
     require_lock_token: bool = False,
     check_episode_lock: bool = True,
+    view_key: str | None = None,
 ) -> dict[str, Any]:
     uuid = uuid.lower()
+    view_key = normalize_view_key(view_key)
     if check_episode_lock:
         if require_lock_token:
             require_lock("episode", uuid, lock_token)
         else:
             require_no_active_lock("episode", uuid)
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
+    clips = db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY clip_index",
+        (uuid, view_key),
+    )
     if not clips:
-        return {"uuid": uuid, "queued": False, "final_status": "missing", "reason": "no clips"}
-    if not episode_clips_ready_for_stitch(uuid, clips):
+        return {"uuid": uuid, "view_key": view_key, "queued": False, "final_status": "missing", "reason": "no clips"}
+    if not episode_clips_ready_for_stitch(uuid, clips, view_key):
         reason = "not all clips accepted" if any(clip["status"] != "accepted" for clip in clips) else "rolling timeline incomplete"
-        return {"uuid": uuid, "queued": False, "final_status": "stale", "reason": reason}
+        return {"uuid": uuid, "view_key": view_key, "queued": False, "final_status": "stale", "reason": reason}
 
     with _STITCH_LOCK:
-        if uuid in _STITCHING_EPISODES:
-            return {"uuid": uuid, "queued": False, "final_status": "stitching", "reason": "already stitching"}
-        stitch_clips = stitchable_clips(uuid, clips)
+        resource_id = episode_view_resource_id(uuid, view_key)
+        if resource_id in _STITCHING_EPISODES:
+            return {"uuid": uuid, "view_key": view_key, "queued": False, "final_status": "stitching", "reason": "already stitching"}
+        stitch_clips = stitchable_clips(uuid, clips, view_key)
         lock_tokens = acquire_stitch_locks(uuid, stitch_clips)
-        _STITCHING_EPISODES.add(uuid)
+        _STITCHING_EPISODES.add(resource_id)
         with db.connect() as conn:
-            conn.execute("UPDATE episodes SET final_status='stitching', error=NULL, updated_at=? WHERE uuid=?", (db.now(), uuid))
-        _STITCH_EXECUTOR.submit(_stitch_episode_worker, uuid, lock_tokens)
-    return {"uuid": uuid, "queued": True, "final_status": "stitching"}
+            conn.execute(
+                "UPDATE episode_views SET final_status='stitching', error=NULL, updated_at=? WHERE episode_uuid=? AND view_key=?",
+                (db.now(), uuid, view_key),
+            )
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute("UPDATE episodes SET final_status='stitching', error=NULL, updated_at=? WHERE uuid=?", (db.now(), uuid))
+        _STITCH_EXECUTOR.submit(_stitch_episode_worker, uuid, lock_tokens, view_key)
+    return {"uuid": uuid, "view_key": view_key, "queued": True, "final_status": "stitching"}
 
 
-def _stitch_episode_worker(uuid: str, lock_tokens: list[str]) -> None:
+def _stitch_episode_worker(uuid: str, lock_tokens: list[str], view_key: str | None = None) -> None:
+    view_key = normalize_view_key(view_key)
     try:
-        stitch_episode(uuid)
+        stitch_episode(uuid, view_key)
     except Exception as exc:
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
-                SET final_status='failed', error=?,
-                    final_dataset_status=CASE
-                        WHEN final_dataset_status='exporting' THEN 'failed'
-                        ELSE final_dataset_status
-                    END,
-                    final_dataset_error=CASE
-                        WHEN final_dataset_status='exporting' THEN ?
-                        ELSE final_dataset_error
-                    END,
-                    updated_at=?
-                WHERE uuid=?
+                UPDATE episode_views
+                SET final_status='failed', error=?, updated_at=?
+                WHERE episode_uuid=? AND view_key=?
                 """,
-                (str(exc), str(exc), db.now(), uuid),
+                (str(exc), db.now(), uuid, view_key),
             )
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET final_status='failed', error=?,
+                        final_dataset_status=CASE
+                            WHEN final_dataset_status='exporting' THEN 'failed'
+                            ELSE final_dataset_status
+                        END,
+                        final_dataset_error=CASE
+                            WHEN final_dataset_status='exporting' THEN ?
+                            ELSE final_dataset_error
+                        END,
+                        updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (str(exc), str(exc), db.now(), uuid),
+                )
     finally:
         release_stitch_locks(lock_tokens)
         with _STITCH_LOCK:
-            _STITCHING_EPISODES.discard(uuid)
+            _STITCHING_EPISODES.discard(episode_view_resource_id(uuid, view_key))
 
 
 def episode_source_dir_for_export(episode: dict[str, Any]) -> Path:
@@ -3742,10 +4319,78 @@ def export_final_seedance_dataset(uuid: str, final_video_path: Path) -> dict[str
     return export_seedance_dataset(source_dir, final_video_path, output_dir)
 
 
-def stitch_episode(uuid: str) -> dict[str, Any]:
+def export_final_seedance_dataset_for_ready_views(uuid: str) -> dict[str, Any] | None:
+    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    if not episode:
+        raise RuntimeError(f"episode not found: {uuid}")
+    source_dir = episode_source_dir_for_export(episode)
+    source_preprocessed = source_dir / "preprocessed"
+    metadata = load_json(source_preprocessed / "metadata.json")
+    views = list_episode_view_rows(uuid)
+    for view in views:
+        if view.get("topic"):
+            continue
+        if normalize_view_key(view.get("view_key")) == DEFAULT_VIEW_KEY:
+            try:
+                from .nedf import choose_head_topic
+
+                topic, camera_id = choose_head_topic(metadata)
+                view["topic"] = topic
+                view["camera_id"] = view.get("camera_id") or camera_id
+                with db.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE episode_views
+                        SET topic=?, camera_id=?, updated_at=?
+                        WHERE episode_uuid=? AND view_key=?
+                        """,
+                        (topic, view["camera_id"], db.now(), uuid, DEFAULT_VIEW_KEY),
+                    )
+            except Exception:
+                pass
+    ready_views = [
+        view
+        for view in views
+        if view.get("final_status") == "ready"
+        and view.get("final_video_path")
+        and view.get("topic")
+        and Path(str(view["final_video_path"])).exists()
+    ]
+    if not ready_views or len(ready_views) < len(views):
+        return None
+    output_dir = FINAL_DATASET_DIR / uuid
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE episodes
+            SET final_dataset_status='exporting', final_dataset_error=NULL, updated_at=?
+            WHERE uuid=?
+            """,
+            (db.now(), uuid),
+        )
+    return export_seedance_dataset_for_views(
+        source_dir,
+        [
+            {
+                "view_key": view["view_key"],
+                "camera_id": view["camera_id"],
+                "topic": view["topic"],
+                "final_video_path": view["final_video_path"],
+            }
+            for view in ready_views
+        ],
+        output_dir,
+    )
+
+
+def stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
     uuid = uuid.lower()
-    clips = db.rows("SELECT * FROM clips WHERE episode_uuid=? ORDER BY clip_index", (uuid,))
-    stitch_clips = stitchable_clips(uuid, clips)
+    view_key = normalize_view_key(view_key)
+    clips = db.rows(
+        "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=? ORDER BY clip_index",
+        (uuid, view_key),
+    )
+    stitch_clips = stitchable_clips(uuid, clips, view_key)
     accepted_paths = []
     for clip in stitch_clips:
         review = db.one(
@@ -3755,10 +4400,16 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
         if not review or not review.get("accepted_path"):
             raise RuntimeError(f"clip {clip['id']} is not accepted")
         accepted_paths.append(ensure_chronological_accepted_path(clip, Path(review["accepted_path"])))
-    out = FINAL_DIR / f"{uuid}_accepted_30fps.mp4"
-    tmp = FINAL_DIR / f".{uuid}_accepted_30fps.stitching-{int(time.time() * 1000)}.mp4"
+    out = FINAL_DIR / uuid / view_key / "accepted_30fps.mp4"
+    tmp = FINAL_DIR / uuid / view_key / f".accepted_30fps.stitching-{int(time.time() * 1000)}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with db.connect() as conn:
-        conn.execute("UPDATE episodes SET final_status='stitching', error=NULL, updated_at=? WHERE uuid=?", (db.now(), uuid))
+        conn.execute(
+            "UPDATE episode_views SET final_status='stitching', error=NULL, updated_at=? WHERE episode_uuid=? AND view_key=?",
+            (db.now(), uuid, view_key),
+        )
+        if view_key == DEFAULT_VIEW_KEY:
+            conn.execute("UPDATE episodes SET final_status='stitching', error=NULL, updated_at=? WHERE uuid=?", (db.now(), uuid))
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             stitch_inputs: list[Path] = []
@@ -3774,47 +4425,74 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
                 concat_videos_precise(stitch_inputs, tmp)
             else:
                 stitch_videos(stitch_inputs, tmp)
-        episode = db.one("SELECT final_status FROM episodes WHERE uuid=?", (uuid,))
-        current_clips = db.rows("SELECT * FROM clips WHERE episode_uuid=?", (uuid,))
-        if not episode or episode.get("final_status") != "stitching" or not episode_clips_ready_for_stitch(uuid, current_clips):
+        view = db.one("SELECT final_status FROM episode_views WHERE episode_uuid=? AND view_key=?", (uuid, view_key))
+        current_clips = db.rows(
+            "SELECT * FROM clips WHERE episode_uuid=? AND COALESCE(view_key, 'head')=?",
+            (uuid, view_key),
+        )
+        if not view or view.get("final_status") != "stitching" or not episode_clips_ready_for_stitch(uuid, current_clips, view_key):
             tmp.unlink(missing_ok=True)
-            return {"uuid": uuid, "final_status": episode.get("final_status") if episode else "missing", "stale": True}
+            return {"uuid": uuid, "view_key": view_key, "final_status": view.get("final_status") if view else "missing", "stale": True}
         tmp.replace(out)
-        dataset_path = None
-        dataset_status = "failed"
-        dataset_error = None
-        try:
-            dataset = export_final_seedance_dataset(uuid, out)
-            dataset_path = dataset["output_path"]
-            dataset_status = "ready"
-        except Exception as exc:
-            dataset_error = str(exc)
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
-                SET final_video_path=?,
-                    final_status='ready',
-                    final_dataset_path=?,
-                    final_dataset_status=?,
-                    final_dataset_error=?,
-                    continuity_state=CASE
-                        WHEN EXISTS (
-                            SELECT 1 FROM clips
-                            WHERE episode_uuid=? AND input_kind IN ('anchor','rolling')
-                        )
-                        THEN 'complete'
-                        ELSE continuity_state
-                    END,
-                    error=NULL,
-                    updated_at=?
-                WHERE uuid=?
+                UPDATE episode_views
+                SET final_video_path=?, final_status='ready', error=NULL, updated_at=?
+                WHERE episode_uuid=? AND view_key=?
                 """,
-                (str(out.resolve()), dataset_path, dataset_status, dataset_error, uuid, db.now(), uuid),
+                (str(out.resolve()), db.now(), uuid, view_key),
             )
-        update_continuity_state(uuid)
+        dataset_path = None
+        dataset_status = db.one("SELECT final_dataset_status FROM episodes WHERE uuid=?", (uuid,)).get("final_dataset_status")
+        dataset_error = None
+        try:
+            dataset = export_final_seedance_dataset_for_ready_views(uuid)
+            if dataset:
+                dataset_path = dataset["output_path"]
+                dataset_status = "ready"
+        except Exception as exc:
+            dataset_error = str(exc)
+        with db.connect() as conn:
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET final_video_path=?,
+                        final_status='ready',
+                        final_dataset_path=?,
+                        final_dataset_status=?,
+                        final_dataset_error=?,
+                        continuity_state=CASE
+                            WHEN EXISTS (
+                                SELECT 1 FROM clips
+                                WHERE episode_uuid=? AND COALESCE(view_key, 'head')='head' AND input_kind IN ('anchor','rolling')
+                            )
+                            THEN 'complete'
+                            ELSE continuity_state
+                        END,
+                        error=NULL,
+                        updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (str(out.resolve()), dataset_path, dataset_status, dataset_error, uuid, db.now(), uuid),
+                )
+            elif dataset_status == "ready" or dataset_error:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET final_dataset_path=COALESCE(?, final_dataset_path),
+                        final_dataset_status=?,
+                        final_dataset_error=?,
+                        updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (dataset_path, dataset_status, dataset_error, db.now(), uuid),
+                )
+        update_continuity_state(uuid, view_key)
         return {
             "uuid": uuid,
+            "view_key": view_key,
             "final_video_path": str(out.resolve()),
             "final_status": "ready",
             "final_dataset_path": dataset_path,
@@ -3825,21 +4503,30 @@ def stitch_episode(uuid: str) -> dict[str, Any]:
         with db.connect() as conn:
             conn.execute(
                 """
-                UPDATE episodes
-                SET final_status='failed', error=?,
-                    final_dataset_status=CASE
-                        WHEN final_dataset_status='exporting' THEN 'failed'
-                        ELSE final_dataset_status
-                    END,
-                    final_dataset_error=CASE
-                        WHEN final_dataset_status='exporting' THEN ?
-                        ELSE final_dataset_error
-                    END,
-                    updated_at=?
-                WHERE uuid=?
+                UPDATE episode_views
+                SET final_status='failed', error=?, updated_at=?
+                WHERE episode_uuid=? AND view_key=?
                 """,
-                (str(exc), str(exc), db.now(), uuid),
+                (str(exc), db.now(), uuid, view_key),
             )
+            if view_key == DEFAULT_VIEW_KEY:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET final_status='failed', error=?,
+                        final_dataset_status=CASE
+                            WHEN final_dataset_status='exporting' THEN 'failed'
+                            ELSE final_dataset_status
+                        END,
+                        final_dataset_error=CASE
+                            WHEN final_dataset_status='exporting' THEN ?
+                            ELSE final_dataset_error
+                        END,
+                        updated_at=?
+                    WHERE uuid=?
+                    """,
+                    (str(exc), str(exc), db.now(), uuid),
+                )
         raise
 
 

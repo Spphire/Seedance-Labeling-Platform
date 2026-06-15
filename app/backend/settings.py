@@ -26,6 +26,8 @@ COLLECTOR_ONLY_PROMPT = (
     "把@视频1里面的左右手机采集器替换为@图片1@图片2中夹爪上安装的摄像头，"
     "机械臂形态、动作、画面、背景保持不变"
 )
+LAB_EXP1_PROMPT = "把@视频1上半部分出现中的人手臂替换为@图片1的机械臂，夹爪形态、动作、画面、背景保持不变"
+LAB_EXP2_PROMPT = "把@视频1里面的手机采集器替换为@图片1@图片2中夹爪上安装的摄像头，机械臂形态、动作、画面、背景保持不变"
 LEGACY_IPHONE2DEPLOY_PROMPTS = {
     (
         "把@视频1里面的真人手臂和手机采集器替换为@图片1@图片2@图片3@图片4的机械臂和摄像头，"
@@ -60,6 +62,13 @@ COLLECTOR_ONLY_REFERENCE_IMAGES = [
     "app/reference_images/l-nn-deploy.png",
     "app/reference_images/r-nn-deploy.png",
 ]
+LAB_EXP1_REFERENCE_IMAGES = [
+    "app/reference_images/lab-exp-000001-1781264007547-d34b8b-rightview_iphone_ref.png",
+]
+LAB_EXP2_REFERENCE_IMAGES = [
+    "app/reference_images/l-nn-deploy.png",
+    "app/reference_images/lab-exp-000002-1781266112365-cba2a8-rightview_ri_ref.png",
+]
 LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
     (
         "app/reference_images/l-near-deploy-v2.png",
@@ -81,7 +90,9 @@ LEGACY_IPHONE2DEPLOY_REFERENCE_IMAGE_ORDERS = {
 DEFAULT_GENERATION_PRESET_ID = "iphone-default"
 COLLECTOR_ONLY_PRESET_ID = "collector-only"
 IPHONE2DEPLOY_PRESET_ID = "iphone2deploy"
-GENERATION_PRESETS_VERSION = 9
+LAB_EXP1_PRESET_ID = "lab-exp1-arm-upper"
+LAB_EXP2_PRESET_ID = "lab-exp2-collector-single"
+GENERATION_PRESETS_VERSION = 10
 DEFAULT_GENERATION_PRESETS = [
     {
         "id": DEFAULT_GENERATION_PRESET_ID,
@@ -100,6 +111,18 @@ DEFAULT_GENERATION_PRESETS = [
         "name": "头部视角-iphone-参考overlap全替换",
         "prompt": IPHONE2DEPLOY_PROMPT,
         "reference_images": IPHONE2DEPLOY_REFERENCE_IMAGES,
+    },
+    {
+        "id": LAB_EXP1_PRESET_ID,
+        "name": "Lab实验1-上半身手臂替换",
+        "prompt": LAB_EXP1_PROMPT,
+        "reference_images": LAB_EXP1_REFERENCE_IMAGES,
+    },
+    {
+        "id": LAB_EXP2_PRESET_ID,
+        "name": "Lab实验2-单采集器替换",
+        "prompt": LAB_EXP2_PROMPT,
+        "reference_images": LAB_EXP2_REFERENCE_IMAGES,
     },
 ]
 LEGACY_GENERATION_PRESET_NAMES = {

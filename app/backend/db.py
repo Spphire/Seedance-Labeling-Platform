@@ -65,6 +65,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS clips (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode_uuid TEXT NOT NULL REFERENCES episodes(uuid) ON DELETE CASCADE,
+                view_key TEXT NOT NULL DEFAULT 'head',
                 clip_index INTEGER NOT NULL,
                 start_sec REAL NOT NULL,
                 duration_sec REAL NOT NULL,
@@ -85,6 +86,39 @@ def init_db() -> None:
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 UNIQUE(episode_uuid, clip_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS episode_views (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_uuid TEXT NOT NULL REFERENCES episodes(uuid) ON DELETE CASCADE,
+                view_key TEXT NOT NULL,
+                camera_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                topic TEXT NOT NULL,
+                source_width INTEGER,
+                source_height INTEGER,
+                target_width INTEGER NOT NULL DEFAULT 760,
+                target_height INTEGER NOT NULL DEFAULT 570,
+                scale_x REAL,
+                scale_y REAL,
+                is_head INTEGER NOT NULL DEFAULT 0,
+                fps REAL,
+                frame_count INTEGER,
+                duration_sec REAL,
+                video_path TEXT,
+                status TEXT NOT NULL DEFAULT 'ready',
+                final_video_path TEXT,
+                final_status TEXT NOT NULL DEFAULT 'missing',
+                preview_video_path TEXT,
+                preview_status TEXT NOT NULL DEFAULT 'missing',
+                preview_version INTEGER NOT NULL DEFAULT 0,
+                preview_error TEXT,
+                continuity_state TEXT NOT NULL DEFAULT 'select_anchor',
+                anchor_clip_id INTEGER,
+                error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(episode_uuid, view_key)
             );
 
             CREATE TABLE IF NOT EXISTS generation_jobs (
@@ -233,6 +267,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_seedance_api_calls_clip
             ON seedance_api_calls(clip_id, created_at);
 
+            CREATE INDEX IF NOT EXISTS idx_episode_views_episode
+            ON episode_views(episode_uuid, view_key);
+
             CREATE INDEX IF NOT EXISTS idx_lab_experiments_updated
             ON lab_experiments(updated_at);
 
@@ -263,6 +300,7 @@ def init_db() -> None:
         _ensure_column(conn, "seedance_api_calls", "api_key_name", "TEXT")
         _ensure_column(conn, "seedance_api_calls", "lab_job_id", "INTEGER")
         _ensure_column(conn, "clips", "source_start_sec", "REAL")
+        _ensure_column(conn, "clips", "view_key", "TEXT NOT NULL DEFAULT 'head'")
         _ensure_column(conn, "clips", "source_duration_sec", "REAL")
         _ensure_column(conn, "clips", "overlap_sec", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "clips", "timeline_duration_sec", "REAL")
@@ -286,6 +324,22 @@ def init_db() -> None:
         )
         conn.execute("UPDATE clips SET direction='forward' WHERE direction IS NULL OR direction=''")
         conn.execute("UPDATE clips SET input_kind='split' WHERE input_kind IS NULL OR input_kind=''")
+        conn.execute("UPDATE clips SET view_key='head' WHERE view_key IS NULL OR view_key=''")
+        _ensure_column(conn, "episode_views", "is_head", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "episode_views", "final_video_path", "TEXT")
+        _ensure_column(conn, "episode_views", "final_status", "TEXT NOT NULL DEFAULT 'missing'")
+        _ensure_column(conn, "episode_views", "preview_video_path", "TEXT")
+        _ensure_column(conn, "episode_views", "preview_status", "TEXT NOT NULL DEFAULT 'missing'")
+        _ensure_column(conn, "episode_views", "preview_version", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "episode_views", "preview_error", "TEXT")
+        _ensure_column(conn, "episode_views", "continuity_state", "TEXT NOT NULL DEFAULT 'select_anchor'")
+        _ensure_column(conn, "episode_views", "anchor_clip_id", "INTEGER")
+        _ensure_column(conn, "episode_views", "error", "TEXT")
+        conn.execute("UPDATE episode_views SET is_head=0 WHERE is_head IS NULL")
+        conn.execute("UPDATE episode_views SET final_status='missing' WHERE final_status IS NULL OR final_status=''")
+        conn.execute("UPDATE episode_views SET preview_status='missing' WHERE preview_status IS NULL OR preview_status=''")
+        conn.execute("UPDATE episode_views SET preview_version=0 WHERE preview_version IS NULL")
+        conn.execute("UPDATE episode_views SET continuity_state='select_anchor' WHERE continuity_state IS NULL OR continuity_state=''")
         conn.execute(
             """
             UPDATE clips

@@ -11,6 +11,7 @@ DB_PATH = ROOT / "db.sqlite3"
 
 EPISODES_DIR = DATA_DIR / "episodes"
 HEAD_VIDEOS_DIR = DATA_DIR / "head_videos"
+VIEW_VIDEOS_DIR = DATA_DIR / "view_videos"
 CLIPS_DIR = DATA_DIR / "clips"
 GENERATED_DIR = DATA_DIR / "generated"
 ACCEPTED_DIR = DATA_DIR / "accepted_clips"
@@ -27,6 +28,7 @@ def ensure_dirs() -> None:
         CONFIG_DIR,
         EPISODES_DIR,
         HEAD_VIDEOS_DIR,
+        VIEW_VIDEOS_DIR,
         CLIPS_DIR,
         GENERATED_DIR,
         ACCEPTED_DIR,
