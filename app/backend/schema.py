@@ -121,3 +121,9 @@ class LockTokenRequest(BaseModel):
     prompt: str | None = None
     reference_images: list[str] | None = None
     view_key: str | None = None
+
+
+class ViewReadyRequest(BaseModel):
+    lock_token: str | None = None
+    view_key: str | None = None
+    note: str | None = None

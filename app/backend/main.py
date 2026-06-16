@@ -28,6 +28,7 @@ from .schema import (
     PreprocessRequest,
     ReviewRequest,
     SubmitPreprocessRequest,
+    ViewReadyRequest,
 )
 from .lab import (
     create_lab_experiment,
@@ -47,6 +48,7 @@ from .services import (
     list_jobs,
     list_reviewer_activity,
     list_seedance_usage,
+    mark_episode_view_ready,
     preprocess,
     queue_generation,
     queue_rolling_generation,
@@ -352,6 +354,15 @@ def post_stitch(uuid: str, request: Request, payload: LockTokenRequest | None = 
             require_lock_token=True,
             view_key=payload.view_key if payload else None,
         )
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.post("/api/episodes/{uuid}/views/ready")
+def post_view_ready(uuid: str, payload: ViewReadyRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return mark_episode_view_ready(uuid.lower(), payload.view_key, payload.lock_token, payload.note)
     except Exception as exc:
         raise _public_error(exc) from exc
 

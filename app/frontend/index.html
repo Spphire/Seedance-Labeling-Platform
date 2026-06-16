@@ -3772,16 +3772,21 @@
         view?.continuity_anchor_candidate_count || 0,
         view?.continuity_coverage_start_sec ?? "",
         view?.continuity_coverage_end_sec ?? "",
+        view?.error || "",
         anchorDrafts(episode.uuid, viewKey).join(","),
       ].join("|");
       if (target.dataset.signature === signature) {
         return;
       }
-      const finalReady = (view?.final_status || episode.final_status) === "ready" && (view?.final_url || episode.final_url);
-      const previewReady = !finalReady && (view?.preview_status || episode.preview_status) === "ready" && (view?.preview_url || episode.preview_url);
-      const outputUrl = finalReady ? (view?.final_url || episode.final_url) : previewReady ? (view?.preview_url || episode.preview_url) : "";
-      const outputTitle = finalReady ? "合成 final" : "accepted preview";
-      const outputStatus = finalReady ? (view?.final_status || episode.final_status) : (view?.preview_status || episode.preview_status || "missing");
+      const finalStatus = view?.final_status || episode.final_status || "missing";
+      const finalUrl = view?.final_url || episode.final_url || "";
+      const previewStatus = view?.preview_status || episode.preview_status || "missing";
+      const previewUrl = view?.preview_url || episode.preview_url || "";
+      const finalReady = finalStatus === "ready";
+      const previewReady = !finalReady && previewStatus === "ready" && previewUrl;
+      const outputUrl = finalReady ? (finalUrl || (view?.video_url || episode.head_video_url || "")) : previewReady ? previewUrl : "";
+      const outputTitle = finalReady ? (finalUrl ? "合成 final" : "原始视角（无需编辑）") : "accepted preview";
+      const outputStatus = finalReady ? finalStatus : previewStatus;
       const headVideo = mediaUrl(view?.video_url || episode.head_video_url || "", episode.updated_at, episode.status);
       const outputVideo = mediaUrl(outputUrl, view?.preview_version || episode.preview_version, episode.updated_at, outputStatus);
       target.innerHTML = `
@@ -3794,6 +3799,7 @@
           </div>
           <div class="actions">
             ${renderPlaybackSpeedControl()}
+            ${view?.final_status === "ready" ? "" : `<button data-action="view-ready">此 view 无需编辑</button>`}
           </div>
         </div>
         <div class="videos">
@@ -3808,6 +3814,29 @@
         </div>
       `;
       target.dataset.signature = signature;
+      const viewReady = document.querySelector("[data-action='view-ready']");
+      if (viewReady) {
+        viewReady.addEventListener("click", async () => {
+          if (!window.confirm(`将 ${viewLabel(view || { view_key: viewKey })} 标记为 ready，并在最终导出中保留原始视角视频？`)) return;
+          viewReady.disabled = true;
+          try {
+            const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/views/ready`, {
+              method: "POST",
+              body: {
+                lock_token: lock.token,
+                view_key: viewKey,
+                note: "manual ready: keep original view",
+              },
+            }));
+            log("view marked ready", result);
+            await refresh({ forceWorkspace: true });
+          } catch (err) {
+            log(err.message);
+          } finally {
+            viewReady.disabled = false;
+          }
+        });
+      }
       wireAnchorPanel(episode);
       wireSync();
     }

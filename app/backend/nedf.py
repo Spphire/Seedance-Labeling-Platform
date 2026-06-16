@@ -323,7 +323,10 @@ def export_seedance_dataset_for_views(
     metadata = load_json(source_preprocessed / "metadata.json")
     replacements = []
     for item in view_final_videos:
-        final_video_path = Path(str(item["final_video_path"]))
+        final_path_value = str(item.get("final_video_path") or "").strip()
+        if not final_path_value:
+            continue
+        final_video_path = Path(final_path_value)
         if not final_video_path.exists():
             raise RuntimeError(f"final video does not exist: {final_video_path}")
         topic = str(item["topic"])

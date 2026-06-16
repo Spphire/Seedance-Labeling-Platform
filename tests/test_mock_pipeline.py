@@ -11,6 +11,7 @@ from unittest.mock import patch
 os.environ["SEEDANCE_PLATFORM_ROOT"] = str(Path(__file__).resolve().parent / "_tmp_platform")
 
 from fastapi.testclient import TestClient
+from mcap.reader import make_reader
 from mcap.writer import Writer
 from nmx_msg.Image_pb2 import RGBD
 from nmx_msg.Metadata_pb2 import Metadata
@@ -42,6 +43,7 @@ from app.backend.services import (
     latest_accepted_path,
     list_episodes,
     list_clips,
+    mark_episode_view_ready,
     preprocess_one,
     queue_generation,
     queue_preview_episode,
@@ -299,6 +301,75 @@ class MockPipelineTest(unittest.TestCase):
         )
         return source_root
 
+    def write_two_view_nedf_episode(self, uuid: str, frame_count: int = 12) -> Path:
+        source_root = DATA_DIR / "source_nedf" / uuid
+        self.rmtree_with_retry(source_root)
+        preprocessed = source_root / "preprocessed"
+        data_dir = preprocessed / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        head_topic = "nmx/hal/camera/camera_2/rgbd"
+        side_topic = "nmx/hal/camera/camera_0/rgbd"
+        metadata = {
+            "data_format": "NEDF3",
+            "collection_mode": "teleop",
+            "camera_info": {"camera_0": "right_wrist", "camera_2": "head"},
+            "record_topic_list": ["nmx/nedf/metadata", head_topic, side_topic],
+            "extra": {
+                "camera_position": ["right_wrist", "head"],
+                "device_type": ["UMI3.0"],
+                "video": [{"frames": frame_count, "width": 1280, "height": 960}],
+            },
+        }
+        (preprocessed / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        timestamps = [index * 33_333_333 for index in range(frame_count)]
+        (preprocessed / "timestamps.json").write_text(
+            json.dumps({head_topic: timestamps, side_topic: timestamps}),
+            encoding="utf-8",
+        )
+        (preprocessed / "qc.json").write_text("{}", encoding="utf-8")
+        mcap_path = data_dir / "data_0.mcap"
+        with mcap_path.open("wb") as output:
+            writer = Writer(output)
+            writer.start()
+            metadata_schema = writer.register_schema(
+                "nmx.msg.Metadata",
+                "protobuf",
+                Metadata.DESCRIPTOR.file.serialized_pb,
+            )
+            rgbd_schema = writer.register_schema(
+                "nmx.msg.RGBD",
+                "protobuf",
+                RGBD.DESCRIPTOR.file.serialized_pb,
+            )
+            metadata_channel = writer.register_channel("nmx/nedf/metadata", "protobuf", metadata_schema)
+            head_channel = writer.register_channel(head_topic, "protobuf", rgbd_schema)
+            side_channel = writer.register_channel(side_topic, "protobuf", rgbd_schema)
+            metadata_message = Metadata(version="nedf3", metadata=json.dumps(metadata, ensure_ascii=False).encode("utf-8"))
+            writer.add_message(metadata_channel, log_time=0, publish_time=0, sequence=0, data=metadata_message.SerializeToString())
+            for index, timestamp in enumerate(timestamps):
+                for channel, payload, cols, rows in [
+                    (head_channel, b"old-head", 1280, 960),
+                    (side_channel, b"old-side", 640, 480),
+                ]:
+                    rgbd = RGBD()
+                    rgbd.rgb.data = payload
+                    rgbd.rgb.encoded_format = "h264"
+                    rgbd.rgb.cols = cols
+                    rgbd.rgb.rows = rows
+                    writer.add_message(
+                        channel,
+                        log_time=timestamp,
+                        publish_time=timestamp,
+                        sequence=index,
+                        data=rgbd.SerializeToString(),
+                    )
+            writer.finish()
+        (data_dir / "mcap_index.json").write_text(
+            json.dumps([{"filename": mcap_path.name, "start_time_ns": 0}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return source_root
+
     def create_anchor_candidates_with_lock(self, uuid: str, starts: list[float]) -> dict:
         lock = self.client.post(
             "/api/locks/acquire",
@@ -498,6 +569,78 @@ class MockPipelineTest(unittest.TestCase):
         self.assertEqual(info["streams"][0]["height"], 570)
         self.assertEqual(extracted["source_width"], 1280)
         self.assertEqual(extracted["source_height"], 960)
+
+    def test_manual_view_ready_exports_dataset_without_replacing_that_view(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000142"
+        source_root = self.write_two_view_nedf_episode(uuid, frame_count=12)
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 4)
+        final = FINAL_DIR / uuid / "head" / "accepted_30fps.mp4"
+        final.parent.mkdir(parents=True, exist_ok=True)
+        self.make_video(final, 4)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(
+                    uuid, remote_path, local_path, status, head_video_path,
+                    final_video_path, final_status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, 'ready', ?, ?)
+                """,
+                (uuid, "mock", str(source_root.resolve()), str(head.resolve()), str(final.resolve()), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, final_video_path, final_status, created_at, updated_at
+                )
+                VALUES (?, 'head', 'camera_2', 'head', 'nmx/hal/camera/camera_2/rgbd',
+                        1280, 960, 760, 570, ?, ?, 1, 30, 12, 4, ?, 'ready', ?, 'ready', ?, ?)
+                """,
+                (uuid, 760 / 1280, 570 / 960, str(head.resolve()), str(final.resolve()), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, final_status, created_at, updated_at
+                )
+                VALUES (?, 'right_wrist', 'camera_0', 'right_wrist', 'nmx/hal/camera/camera_0/rgbd',
+                        640, 480, 760, 570, ?, ?, 0, 30, 12, 4, ?, 'ready', 'missing', ?, ?)
+                """,
+                (uuid, 760 / 640, 570 / 480, str((DATA_DIR / "right_wrist.mp4").resolve()), now, now),
+            )
+
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+        result = mark_episode_view_ready(uuid, "right_wrist", lock.json()["token"], "skip wrist")
+
+        self.assertEqual(result["final_status"], "ready")
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertEqual(episode["final_dataset_status"], "ready")
+        dataset_root = Path(episode["final_dataset_path"])
+        self.assertTrue(dataset_root.exists())
+        metadata = json.loads((dataset_root / "preprocessed" / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["collection_mode"], "seedance")
+
+        side_payloads = []
+        for mcap_path in sorted((dataset_root / "preprocessed" / "data").glob("*.mcap")):
+            with mcap_path.open("rb") as handle:
+                reader = make_reader(handle)
+                for schema, _, message in reader.iter_messages(topics=["nmx/hal/camera/camera_0/rgbd"]):
+                    rgbd = RGBD()
+                    rgbd.ParseFromString(message.data)
+                    side_payloads.append(rgbd.rgb.data)
+        self.assertEqual(side_payloads, [b"old-side"] * 12)
 
     def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"
