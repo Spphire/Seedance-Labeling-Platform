@@ -3029,7 +3029,29 @@
 
     function episodeViewStats(episode) {
       const view = selectedEpisodeView(episode);
-      return view || episode || {};
+      return resolveEpisodeViewStats(episode, view);
+    }
+
+    function resolveEpisodeViewStats(episode, view = null) {
+      if (!episode || !episode.uuid) return {};
+      if (!view) return episode || {};
+      const viewKey = view.view_key || "head";
+      const canUseEpisodeFallback = viewKey === "head";
+      return {
+        ...view,
+        final_status: view.final_status || (canUseEpisodeFallback ? episode.final_status : "missing") || "missing",
+        final_url: view.final_url || (canUseEpisodeFallback ? episode.final_url : "") || "",
+        preview_status: view.preview_status || (canUseEpisodeFallback ? episode.preview_status : "missing") || "missing",
+        preview_url: view.preview_url || (canUseEpisodeFallback ? episode.preview_url : "") || "",
+        preview_version: view.preview_version || (canUseEpisodeFallback ? episode.preview_version : "") || "",
+        error: view.error || (canUseEpisodeFallback ? episode.error : "") || "",
+        preview_error: view.preview_error || (canUseEpisodeFallback ? episode.preview_error : "") || "",
+        video_url: view.video_url || (canUseEpisodeFallback ? episode.head_video_url : "") || "",
+      };
+    }
+
+    function isManualReadyStats(stats) {
+      return stats?.final_status === "ready" && !stats?.final_url;
     }
 
     function episodeClass(episode) {
@@ -3187,9 +3209,9 @@
         const total = stats.clip_count || 0;
         const progress = pct(accepted, total);
         const focused = isFocusedEpisode(episode.uuid);
-        const previewUrl = stats.preview_url || episode.preview_url;
-        const previewStatus = stats.preview_status || episode.preview_status;
-        const finalStatus = stats.final_status || episode.final_status;
+        const previewUrl = stats.preview_url || "";
+        const previewStatus = stats.preview_status || "missing";
+        const finalStatus = stats.final_status || "missing";
         const div = document.createElement("div");
         div.className = episodeClass(episode);
         div.innerHTML = `
@@ -3706,7 +3728,7 @@
         return;
       }
       const clipView = (episode.views || []).find((view) => (view.view_key || "head") === (clip.view_key || "head"));
-      const episodeNotice = renderEpisodeNotice(episode, clipView || clip);
+      const episodeNotice = renderEpisodeNotice(episode, clipView ? resolveEpisodeViewStats(episode, clipView) : clip);
       const canEdit = clipCanEdit(clip);
       const lockNotice = renderClipLockNotice(clip, canEdit);
       const jobNotice = renderJobNotice(job);
@@ -3753,17 +3775,18 @@
       const target = $("workspace");
       const view = selectedEpisodeView(episode);
       const viewKey = view?.view_key || "head";
+      const stats = resolveEpisodeViewStats(episode, view);
       const signature = [
         "episode",
         episode.uuid,
         viewKey,
         episode.status || "",
-        view?.final_status || episode.final_status || "",
-        view?.preview_status || episode.preview_status || "",
-        view?.preview_version || episode.preview_version || "",
-        view?.video_url || episode.head_video_url || "",
-        view?.final_url || episode.final_url || "",
-        view?.preview_url || episode.preview_url || "",
+        stats.final_status || "",
+        stats.preview_status || "",
+        stats.preview_version || "",
+        stats.video_url || "",
+        stats.final_url || "",
+        stats.preview_url || "",
         episode.updated_at || "",
         view?.rolling_clip_count || 0,
         view?.continuity_accepted_sec || 0,
@@ -3778,19 +3801,20 @@
       if (target.dataset.signature === signature) {
         return;
       }
-      const finalStatus = view?.final_status || episode.final_status || "missing";
-      const finalUrl = view?.final_url || episode.final_url || "";
-      const previewStatus = view?.preview_status || episode.preview_status || "missing";
-      const previewUrl = view?.preview_url || episode.preview_url || "";
+      const finalStatus = stats.final_status || "missing";
+      const finalUrl = stats.final_url || "";
+      const previewStatus = stats.preview_status || "missing";
+      const previewUrl = stats.preview_url || "";
       const finalReady = finalStatus === "ready";
       const previewReady = !finalReady && previewStatus === "ready" && previewUrl;
-      const outputUrl = finalReady ? (finalUrl || (view?.video_url || episode.head_video_url || "")) : previewReady ? previewUrl : "";
+      const outputUrl = finalReady ? (finalUrl || stats.video_url || "") : previewReady ? previewUrl : "";
       const outputTitle = finalReady ? (finalUrl ? "合成 final" : "原始视角（无需编辑）") : "accepted preview";
       const outputStatus = finalReady ? finalStatus : previewStatus;
-      const headVideo = mediaUrl(view?.video_url || episode.head_video_url || "", episode.updated_at, episode.status);
-      const outputVideo = mediaUrl(outputUrl, view?.preview_version || episode.preview_version, episode.updated_at, outputStatus);
+      const sourceVideo = mediaUrl(stats.video_url || "", episode.updated_at, episode.status);
+      const outputVideo = mediaUrl(outputUrl, stats.preview_version || "", episode.updated_at, outputStatus);
+      const manualReady = isManualReadyStats(stats);
       target.innerHTML = `
-        ${renderEpisodeNotice(episode, view)}
+        ${renderEpisodeNotice(episode, stats)}
         ${renderAnchorPanel(episode)}
         <div class="review-head">
           <div class="review-title">
@@ -3799,13 +3823,14 @@
           </div>
           <div class="actions">
             ${renderPlaybackSpeedControl()}
-            ${view?.final_status === "ready" ? "" : `<button data-action="view-ready">此 view 无需编辑</button>`}
+            ${manualReady ? `<button data-action="view-unready">取消无需编辑</button>` : ""}
+            ${finalStatus === "ready" ? "" : `<button data-action="view-ready">此 view 无需编辑</button>`}
           </div>
         </div>
         <div class="videos">
           <div class="video-pane">
-            <h3><span>原 head 视频</span><span>${badge(episode.status)}</span></h3>
-            <video id="originalVideo" src="${headVideo}" controls playsinline></video>
+            <h3><span>原 ${viewLabel(view || { view_key: viewKey })} 视频</span><span>${badge(episode.status)}</span></h3>
+            <video id="originalVideo" src="${sourceVideo}" controls playsinline></video>
           </div>
           <div class="video-pane">
             <h3><span>${outputTitle}</span><span>${badge(outputStatus)}</span></h3>
@@ -3834,6 +3859,28 @@
             log(err.message);
           } finally {
             viewReady.disabled = false;
+          }
+        });
+      }
+      const viewUnready = document.querySelector("[data-action='view-unready']");
+      if (viewUnready) {
+        viewUnready.addEventListener("click", async () => {
+          if (!window.confirm(`取消 ${viewLabel(view || { view_key: viewKey })} 的“无需编辑”标记？如果最终数据集已经导出，会被标记为需要重新导出。`)) return;
+          viewUnready.disabled = true;
+          try {
+            const result = await withEpisodeLock(episode.uuid, (lock) => api(`/api/episodes/${episode.uuid}/views/ready`, {
+              method: "DELETE",
+              body: {
+                lock_token: lock.token,
+                view_key: viewKey,
+              },
+            }));
+            log("view ready cancelled", result);
+            await refresh({ forceWorkspace: true });
+          } catch (err) {
+            log(err.message);
+          } finally {
+            viewUnready.disabled = false;
           }
         });
       }
@@ -3934,17 +3981,20 @@
     function renderEpisodeNotice(episode, statsOverride = null) {
       if (!episode || !episode.uuid) return "";
       const stats = statsOverride || episodeViewStats(episode);
-      const finalStatus = stats.final_status || episode.final_status;
-      const previewStatus = stats.preview_status || episode.preview_status;
-      const finalUrl = stats.final_url || episode.final_url;
-      const previewUrl = stats.preview_url || episode.preview_url;
-      const error = stats.error || episode.error;
-      const previewError = stats.preview_error || episode.preview_error;
+      const finalStatus = stats.final_status || "missing";
+      const previewStatus = stats.preview_status || "missing";
+      const finalUrl = stats.final_url || "";
+      const previewUrl = stats.preview_url || "";
+      const error = stats.error || "";
+      const previewError = stats.preview_error || "";
       if (finalStatus === "stitching") {
         return `<div class="notice stitching">这个 episode 的所有 clip 已经保留，正在后台合成完整 final。旧 final 会保留到新文件合成完成后再被替换。</div>`;
       }
       if (finalStatus === "ready") {
-        return `<div class="notice">这个 episode 已经全部保留并合成 final。${finalUrl ? `<a href="${finalUrl}" target="_blank" rel="noreferrer">打开 final</a>` : ""}</div>`;
+        if (!finalUrl) {
+          return `<div class="notice">当前 view 已标记为无需编辑，最终导出会保留该视角原始视频。</div>`;
+        }
+        return `<div class="notice">当前 view 已经全部保留并合成 final。<a href="${finalUrl}" target="_blank" rel="noreferrer">打开 final</a></div>`;
       }
       if (finalStatus === "failed") {
         return `<div class="notice failed">这个 episode 的 final 合成失败，可以在左侧 episode 卡片点“重新合成”。${error ? `错误：${error}` : ""}</div>`;

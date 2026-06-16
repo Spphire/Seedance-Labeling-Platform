@@ -61,6 +61,7 @@ from .services import (
     start_generation_watchdog,
     submit_and_preprocess_episodes,
     submit_episodes,
+    unmark_episode_view_ready,
 )
 from .settings import load_settings, public_settings, save_settings
 
@@ -363,6 +364,15 @@ def post_view_ready(uuid: str, payload: ViewReadyRequest, request: Request) -> d
     require_reviewer(request)
     try:
         return mark_episode_view_ready(uuid.lower(), payload.view_key, payload.lock_token, payload.note)
+    except Exception as exc:
+        raise _public_error(exc) from exc
+
+
+@app.delete("/api/episodes/{uuid}/views/ready")
+def delete_view_ready(uuid: str, payload: ViewReadyRequest, request: Request) -> dict[str, Any]:
+    require_reviewer(request)
+    try:
+        return unmark_episode_view_ready(uuid.lower(), payload.view_key, payload.lock_token)
     except Exception as exc:
         raise _public_error(exc) from exc
 

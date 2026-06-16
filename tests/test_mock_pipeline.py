@@ -34,6 +34,7 @@ from app.backend.paths import (
     LAB_DIR,
     REFERENCE_IMAGES_DIR,
     ROOT,
+    VIEW_VIDEOS_DIR,
 )
 from app.backend.services import (
     chronological_accepted_output_path,
@@ -52,6 +53,7 @@ from app.backend.services import (
     refresh_clip_public_urls,
     review_clip,
     run_generation,
+    unmark_episode_view_ready,
 )
 from app.backend.settings import (
     COLLECTOR_ONLY_PRESET_ID,
@@ -96,7 +98,7 @@ class MockPipelineTest(unittest.TestCase):
             backend_services._GENERATION_WORKER_KEY_SLOTS.clear()
         save_settings(dict(DEFAULT_SETTINGS))
         self.unlink_with_retry(DB_PATH)
-        for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR, FINAL_DATASET_DIR, LAB_DIR]:
+        for directory in [CLIPS_DIR, GENERATED_DIR, HEAD_VIDEOS_DIR, VIEW_VIDEOS_DIR, ACCEPTED_DIR, FINAL_DIR, FINAL_DATASET_DIR, LAB_DIR]:
             self.rmtree_with_retry(directory)
             directory.mkdir(parents=True, exist_ok=True)
         db.init_db()
@@ -576,6 +578,8 @@ class MockPipelineTest(unittest.TestCase):
         now = db.now()
         head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
         self.make_video(head, 4)
+        right_wrist = VIEW_VIDEOS_DIR / f"{uuid}_right_wrist.mp4"
+        self.make_video(right_wrist, 4)
         final = FINAL_DIR / uuid / "head" / "accepted_30fps.mp4"
         final.parent.mkdir(parents=True, exist_ok=True)
         self.make_video(final, 4)
@@ -614,7 +618,7 @@ class MockPipelineTest(unittest.TestCase):
                 VALUES (?, 'right_wrist', 'camera_0', 'right_wrist', 'nmx/hal/camera/camera_0/rgbd',
                         640, 480, 760, 570, ?, ?, 0, 30, 12, 4, ?, 'ready', 'missing', ?, ?)
                 """,
-                (uuid, 760 / 640, 570 / 480, str((DATA_DIR / "right_wrist.mp4").resolve()), now, now),
+                (uuid, 760 / 640, 570 / 480, str(right_wrist.resolve()), now, now),
             )
 
         lock = self.client.post(
@@ -641,6 +645,23 @@ class MockPipelineTest(unittest.TestCase):
                     rgbd.ParseFromString(message.data)
                     side_payloads.append(rgbd.rgb.data)
         self.assertEqual(side_payloads, [b"old-side"] * 12)
+
+        payload = self.client.get("/api/episodes").json()
+        episode_payload = next(item for item in payload if item["uuid"] == uuid)
+        right_payload = next(view for view in episode_payload["views"] if view["view_key"] == "right_wrist")
+        self.assertEqual(right_payload["final_status"], "ready")
+        self.assertIsNone(right_payload["final_url"])
+        self.assertTrue(right_payload["video_url"].startswith("/media/"))
+
+        cancelled = unmark_episode_view_ready(uuid, "right_wrist", lock.json()["token"])
+        self.assertEqual(cancelled["final_status"], "missing")
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertEqual(episode["final_dataset_status"], "stale")
+        payload = self.client.get("/api/episodes").json()
+        episode_payload = next(item for item in payload if item["uuid"] == uuid)
+        right_payload = next(view for view in episode_payload["views"] if view["view_key"] == "right_wrist")
+        self.assertEqual(right_payload["final_status"], "missing")
+        self.assertIsNone(right_payload["final_url"])
 
     def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"

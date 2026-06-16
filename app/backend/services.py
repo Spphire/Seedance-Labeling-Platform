@@ -4476,6 +4476,71 @@ def mark_episode_view_ready(
     return view
 
 
+def unmark_episode_view_ready(
+    uuid: str,
+    view_key: str | None = None,
+    lock_token: str | None = None,
+) -> dict[str, Any]:
+    uuid = uuid.lower()
+    view_key = normalize_view_key(view_key)
+    require_episode_mutation_lock(uuid, lock_token)
+    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+    if not episode:
+        raise ValueError("episode not found")
+    view = get_episode_view_row(uuid, view_key)
+    if not view:
+        raise ValueError("episode view not found")
+    if view.get("final_status") == "stitching":
+        raise ValueError("view is currently stitching")
+    if view.get("final_status") != "ready" or view.get("final_video_path"):
+        raise ValueError("only a manually marked ready view can be cancelled")
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE episode_views
+            SET final_status='missing',
+                final_video_path=NULL,
+                error=NULL,
+                updated_at=?
+            WHERE episode_uuid=? AND view_key=?
+            """,
+            (db.now(), uuid, view_key),
+        )
+        if view_key == DEFAULT_VIEW_KEY:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET final_status='missing',
+                    final_video_path=NULL,
+                    error=NULL,
+                    updated_at=?
+                WHERE uuid=?
+                """,
+                (db.now(), uuid),
+            )
+        conn.execute(
+            """
+            UPDATE episodes
+            SET final_dataset_status=CASE
+                    WHEN final_dataset_status IN ('ready','exporting') THEN 'stale'
+                    ELSE final_dataset_status
+                END,
+                final_dataset_error=NULL,
+                updated_at=?
+            WHERE uuid=?
+            """,
+            (db.now(), uuid),
+        )
+    update_continuity_state(uuid, view_key)
+    view = get_episode_view_row(uuid, view_key) or {}
+    view["dataset_export"] = {
+        "final_dataset_path": episode.get("final_dataset_path"),
+        "final_dataset_status": db.one("SELECT final_dataset_status FROM episodes WHERE uuid=?", (uuid,)).get("final_dataset_status"),
+        "final_dataset_error": None,
+    }
+    return view
+
+
 def stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
     uuid = uuid.lower()
     view_key = normalize_view_key(view_key)
