@@ -404,6 +404,17 @@ def list_episodes() -> list[dict[str, Any]]:
             views = [head_view_row(episode["uuid"], Path(episode["head_video_path"]))]
         for view in views:
             key = normalize_view_key(view.get("view_key"))
+            if key == DEFAULT_VIEW_KEY:
+                if not view.get("final_video_path") and episode.get("final_video_path"):
+                    view["final_video_path"] = episode.get("final_video_path")
+                    view["final_status"] = episode.get("final_status") or view.get("final_status")
+                    view["final_url"] = media_url_for_path(view.get("final_video_path"), FINAL_DIR, "final")
+                if not view.get("preview_video_path") and episode.get("preview_video_path"):
+                    view["preview_video_path"] = episode.get("preview_video_path")
+                    view["preview_status"] = episode.get("preview_status") or view.get("preview_status")
+                    view["preview_version"] = episode.get("preview_version") or view.get("preview_version")
+                    view["preview_error"] = episode.get("preview_error") or view.get("preview_error")
+                    view["preview_url"] = media_url_for_path(view.get("preview_video_path"), FINAL_DIR, "preview")
             view_clips = [clip for clip in episode_clips if clip_view_key(clip) == key]
             view_counts = clip_status_counts(view_clips)
             view.update(view_counts)
