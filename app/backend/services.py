@@ -59,6 +59,7 @@ from ..seedance.client import SeedanceClient
 _STITCH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="seedance-stitch")
 _STITCH_LOCK = threading.Lock()
 _STITCHING_EPISODES: set[str] = set()
+_FINAL_DATASET_EXPORT_LOCK = threading.Lock()
 _PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="seedance-preview")
 _PREVIEW_LOCK = threading.Lock()
 _PREVIEWING_EPISODES: set[str] = set()
@@ -185,10 +186,10 @@ def upsert_episode_view(conn, row: dict[str, Any]) -> None:
             episode_uuid, view_key, camera_id, role, topic,
             source_width, source_height, target_width, target_height,
             scale_x, scale_y, is_head, fps, frame_count, duration_sec,
-            video_path, status, final_status, preview_status, preview_version,
+            video_path, status, final_status, ready_kind, preview_status, preview_version,
             continuity_state, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'missing', 'missing', 0, 'select_anchor', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'missing', '', 'missing', 0, 'select_anchor', ?, ?)
         ON CONFLICT(episode_uuid, view_key) DO UPDATE SET
             camera_id=excluded.camera_id,
             role=excluded.role,
@@ -310,7 +311,7 @@ def mark_view_outputs_stale(conn, uuid: str, view_key: str | None = None) -> Non
         """
         UPDATE episode_views
         SET final_status='stale', preview_status=CASE WHEN preview_status='ready' THEN 'stale' ELSE preview_status END,
-            error=NULL, updated_at=?
+            ready_kind='', error=NULL, updated_at=?
         WHERE episode_uuid=? AND view_key=? AND final_status IN ('ready','stitching','stale','missing')
         """,
         (now, uuid, view_key),
@@ -1322,7 +1323,7 @@ def clear_episode_clip_state(uuid: str) -> None:
             """
             UPDATE episode_views
             SET anchor_clip_id=NULL, continuity_state='select_anchor',
-                final_video_path=NULL, final_status='missing',
+                final_video_path=NULL, final_status='missing', ready_kind='',
                 preview_video_path=NULL, preview_status='missing', preview_error=NULL,
                 preview_version=preview_version+1, error=NULL, updated_at=?
             WHERE episode_uuid=?
@@ -1581,7 +1582,7 @@ def delete_dependent_continuity_clips(clip: dict[str, Any]) -> int:
                     """
                     UPDATE episode_views
                     SET anchor_clip_id=NULL, continuity_state='anchor_candidates',
-                        final_status='stale', updated_at=?
+                        final_status='stale', ready_kind='', updated_at=?
                     WHERE episode_uuid=? AND view_key=?
                     """,
                     (db.now(), uuid, view_key),
@@ -2266,7 +2267,7 @@ def maybe_prepare_next_continuity_clips_after_accept(
             conn.execute(
                 """
                 UPDATE episode_views
-                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale', updated_at=?
+                SET anchor_clip_id=?, continuity_state='bidirectional', final_status='stale', ready_kind='', updated_at=?
                 WHERE episode_uuid=? AND view_key=?
                 """,
                 (accepted_clip_id, db.now(), uuid, view_key),
@@ -3861,7 +3862,7 @@ def review_clip(
         conn.execute(
             """
             UPDATE episode_views
-            SET final_status='stale', updated_at=?
+            SET final_status='stale', ready_kind='', updated_at=?
             WHERE episode_uuid=? AND view_key=?
             """,
             (now, clip["episode_uuid"], view_key),
@@ -4246,7 +4247,7 @@ def queue_stitch_episode(
         _STITCHING_EPISODES.add(resource_id)
         with db.connect() as conn:
             conn.execute(
-                "UPDATE episode_views SET final_status='stitching', error=NULL, updated_at=? WHERE episode_uuid=? AND view_key=?",
+                "UPDATE episode_views SET final_status='stitching', ready_kind='', error=NULL, updated_at=? WHERE episode_uuid=? AND view_key=?",
                 (db.now(), uuid, view_key),
             )
             if view_key == DEFAULT_VIEW_KEY:
@@ -4264,7 +4265,7 @@ def _stitch_episode_worker(uuid: str, lock_tokens: list[str], view_key: str | No
             conn.execute(
                 """
                 UPDATE episode_views
-                SET final_status='failed', error=?, updated_at=?
+                SET final_status='failed', ready_kind='', error=?, updated_at=?
                 WHERE episode_uuid=? AND view_key=?
                 """,
                 (str(exc), db.now(), uuid, view_key),
@@ -4312,6 +4313,79 @@ def episode_source_dir_for_export(episode: dict[str, Any]) -> Path:
     raise RuntimeError(f"source episode folder with preprocessed metadata not found for {uuid}")
 
 
+def _view_row_from_camera(uuid: str, view: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "episode_uuid": uuid,
+        "view_key": normalize_view_key(view.get("view_key")),
+        "camera_id": str(view.get("camera_id") or ""),
+        "role": str(view.get("role") or ""),
+        "topic": str(view.get("topic") or ""),
+        "source_width": None,
+        "source_height": None,
+        "target_width": 760,
+        "target_height": 570,
+        "scale_x": None,
+        "scale_y": None,
+        "is_head": str(view.get("is_head") or "0") == "1" or normalize_view_key(view.get("view_key")) == DEFAULT_VIEW_KEY,
+        "fps": None,
+        "frame_count": None,
+        "duration_sec": None,
+        "video_path": "",
+        "status": "missing",
+    }
+
+
+def ensure_expected_episode_views(
+    uuid: str,
+    metadata: dict[str, Any],
+    existing_views: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    existing_by_key = {normalize_view_key(view.get("view_key")): view for view in (existing_views or list_episode_view_rows(uuid))}
+    expected = camera_views(metadata)
+    now = db.now()
+    with db.connect() as conn:
+        for expected_view in expected:
+            key = normalize_view_key(expected_view.get("view_key"))
+            if key in existing_by_key:
+                continue
+            row = _view_row_from_camera(uuid, expected_view)
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, final_status, ready_kind, preview_status, preview_version,
+                    continuity_state, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'missing', '', 'missing', 0, 'select_anchor', ?, ?)
+                ON CONFLICT(episode_uuid, view_key) DO NOTHING
+                """,
+                (
+                    uuid,
+                    key,
+                    row["camera_id"],
+                    row["role"],
+                    row["topic"],
+                    row["source_width"],
+                    row["source_height"],
+                    row["target_width"],
+                    row["target_height"],
+                    row["scale_x"],
+                    row["scale_y"],
+                    1 if row["is_head"] else 0,
+                    row["fps"],
+                    row["frame_count"],
+                    row["duration_sec"],
+                    row["video_path"],
+                    row["status"],
+                    now,
+                    now,
+                ),
+            )
+    return list_episode_view_rows(uuid)
+
+
 def export_final_seedance_dataset(uuid: str, final_video_path: Path) -> dict[str, Any]:
     episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
     if not episode:
@@ -4331,71 +4405,73 @@ def export_final_seedance_dataset(uuid: str, final_video_path: Path) -> dict[str
 
 
 def export_final_seedance_dataset_for_ready_views(uuid: str) -> dict[str, Any] | None:
-    episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
-    if not episode:
-        raise RuntimeError(f"episode not found: {uuid}")
-    source_dir = episode_source_dir_for_export(episode)
-    source_preprocessed = source_dir / "preprocessed"
-    metadata = load_json(source_preprocessed / "metadata.json")
-    views = list_episode_view_rows(uuid)
-    for view in views:
-        if normalize_view_key(view.get("view_key")) == DEFAULT_VIEW_KEY:
-            if not view.get("final_video_path") and episode.get("final_video_path"):
-                view["final_video_path"] = episode.get("final_video_path")
-            if (not view.get("final_status") or view.get("final_status") == "missing") and episode.get("final_status") == "ready":
-                view["final_status"] = "ready"
-        if view.get("topic"):
-            continue
-        if normalize_view_key(view.get("view_key")) == DEFAULT_VIEW_KEY:
-            try:
-                from .nedf import choose_head_topic
+    with _FINAL_DATASET_EXPORT_LOCK:
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        if not episode:
+            raise RuntimeError(f"episode not found: {uuid}")
+        source_dir = episode_source_dir_for_export(episode)
+        source_preprocessed = source_dir / "preprocessed"
+        metadata = load_json(source_preprocessed / "metadata.json")
+        views = ensure_expected_episode_views(uuid, metadata)
+        for view in views:
+            key = normalize_view_key(view.get("view_key"))
+            if key == DEFAULT_VIEW_KEY and view.get("ready_kind") != "manual":
+                if not view.get("final_video_path") and episode.get("final_video_path"):
+                    view["final_video_path"] = episode.get("final_video_path")
+                if (not view.get("final_status") or view.get("final_status") == "missing") and episode.get("final_status") == "ready":
+                    view["final_status"] = "ready"
+            if view.get("topic"):
+                continue
+            if key == DEFAULT_VIEW_KEY:
+                try:
+                    from .nedf import choose_head_topic
 
-                topic, camera_id = choose_head_topic(metadata)
-                view["topic"] = topic
-                view["camera_id"] = view.get("camera_id") or camera_id
-                with db.connect() as conn:
-                    conn.execute(
-                        """
-                        UPDATE episode_views
-                        SET topic=?, camera_id=?, updated_at=?
-                        WHERE episode_uuid=? AND view_key=?
-                        """,
-                        (topic, view["camera_id"], db.now(), uuid, DEFAULT_VIEW_KEY),
-                    )
-            except Exception:
-                pass
-    ready_views = [
-        view
-        for view in views
-        if view.get("final_status") == "ready"
-        and view.get("topic")
-        and (not view.get("final_video_path") or Path(str(view["final_video_path"])).exists())
-    ]
-    if not ready_views or len(ready_views) < len(views):
-        return None
-    output_dir = FINAL_DATASET_DIR / uuid
-    with db.connect() as conn:
-        conn.execute(
-            """
-            UPDATE episodes
-            SET final_dataset_status='exporting', final_dataset_error=NULL, updated_at=?
-            WHERE uuid=?
-            """,
-            (db.now(), uuid),
+                    topic, camera_id = choose_head_topic(metadata)
+                    view["topic"] = topic
+                    view["camera_id"] = view.get("camera_id") or camera_id
+                    with db.connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE episode_views
+                            SET topic=?, camera_id=?, updated_at=?
+                            WHERE episode_uuid=? AND view_key=?
+                            """,
+                            (topic, view["camera_id"], db.now(), uuid, DEFAULT_VIEW_KEY),
+                        )
+                except Exception:
+                    pass
+        ready_views = [
+            view
+            for view in views
+            if view.get("final_status") == "ready"
+            and view.get("topic")
+            and (not view.get("final_video_path") or Path(str(view["final_video_path"])).exists())
+        ]
+        if not ready_views or len(ready_views) < len(views):
+            return None
+        output_dir = FINAL_DATASET_DIR / uuid
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE episodes
+                SET final_dataset_status='exporting', final_dataset_error=NULL, updated_at=?
+                WHERE uuid=?
+                """,
+                (db.now(), uuid),
+            )
+        return export_seedance_dataset_for_views(
+            source_dir,
+            [
+                {
+                    "view_key": view["view_key"],
+                    "camera_id": view["camera_id"],
+                    "topic": view["topic"],
+                    "final_video_path": view.get("final_video_path"),
+                }
+                for view in ready_views
+            ],
+            output_dir,
         )
-    return export_seedance_dataset_for_views(
-        source_dir,
-        [
-            {
-                "view_key": view["view_key"],
-                "camera_id": view["camera_id"],
-                "topic": view["topic"],
-                "final_video_path": view.get("final_video_path"),
-            }
-            for view in ready_views
-        ],
-        output_dir,
-    )
 
 
 def mark_episode_view_ready(
@@ -4421,6 +4497,7 @@ def mark_episode_view_ready(
             UPDATE episode_views
             SET final_video_path=NULL,
                 final_status='ready',
+                ready_kind='manual',
                 error=?,
                 preview_status=CASE
                     WHEN preview_status='stitching' THEN 'stale'
@@ -4436,6 +4513,7 @@ def mark_episode_view_ready(
                 """
                 UPDATE episodes
                 SET final_status='ready',
+                    final_video_path=NULL,
                     error=?,
                     updated_at=?
                 WHERE uuid=?
@@ -4492,7 +4570,7 @@ def unmark_episode_view_ready(
         raise ValueError("episode view not found")
     if view.get("final_status") == "stitching":
         raise ValueError("view is currently stitching")
-    if view.get("final_status") != "ready" or view.get("final_video_path"):
+    if view.get("final_status") != "ready" or view.get("ready_kind") != "manual":
         raise ValueError("only a manually marked ready view can be cancelled")
     with db.connect() as conn:
         conn.execute(
@@ -4500,6 +4578,7 @@ def unmark_episode_view_ready(
             UPDATE episode_views
             SET final_status='missing',
                 final_video_path=NULL,
+                ready_kind='',
                 error=NULL,
                 updated_at=?
             WHERE episode_uuid=? AND view_key=?
@@ -4563,7 +4642,7 @@ def stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
     out.parent.mkdir(parents=True, exist_ok=True)
     with db.connect() as conn:
         conn.execute(
-            "UPDATE episode_views SET final_status='stitching', error=NULL, updated_at=? WHERE episode_uuid=? AND view_key=?",
+            "UPDATE episode_views SET final_status='stitching', ready_kind='', error=NULL, updated_at=? WHERE episode_uuid=? AND view_key=?",
             (db.now(), uuid, view_key),
         )
         if view_key == DEFAULT_VIEW_KEY:
@@ -4596,7 +4675,7 @@ def stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
             conn.execute(
                 """
                 UPDATE episode_views
-                SET final_video_path=?, final_status='ready', error=NULL, updated_at=?
+                SET final_video_path=?, final_status='ready', ready_kind='generated', error=NULL, updated_at=?
                 WHERE episode_uuid=? AND view_key=?
                 """,
                 (str(out.resolve()), db.now(), uuid, view_key),
@@ -4611,6 +4690,7 @@ def stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
                 dataset_status = "ready"
         except Exception as exc:
             dataset_error = str(exc)
+            dataset_status = "failed"
         with db.connect() as conn:
             if view_key == DEFAULT_VIEW_KEY:
                 conn.execute(
@@ -4662,7 +4742,7 @@ def stitch_episode(uuid: str, view_key: str | None = None) -> dict[str, Any]:
             conn.execute(
                 """
                 UPDATE episode_views
-                SET final_status='failed', error=?, updated_at=?
+                SET final_status='failed', ready_kind='', error=?, updated_at=?
                 WHERE episode_uuid=? AND view_key=?
                 """,
                 (str(exc), db.now(), uuid, view_key),

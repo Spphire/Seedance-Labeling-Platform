@@ -3051,7 +3051,7 @@
     }
 
     function isManualReadyStats(stats) {
-      return stats?.final_status === "ready" && !stats?.final_url;
+      return stats?.final_status === "ready" && (stats?.ready_kind === "manual" || !stats?.final_url);
     }
 
     function episodeClass(episode) {

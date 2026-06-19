@@ -109,6 +109,7 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'ready',
                 final_video_path TEXT,
                 final_status TEXT NOT NULL DEFAULT 'missing',
+                ready_kind TEXT NOT NULL DEFAULT '',
                 preview_video_path TEXT,
                 preview_status TEXT NOT NULL DEFAULT 'missing',
                 preview_version INTEGER NOT NULL DEFAULT 0,
@@ -328,6 +329,7 @@ def init_db() -> None:
         _ensure_column(conn, "episode_views", "is_head", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "episode_views", "final_video_path", "TEXT")
         _ensure_column(conn, "episode_views", "final_status", "TEXT NOT NULL DEFAULT 'missing'")
+        _ensure_column(conn, "episode_views", "ready_kind", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "episode_views", "preview_video_path", "TEXT")
         _ensure_column(conn, "episode_views", "preview_status", "TEXT NOT NULL DEFAULT 'missing'")
         _ensure_column(conn, "episode_views", "preview_version", "INTEGER NOT NULL DEFAULT 0")
@@ -337,6 +339,7 @@ def init_db() -> None:
         _ensure_column(conn, "episode_views", "error", "TEXT")
         conn.execute("UPDATE episode_views SET is_head=0 WHERE is_head IS NULL")
         conn.execute("UPDATE episode_views SET final_status='missing' WHERE final_status IS NULL OR final_status=''")
+        conn.execute("UPDATE episode_views SET ready_kind='' WHERE ready_kind IS NULL")
         conn.execute("UPDATE episode_views SET preview_status='missing' WHERE preview_status IS NULL OR preview_status=''")
         conn.execute("UPDATE episode_views SET preview_version=0 WHERE preview_version IS NULL")
         conn.execute("UPDATE episode_views SET continuity_state='select_anchor' WHERE continuity_state IS NULL OR continuity_state=''")

@@ -629,6 +629,7 @@ class MockPipelineTest(unittest.TestCase):
         result = mark_episode_view_ready(uuid, "right_wrist", lock.json()["token"], "skip wrist")
 
         self.assertEqual(result["final_status"], "ready")
+        self.assertEqual(result["ready_kind"], "manual")
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertEqual(episode["final_dataset_status"], "ready")
         dataset_root = Path(episode["final_dataset_path"])
@@ -655,6 +656,7 @@ class MockPipelineTest(unittest.TestCase):
 
         cancelled = unmark_episode_view_ready(uuid, "right_wrist", lock.json()["token"])
         self.assertEqual(cancelled["final_status"], "missing")
+        self.assertEqual(cancelled["ready_kind"], "")
         episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
         self.assertEqual(episode["final_dataset_status"], "stale")
         payload = self.client.get("/api/episodes").json()
@@ -662,6 +664,149 @@ class MockPipelineTest(unittest.TestCase):
         right_payload = next(view for view in episode_payload["views"] if view["view_key"] == "right_wrist")
         self.assertEqual(right_payload["final_status"], "missing")
         self.assertIsNone(right_payload["final_url"])
+
+    def test_manual_head_ready_does_not_reuse_legacy_final(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000143"
+        source_root = self.write_minimal_nedf_episode(uuid, frame_count=12)
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 4)
+        final = FINAL_DIR / uuid / "head" / "old_accepted_30fps.mp4"
+        final.parent.mkdir(parents=True, exist_ok=True)
+        self.make_video(final, 4)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(
+                    uuid, remote_path, local_path, status, head_video_path,
+                    final_video_path, final_status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, 'ready', ?, ?)
+                """,
+                (uuid, "mock", str(source_root.resolve()), str(head.resolve()), str(final.resolve()), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, final_video_path, final_status, created_at, updated_at
+                )
+                VALUES (?, 'head', 'camera_2', 'head', 'nmx/hal/camera/camera_2/rgbd',
+                        1280, 960, 760, 570, ?, ?, 1, 30, 12, 4, ?, 'ready', ?, 'ready', ?, ?)
+                """,
+                (uuid, 760 / 1280, 570 / 960, str(head.resolve()), str(final.resolve()), now, now),
+            )
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+
+        result = mark_episode_view_ready(uuid, "head", lock.json()["token"], "skip head")
+
+        self.assertEqual(result["final_status"], "ready")
+        self.assertEqual(result["ready_kind"], "manual")
+        self.assertIsNone(result["final_video_path"])
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertIsNone(episode["final_video_path"])
+        self.assertEqual(episode["final_dataset_status"], "ready")
+        dataset_root = Path(episode["final_dataset_path"])
+        payloads = []
+        for mcap_path in sorted((dataset_root / "preprocessed" / "data").glob("*.mcap")):
+            with mcap_path.open("rb") as handle:
+                reader = make_reader(handle)
+                for _, _, message in reader.iter_messages(topics=["nmx/hal/camera/camera_2/rgbd"]):
+                    rgbd = RGBD()
+                    rgbd.ParseFromString(message.data)
+                    payloads.append(rgbd.rgb.data)
+        self.assertEqual(payloads, [b"old-rgb"] * 12)
+
+    def test_missing_expected_view_blocks_final_dataset_export(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000144"
+        source_root = self.write_two_view_nedf_episode(uuid, frame_count=12)
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 4)
+        final = FINAL_DIR / uuid / "head" / "accepted_30fps.mp4"
+        final.parent.mkdir(parents=True, exist_ok=True)
+        self.make_video(final, 4)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(
+                    uuid, remote_path, local_path, status, head_video_path,
+                    final_video_path, final_status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, 'ready', ?, ?)
+                """,
+                (uuid, "mock", str(source_root.resolve()), str(head.resolve()), str(final.resolve()), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, final_video_path, final_status, ready_kind, created_at, updated_at
+                )
+                VALUES (?, 'head', 'camera_2', 'head', 'nmx/hal/camera/camera_2/rgbd',
+                        1280, 960, 760, 570, ?, ?, 1, 30, 12, 4, ?, 'ready', ?, 'ready', 'generated', ?, ?)
+                """,
+                (uuid, 760 / 1280, 570 / 960, str(head.resolve()), str(final.resolve()), now, now),
+            )
+
+        dataset = backend_services.export_final_seedance_dataset_for_ready_views(uuid)
+
+        self.assertIsNone(dataset)
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertNotEqual(episode["final_dataset_status"], "ready")
+        views = {view["view_key"]: view for view in db.rows("SELECT * FROM episode_views WHERE episode_uuid=?", (uuid,))}
+        self.assertEqual(set(views), {"head", "right_wrist"})
+        self.assertEqual(views["right_wrist"]["final_status"], "missing")
+
+    def test_manual_ready_marks_dataset_failed_when_export_fails(self) -> None:
+        uuid = "00000000-0000-0000-0000-000000000145"
+        source_root = self.write_minimal_nedf_episode(uuid, frame_count=12)
+        now = db.now()
+        head = HEAD_VIDEOS_DIR / f"{uuid}_head_760x570.mp4"
+        self.make_video(head, 4)
+        with db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes(uuid, remote_path, local_path, status, head_video_path, created_at, updated_at)
+                VALUES (?, ?, ?, 'preprocessed', ?, ?, ?)
+                """,
+                (uuid, "mock", str(source_root.resolve()), str(head.resolve()), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO episode_views(
+                    episode_uuid, view_key, camera_id, role, topic,
+                    source_width, source_height, target_width, target_height,
+                    scale_x, scale_y, is_head, fps, frame_count, duration_sec,
+                    video_path, status, final_status, created_at, updated_at
+                )
+                VALUES (?, 'head', 'camera_2', 'head', 'nmx/hal/camera/camera_2/rgbd',
+                        1280, 960, 760, 570, ?, ?, 1, 30, 12, 4, ?, 'ready', 'missing', ?, ?)
+                """,
+                (uuid, 760 / 1280, 570 / 960, str(head.resolve()), now, now),
+            )
+        lock = self.client.post(
+            "/api/locks/acquire",
+            json={"resource_type": "episode", "resource_id": uuid, "owner_id": "alice", "owner_name": "Alice"},
+        )
+        self.assertEqual(lock.status_code, 200, lock.text)
+
+        with patch("app.backend.services.export_seedance_dataset_for_views", side_effect=RuntimeError("boom")):
+            result = mark_episode_view_ready(uuid, "head", lock.json()["token"], "skip head")
+
+        self.assertEqual(result["dataset_export"]["final_dataset_status"], "failed")
+        self.assertIn("boom", result["dataset_export"]["final_dataset_error"])
+        episode = db.one("SELECT * FROM episodes WHERE uuid=?", (uuid,))
+        self.assertEqual(episode["final_dataset_status"], "failed")
+        self.assertIn("boom", episode["final_dataset_error"])
 
     def test_import_head_video_prepares_head_without_creating_clips(self) -> None:
         uuid = "00000000-0000-0000-0000-000000000022"
