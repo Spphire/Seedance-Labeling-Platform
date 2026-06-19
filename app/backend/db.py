@@ -340,6 +340,16 @@ def init_db() -> None:
         conn.execute("UPDATE episode_views SET is_head=0 WHERE is_head IS NULL")
         conn.execute("UPDATE episode_views SET final_status='missing' WHERE final_status IS NULL OR final_status=''")
         conn.execute("UPDATE episode_views SET ready_kind='' WHERE ready_kind IS NULL")
+        conn.execute(
+            """
+            UPDATE episode_views
+            SET ready_kind='manual'
+            WHERE final_status='ready'
+              AND (final_video_path IS NULL OR final_video_path='')
+              AND ready_kind=''
+              AND LOWER(COALESCE(error, '')) LIKE 'manual ready%'
+            """
+        )
         conn.execute("UPDATE episode_views SET preview_status='missing' WHERE preview_status IS NULL OR preview_status=''")
         conn.execute("UPDATE episode_views SET preview_version=0 WHERE preview_version IS NULL")
         conn.execute("UPDATE episode_views SET continuity_state='select_anchor' WHERE continuity_state IS NULL OR continuity_state=''")

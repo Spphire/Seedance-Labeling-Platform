@@ -140,6 +140,14 @@ def view_scoped_dir(root: Path, uuid: str, view_key: str | None = None) -> Path:
     return root / uuid if view_key == DEFAULT_VIEW_KEY else root / uuid / view_key
 
 
+def view_is_manual_ready(view: dict[str, Any]) -> bool:
+    return (
+        view.get("final_status") == "ready"
+        and not view.get("final_video_path")
+        and (view.get("ready_kind") == "manual" or str(view.get("error") or "").lower().startswith("manual ready"))
+    )
+
+
 def view_video_path_for_episode(uuid: str, view_key: str | None = None) -> Path:
     view_key = normalize_view_key(view_key)
     if view_key == DEFAULT_VIEW_KEY:
@@ -4415,7 +4423,7 @@ def export_final_seedance_dataset_for_ready_views(uuid: str) -> dict[str, Any] |
         views = ensure_expected_episode_views(uuid, metadata)
         for view in views:
             key = normalize_view_key(view.get("view_key"))
-            if key == DEFAULT_VIEW_KEY and view.get("ready_kind") != "manual":
+            if key == DEFAULT_VIEW_KEY and not view_is_manual_ready(view):
                 if not view.get("final_video_path") and episode.get("final_video_path"):
                     view["final_video_path"] = episode.get("final_video_path")
                 if (not view.get("final_status") or view.get("final_status") == "missing") and episode.get("final_status") == "ready":
@@ -4570,7 +4578,7 @@ def unmark_episode_view_ready(
         raise ValueError("episode view not found")
     if view.get("final_status") == "stitching":
         raise ValueError("view is currently stitching")
-    if view.get("final_status") != "ready" or view.get("ready_kind") != "manual":
+    if not view_is_manual_ready(view):
         raise ValueError("only a manually marked ready view can be cancelled")
     with db.connect() as conn:
         conn.execute(
